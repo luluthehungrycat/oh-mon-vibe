@@ -52,6 +52,32 @@ async def test_lifecycle_bounds_slow_async_callback() -> None:
 
 
 @pytest.mark.asyncio
+async def test_lifecycle_runs_synchronous_callbacks() -> None:
+    class SyncPlugin:
+        def register(self) -> None:
+            self.registered = True
+
+        def on_activate(self) -> None:
+            self.activated = True
+
+        def on_deactivate(self) -> None:
+            self.deactivated = True
+
+        def cleanup(self) -> None:
+            self.cleaned = True
+
+    plugin = SyncPlugin()
+    lifecycle = PluginLifecycle()
+
+    assert await lifecycle.activate(_package(), plugin)
+    assert plugin.registered
+    assert plugin.activated
+    assert await lifecycle.deactivate("demo")
+    assert plugin.deactivated
+    assert plugin.cleaned
+
+
+@pytest.mark.asyncio
 async def test_required_sandbox_refuses_activation_without_backend() -> None:
     lifecycle = PluginLifecycle(sandbox_available=False)
     assert await lifecycle.activate(_package(sandbox="required"), object()) is False

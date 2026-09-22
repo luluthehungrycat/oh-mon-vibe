@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
-from inspect import iscoroutinefunction
+from inspect import isawaitable, iscoroutinefunction
 from typing import Any, Literal, cast
 
 from vibe.core.plugins.package import PluginPackage
@@ -179,9 +179,12 @@ class PluginLifecycle:
         callback = getattr(implementation, method_name, None)
         if not callable(callback):
             return None
-        if not iscoroutinefunction(callback) and not iscoroutinefunction(
+        if iscoroutinefunction(callback) or iscoroutinefunction(
             type(callback).__call__
         ):
-            raise TypeError("plugin lifecycle callbacks must be async")
-        typed_callback = cast(Callable[..., Awaitable[object]], callback)
-        return await asyncio.wait_for(typed_callback(*args), timeout)
+            typed_callback = cast(Callable[..., Awaitable[object]], callback)
+            return await asyncio.wait_for(typed_callback(*args), timeout)
+        result = await asyncio.wait_for(asyncio.to_thread(callback, *args), timeout)
+        if isawaitable(result):
+            return await asyncio.wait_for(cast(Awaitable[object], result), timeout)
+        return result
