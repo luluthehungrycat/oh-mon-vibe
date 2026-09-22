@@ -40,7 +40,7 @@ PluginPackageDiagnosticEvent = Literal[
 
 
 class PluginPackageManifest(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+    model_config = ConfigDict(extra="allow", frozen=True, populate_by_name=True)
 
     schema_version: Literal["omv.plugin.v1"] = Field(
         validation_alias="schema", serialization_alias="schema"
@@ -193,6 +193,13 @@ def _validate_layout(package: PluginPackage) -> None:
         skills = package.root / "skills"
         if not skills.is_dir() or skills.is_symlink():
             raise ValueError("skills capability requires a regular skills directory")
+        for child in skills.rglob("*"):
+            if child.is_symlink():
+                raise ValueError("skills component must not contain symlinks")
+            try:
+                child.resolve().relative_to(root)
+            except ValueError as exc:
+                raise ValueError("skills component escapes package root") from exc
 
 
 def discover_package_plugins(

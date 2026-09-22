@@ -42,16 +42,19 @@ class PluginConformanceReport:
 
 def run_plugin_conformance(package: PluginPackage) -> PluginConformanceReport:
     evidence: list[PluginConformanceEvidence] = []
-    root = package.root.resolve()
+    root = package.root
     manifest_path = root / "plugin.json"
     manifest_ok = False
     manifest_detail = "regular root plugin.json"
-    try:
-        payload = json.loads(read_safe(manifest_path, raise_on_error=True).text)
-        parsed = PluginPackageManifest.model_validate(payload)
-        manifest_ok = parsed == package.manifest
-    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        manifest_detail = f"invalid plugin.json: {exc}"
+    if manifest_path.is_symlink():
+        manifest_detail = "plugin.json must not be a symlink"
+    else:
+        try:
+            payload = json.loads(read_safe(manifest_path, raise_on_error=True).text)
+            parsed = PluginPackageManifest.model_validate(payload)
+            manifest_ok = parsed == package.manifest
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            manifest_detail = f"invalid plugin.json: {exc}"
     evidence.append(PluginConformanceEvidence("manifest", manifest_ok, manifest_detail))
     evidence.append(
         PluginConformanceEvidence(

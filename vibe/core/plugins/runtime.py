@@ -94,6 +94,10 @@ class PluginRuntimeManager:
             await self.lifecycle.activate(package, implementation)
 
     def _validate_activation_isolation(self, package: PluginPackage) -> None:
+        if "mcp" in package.manifest.capabilities:
+            raise PluginSandboxError(
+                "plugin MCP components require a policy-aware host adapter; activation refused"
+            )
         if package.manifest.trust == "isolated_process":
             raise PluginSandboxError(
                 "isolated-process plugin runtime is unavailable; activation refused"

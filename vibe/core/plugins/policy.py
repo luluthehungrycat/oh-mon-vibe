@@ -118,10 +118,9 @@ def compose_plugin_decision(
     """Apply host guardrails and explicit human precedence to plugin output."""
     if human_denied:
         return CommandDecision(Decision.DENY, "explicitly denied by the user", "human")
+    plugin_decision = result.as_command_decision(plugin)
+    if plugin_decision.outcome == Decision.DENY:
+        return plugin_decision
     if core.outcome != Decision.ALLOW:
         return core
-    if result.decision == PluginDecision.DENY:
-        return result.as_command_decision(plugin)
-    if result.decision == PluginDecision.ASK:
-        return result.as_command_decision(plugin)
-    return core
+    return plugin_decision

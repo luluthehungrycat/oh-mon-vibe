@@ -72,6 +72,7 @@ from vibe.core.config import (
 )
 from vibe.core.log_reader import PaginatedLogs
 from vibe.core.plugins import PluginPackageDiagnostic
+from vibe.core.plugins.lifecycle import PluginLifecycleDiagnostic
 from vibe.core.tools.connectors.connector_registry import ConnectorAuthAction
 from vibe.core.tools.connectors.counts import compute_connector_counts
 from vibe.core.tools.remote import AuthStatus, MCPTool
@@ -393,6 +394,10 @@ def project_diagnostics(agent_loop: AgentLoop) -> tuple[list[ConfigIssue], int]:
             _project_plugin_issue(issue)
             for issue in agent_loop.plugin_package_registry.diagnostics
         ),
+        *(
+            _project_plugin_lifecycle_issue(issue)
+            for issue in agent_loop.plugin_lifecycle.diagnostics
+        ),
     ]
     return issues, agent_loop.hooks_count
 
@@ -659,6 +664,13 @@ def _project_issue(issue: _ConfigIssue) -> ConfigIssue:
 def _project_plugin_issue(issue: PluginPackageDiagnostic) -> ConfigIssue:
     return ConfigIssue(
         file=f"plugin:{issue.package}", message=f"{issue.event}: {issue.reason}"
+    )
+
+
+def _project_plugin_lifecycle_issue(issue: PluginLifecycleDiagnostic) -> ConfigIssue:
+    return ConfigIssue(
+        file=f"plugin:{issue.plugin}",
+        message=f"{issue.event} ({issue.phase}): {issue.reason}",
     )
 
 
