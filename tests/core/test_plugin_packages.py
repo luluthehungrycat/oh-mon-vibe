@@ -129,12 +129,21 @@ def test_package_discovery_rejects_symlinked_components(tmp_path: Path) -> None:
 def test_manifest_requires_semantic_version_and_safe_entrypoint() -> None:
     with pytest.raises(ValueError):
         PluginPackageManifest(
-            name="demo", version="latest", kind="analyzer", entrypoint="plugin:register"
+            schema_version="omv.plugin.v1",
+            name="demo",
+            version="latest",
+            kind="analyzer",
+            entrypoint="plugin:register",
+            activation="manual",
+            trust="trusted_in_process",
         )
     with pytest.raises(ValueError):
         PluginPackageManifest(
+            schema_version="omv.plugin.v1",
             name="demo",
             version="1.0.0",
             kind="analyzer",
             entrypoint="../plugin:register",
+            activation="manual",
+            trust="trusted_in_process",
         )

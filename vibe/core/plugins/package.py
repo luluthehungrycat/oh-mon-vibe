@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from importlib.metadata import entry_points
 import json
 from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 if TYPE_CHECKING:
     from vibe.core.plugins.components import PluginPackageComponents
@@ -19,6 +20,10 @@ from vibe.utils.io import read_safe
 OMV_PLUGIN_SCHEMA = "omv.plugin.v1"
 _PLUGIN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SEMVER = re.compile(r"^(?:0|[1-9][0-9]*)\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
+_ENTRYPOINT = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$"
+)
+_PLUGIN_CAPABILITIES = frozenset({"analyzer", "tool", "hook", "skills", "mcp"})
 
 PluginPackageKind = Literal["analyzer", "tool", "hook", "combined"]
 PluginTrust = Literal["trusted_in_process", "isolated_process"]
@@ -33,12 +38,12 @@ PluginPackageDiagnosticEvent = Literal[
     "legacy_entrypoint",
 ]
 
-
 class PluginPackageManifest(BaseModel):
-    model_config = ConfigDict(extra="allow", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, populate_by_name=True
+    )
 
     schema_version: Literal["omv.plugin.v1"] = Field(
-        default=OMV_PLUGIN_SCHEMA,
         validation_alias="schema",
         serialization_alias="schema",
     )
@@ -47,8 +52,8 @@ class PluginPackageManifest(BaseModel):
     kind: PluginPackageKind
     capabilities: frozenset[str] = frozenset()
     entrypoint: str
-    activation: PluginActivation = "manual"
-    trust: PluginTrust = "trusted_in_process"
+    activation: PluginActivation
+    trust: PluginTrust
     sandbox: PluginSandboxExpectation = "optional"
     lifecycle_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
 
@@ -71,11 +76,30 @@ class PluginPackageManifest(BaseModel):
     @field_validator("entrypoint")
     @classmethod
     def validate_entrypoint(cls, value: str) -> str:
-        if not value or value.startswith((".", "/")) or ".." in value:
+        if not _ENTRYPOINT.fullmatch(value) or ".." in value:
             raise ValueError(
-                "plugin entrypoint must be a package-local module reference"
+                "plugin entrypoint must use safe package-local module:attribute syntax"
             )
         return value
+
+    @model_validator(mode="after")
+    def validate_capabilities(self) -> PluginPackageManifest:
+        unsupported = self.capabilities - _PLUGIN_CAPABILITIES
+        if unsupported:
+            raise ValueError(f"unsupported plugin capabilities: {sorted(unsupported)!r}")
+        allowed = {
+            "analyzer": frozenset({"analyzer", "skills", "mcp"}),
+            "tool": frozenset({"tool", "skills", "mcp"}),
+            "hook": frozenset({"hook", "skills", "mcp"}),
+            "combined": _PLUGIN_CAPABILITIES,
+        }[self.kind]
+        contradictory = self.capabilities - allowed
+        if contradictory:
+            raise ValueError(
+                f"capabilities {sorted(contradictory)!r} are not valid for "
+                f"plugin kind {self.kind!r}"
+            )
+        return self
 
 
 @dataclass(frozen=True)
@@ -128,6 +152,19 @@ def _load_manifest(package_dir: Path) -> PluginPackageManifest:
     payload = json.loads(read_safe(manifest_path, raise_on_error=True).text)
     if not isinstance(payload, dict):
         raise ValueError("plugin.json must contain an object")
+    required = {
+        "schema",
+        "name",
+        "version",
+        "kind",
+        "capabilities",
+        "entrypoint",
+        "activation",
+        "trust",
+    }
+    missing = required - payload.keys()
+    if missing:
+        raise ValueError(f"plugin.json is missing required fields: {sorted(missing)!r}")
     manifest = PluginPackageManifest.model_validate(payload)
     if manifest.trust != "trusted_in_process":
         raise ValueError("isolated plugin protocol is not supported yet")
@@ -187,6 +224,8 @@ def discover_package_plugins(
             registry.components[manifest.name] = components
             for reason in components.diagnostics:
                 registry.add_diagnostic(manifest.name, "component_rejected", reason)
+            if components.diagnostics:
+                continue
             if manifest.name not in enabled:
                 registry.add_diagnostic(
                     manifest.name, "disabled", "plugin is installed but disabled"
@@ -206,3 +245,10 @@ def add_legacy_entrypoint_diagnostics(
             "legacy Python entry point remains available through the internal registry; "
             "it was not enabled as a package",
         )
+
+def discover_legacy_entrypoint_names() -> list[str]:
+    try:
+        candidates = entry_points(group="omv.plugins")
+    except TypeError:  # pragma: no cover - Python 3.11 compatibility
+        candidates = entry_points().select(group="omv.plugins")
+    return sorted(ep.name for ep in candidates)

@@ -24,6 +24,7 @@ from vibe.core.plugins.package import (
     PluginPackageManifest,
     PluginPackageRegistry,
     add_legacy_entrypoint_diagnostics,
+    discover_legacy_entrypoint_names,
     discover_package_plugins,
 )
 from vibe.core.plugins.policy import (
@@ -97,6 +98,7 @@ __all__ = [
     "PluginTrust",
     "add_legacy_entrypoint_diagnostics",
     "compose_plugin_decision",
+    "discover_legacy_entrypoint_names",
     "discover_package_plugins",
     "discover_plugins",
     "load_package_components",

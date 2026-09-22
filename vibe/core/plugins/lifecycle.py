@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
-from inspect import isawaitable
+from inspect import iscoroutinefunction
 from typing import Any, Literal, cast
 
 from vibe.core.plugins.package import PluginPackage
@@ -57,7 +57,7 @@ class PluginRuntime:
 
 @dataclass
 class PluginLifecycle:
-    sandbox_available: bool = True
+    sandbox_available: bool = False
     runtimes: dict[str, PluginRuntime] = field(default_factory=dict)
     diagnostics: list[PluginLifecycleDiagnostic] = field(default_factory=list)
 
@@ -102,6 +102,8 @@ class PluginLifecycle:
 
     async def invoke(self, name: str, method_name: str, *args: Any) -> object:
         runtime = self.runtimes[name]
+        if runtime.phase is not PluginLifecyclePhase.ACTIVATE:
+            raise RuntimeError(f"plugin {name!r} is not active")
         runtime.phase = PluginLifecyclePhase.INVOKE
         try:
             result = await self._invoke(
@@ -120,12 +122,10 @@ class PluginLifecycle:
 
     async def deactivate(self, name: str) -> bool:
         runtime = self.runtimes.get(name)
-        if runtime is None or runtime.phase in {
-            PluginLifecyclePhase.STOPPED,
-            PluginLifecyclePhase.FAILED,
-        }:
+        if runtime is None or runtime.phase is PluginLifecyclePhase.STOPPED:
             return True
         runtime.phase = PluginLifecyclePhase.DEACTIVATE
+        failed = False
         try:
             await self._invoke(
                 runtime.implementation,
@@ -133,9 +133,8 @@ class PluginLifecycle:
                 runtime.package.manifest.lifecycle_timeout_seconds,
             )
         except Exception as exc:
-            runtime.phase = PluginLifecyclePhase.FAILED
+            failed = True
             self._diagnose(name, "deactivation_failed", runtime.phase, str(exc))
-            return False
         runtime.phase = PluginLifecyclePhase.CLEANUP
         try:
             await self._invoke(
@@ -144,8 +143,10 @@ class PluginLifecycle:
                 runtime.package.manifest.lifecycle_timeout_seconds,
             )
         except Exception as exc:
-            runtime.phase = PluginLifecyclePhase.FAILED
+            failed = True
             self._diagnose(name, "cleanup_failed", runtime.phase, str(exc))
+        if failed:
+            runtime.phase = PluginLifecyclePhase.FAILED
             return False
         runtime.phase = PluginLifecyclePhase.STOPPED
         self._diagnose(name, "deactivated", runtime.phase, "plugin deactivated")
@@ -178,10 +179,9 @@ class PluginLifecycle:
         callback = getattr(implementation, method_name, None)
         if not callable(callback):
             return None
-        typed_callback = cast(Callable[..., Any], callback)
-        result = await asyncio.wait_for(
-            asyncio.to_thread(typed_callback, *args), timeout
-        )
-        if isawaitable(result):
-            return await asyncio.wait_for(cast(Awaitable[object], result), timeout)
-        return result
+        if not iscoroutinefunction(callback) and not iscoroutinefunction(
+            type(callback).__call__
+        ):
+            raise TypeError("plugin lifecycle callbacks must be async")
+        typed_callback = cast(Callable[..., Awaitable[object]], callback)
+        return await asyncio.wait_for(typed_callback(*args), timeout)

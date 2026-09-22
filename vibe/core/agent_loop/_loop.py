@@ -78,7 +78,14 @@ from vibe.core.middleware import (
     make_plan_agent_reminder,
 )
 from vibe.core.plan_session import PlanSession
-from vibe.core.plugins import PluginPackageRegistry, discover_package_plugins
+from vibe.core.plugins.lifecycle import PluginLifecycle
+from vibe.core.plugins.package import (
+    PluginPackageRegistry,
+    add_legacy_entrypoint_diagnostics,
+    discover_legacy_entrypoint_names,
+    discover_package_plugins,
+)
+from vibe.core.plugins.runtime import PluginRuntimeManager
 from vibe.core.review import ReviewManager
 from vibe.core.rewind import RewindManager
 from vibe.core.scratchpad import cleanup_scratchpad, init_scratchpad
@@ -475,6 +482,18 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self.plugin_package_registry: PluginPackageRegistry = discover_package_plugins(
             set(config.plugins.enabled), project_root=self.cwd
         )
+        add_legacy_entrypoint_diagnostics(
+            self.plugin_package_registry, discover_legacy_entrypoint_names()
+        )
+        self.plugin_lifecycle = PluginLifecycle()
+        self.plugin_runtime_manager = PluginRuntimeManager(
+            self.plugin_package_registry,
+            self.plugin_lifecycle,
+            config.plugins.permission_policy(),
+            sandbox_policy=config.plugins.sandbox,
+            sandbox_backend=config.plugins.sandbox_backend,
+        )
+        self._plugins_activated = False
         self.experiment_manager = ExperimentManager(
             client=RemoteEvalClient.from_settings(
                 api_host=config.experiments.api_host,
@@ -658,6 +677,9 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             await asyncio.to_thread(thread.join)
             if err := self._init_error:
                 raise copy.copy(err).with_traceback(err.__traceback__)
+        if not self._plugins_activated:
+            await self.plugin_runtime_manager.activate_enabled()
+            self._plugins_activated = True
         if (task := self._experiments_task) is not None:
             if task is asyncio.current_task():
                 return
@@ -671,7 +693,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         if self._pending_new_session_telemetry:
             self._pending_new_session_telemetry = False
             self.emit_new_session_telemetry()
-
     @property
     def agent_profile(self) -> AgentProfile:
         return self.agent_manager.active_profile
@@ -947,6 +968,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self.telemetry_client.send_session_closed()
 
     async def aclose(self) -> None:
+        with contextlib.suppress(Exception):
+            await self.plugin_runtime_manager.shutdown()
         if (task := self._experiments_task) is not None and not task.done():
             task.cancel()
             with contextlib.suppress(BaseException):

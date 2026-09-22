@@ -86,8 +86,8 @@ def select_plugin_sandbox(
         backend=capabilities.backend,
         network_isolated=capabilities.network_isolation,
         writable_workdir=capabilities.writable_workdir,
-        timeout_enforced=True,
-        cleanup_confirmed=True,
+        timeout_enforced=False,
+        cleanup_confirmed=False,
     )
     if policy == "required" and not evidence.complete:
         raise PluginSandboxError(

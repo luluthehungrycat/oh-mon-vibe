@@ -7,7 +7,7 @@ from enum import StrEnum
 from fnmatch import fnmatchcase
 from typing import Literal
 
-from vibe.core.safety.policy import CommandDecision, Decision, compose_policy_decision
+from vibe.core.safety.policy import CommandDecision, Decision
 
 
 class PluginDecision(StrEnum):
@@ -116,6 +116,12 @@ def compose_plugin_decision(
     human_denied: bool = False,
 ) -> CommandDecision:
     """Apply host guardrails and explicit human precedence to plugin output."""
-    return compose_policy_decision(
-        core, [result.as_command_decision(plugin)], human_denied=human_denied
-    )
+    if human_denied:
+        return CommandDecision(Decision.DENY, "explicitly denied by the user", "human")
+    if core.outcome != Decision.ALLOW:
+        return core
+    if result.decision == PluginDecision.DENY:
+        return result.as_command_decision(plugin)
+    if result.decision == PluginDecision.ASK:
+        return result.as_command_decision(plugin)
+    return core

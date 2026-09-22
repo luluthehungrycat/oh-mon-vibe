@@ -21,7 +21,13 @@ from vibe.core.plugins.runtime import (
 def _package(root: Path, entrypoint: str = "plugin:create") -> PluginPackage:
     return PluginPackage(
         PluginPackageManifest(
-            name="demo", version="1.0.0", kind="analyzer", entrypoint=entrypoint
+            schema_version="omv.plugin.v1",
+            name="demo",
+            version="1.0.0",
+            kind="analyzer",
+            entrypoint=entrypoint,
+            activation="manual",
+            trust="trusted_in_process",
         ),
         root,
     )
@@ -51,7 +57,7 @@ async def test_denied_plugin_action_does_not_invoke_callback(tmp_path: Path) -> 
         "class Plugin:\n"
         "    def __init__(self):\n"
         "        self.called = False\n"
-        "    def on_activate(self):\n"
+        "    async def on_activate(self):\n"
         "        pass\n"
         "    def invoke(self):\n"
         "        self.called = True\n"

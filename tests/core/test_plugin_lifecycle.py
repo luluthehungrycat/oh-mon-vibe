@@ -12,10 +12,13 @@ from vibe.core.plugins.package import PluginPackage, PluginPackageManifest
 
 def _package(*, sandbox: Literal["optional", "required"] = "optional") -> PluginPackage:
     manifest = PluginPackageManifest(
+        schema_version="omv.plugin.v1",
         name="demo",
         version="1.0.0",
         kind="analyzer",
         entrypoint="plugin:register",
+        activation="manual",
+        trust="trusted_in_process",
         sandbox=sandbox,
     )
     return PluginPackage(manifest, Path("/tmp/demo"))

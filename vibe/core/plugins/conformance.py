@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 
 from vibe.core.plugins.components import load_package_components
-from vibe.core.plugins.package import PluginPackage
+from vibe.core.plugins.package import PluginPackage, PluginPackageManifest
+from vibe.utils.io import read_safe
 
 
 class PluginConformanceError(RuntimeError):
@@ -42,14 +44,16 @@ def run_plugin_conformance(package: PluginPackage) -> PluginConformanceReport:
     evidence: list[PluginConformanceEvidence] = []
     root = package.root.resolve()
     manifest_path = root / "plugin.json"
+    manifest_ok = False
+    manifest_detail = "regular root plugin.json"
+    try:
+        payload = json.loads(read_safe(manifest_path, raise_on_error=True).text)
+        parsed = PluginPackageManifest.model_validate(payload)
+        manifest_ok = parsed == package.manifest
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        manifest_detail = f"invalid plugin.json: {exc}"
     evidence.append(
-        PluginConformanceEvidence(
-            "manifest",
-            manifest_path.is_file() and not manifest_path.is_symlink(),
-            "regular root plugin.json"
-            if manifest_path.is_file()
-            else "missing plugin.json",
-        )
+        PluginConformanceEvidence("manifest", manifest_ok, manifest_detail)
     )
     evidence.append(
         PluginConformanceEvidence(
@@ -65,9 +69,18 @@ def run_plugin_conformance(package: PluginPackage) -> PluginConformanceReport:
             package.manifest.trust,
         )
     )
+    evidence.append(
+        PluginConformanceEvidence(
+            "sandbox",
+            package.manifest.sandbox == "optional",
+            "trusted in-process execution does not claim isolation"
+            if package.manifest.sandbox == "optional"
+            else "required sandbox evidence must be supplied by an isolation runtime",
+        )
+    )
     components = load_package_components(package)
     evidence.extend(
-        PluginConformanceEvidence("component", not components.diagnostics, detail)
+        PluginConformanceEvidence("component", False, detail)
         for detail in components.diagnostics
     )
     if not components.diagnostics:
