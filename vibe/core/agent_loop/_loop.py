@@ -486,6 +486,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             self.plugin_package_registry, discover_legacy_entrypoint_names()
         )
         self._active_plugin_skill_paths: tuple[Path, ...] = ()
+        self._plugin_config_snapshot = config.plugins.model_dump(mode="json")
         self.plugin_lifecycle = PluginLifecycle()
         self.plugin_runtime_manager = PluginRuntimeManager(
             self.plugin_package_registry,
@@ -678,19 +679,54 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             for name, runtime in self.plugin_lifecycle.runtimes.items()
             if runtime.phase is PluginLifecyclePhase.ACTIVATE
         }
-        self._active_plugin_skill_paths = tuple(
+        active_skill_paths = tuple(
             components.skills
             for name, components in self.plugin_package_registry.components.items()
             if name in active and components.skills is not None
         )
-        if not self._active_plugin_skill_paths:
-            return
-        self.skill_manager = SkillManager(
+        skill_manager = SkillManager(
             lambda: self.config,
             harness_files=self.harness_files,
-            extra_search_paths=self._active_plugin_skill_paths,
+            extra_search_paths=active_skill_paths,
         )
+        self._active_plugin_skill_paths = active_skill_paths
+        self.skill_manager = skill_manager
         self.messages.update_system_prompt(self._build_system_prompt())
+
+    async def _reconcile_plugins(self, target_config: VibeConfigSchema) -> None:
+        snapshot = target_config.plugins.model_dump(mode="json")
+        if snapshot == self._plugin_config_snapshot:
+            return
+        async with self._plugin_activation_lock:
+            if snapshot == self._plugin_config_snapshot:
+                return
+            await self.plugin_runtime_manager.shutdown()
+            registry = discover_package_plugins(
+                set(target_config.plugins.enabled), project_root=self.cwd
+            )
+            add_legacy_entrypoint_diagnostics(
+                registry, discover_legacy_entrypoint_names()
+            )
+            lifecycle = PluginLifecycle()
+            runtime_manager = PluginRuntimeManager(
+                registry,
+                lifecycle,
+                target_config.plugins.permission_policy(),
+                sandbox_policy=target_config.plugins.sandbox,
+                sandbox_backend=target_config.plugins.sandbox_backend,
+            )
+            await runtime_manager.activate_enabled()
+            self.plugin_package_registry = registry
+            self.plugin_lifecycle = lifecycle
+            self.plugin_runtime_manager = runtime_manager
+            self._active_plugin_skill_paths = tuple(
+                components.skills
+                for name, components in registry.components.items()
+                if name in lifecycle.runtimes
+                and lifecycle.runtimes[name].phase is PluginLifecyclePhase.ACTIVATE
+                and components.skills is not None
+            )
+            self._plugin_config_snapshot = snapshot
 
     async def wait_until_ready(self) -> None:
         """Await deferred initialization (MCP + experiments) from an async context."""
@@ -2864,6 +2900,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             if switch_to_agent is not None
             else self.config
         )
+        if generation != self._reload_generation:
+            return
+        await self._reconcile_plugins(target_config)
+        if generation != self._reload_generation:
+            return
 
         # Off-loop: skill discovery and system prompt I/O. reload() is awaited within a
         # turn, so that turn is suspended here -- nothing mutates the shared state this
