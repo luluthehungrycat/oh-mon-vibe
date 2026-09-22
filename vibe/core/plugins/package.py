@@ -38,14 +38,12 @@ PluginPackageDiagnosticEvent = Literal[
     "legacy_entrypoint",
 ]
 
+
 class PluginPackageManifest(BaseModel):
-    model_config = ConfigDict(
-        extra="forbid", frozen=True, populate_by_name=True
-    )
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
 
     schema_version: Literal["omv.plugin.v1"] = Field(
-        validation_alias="schema",
-        serialization_alias="schema",
+        validation_alias="schema", serialization_alias="schema"
     )
     name: str
     version: str
@@ -86,7 +84,9 @@ class PluginPackageManifest(BaseModel):
     def validate_capabilities(self) -> PluginPackageManifest:
         unsupported = self.capabilities - _PLUGIN_CAPABILITIES
         if unsupported:
-            raise ValueError(f"unsupported plugin capabilities: {sorted(unsupported)!r}")
+            raise ValueError(
+                f"unsupported plugin capabilities: {sorted(unsupported)!r}"
+            )
         allowed = {
             "analyzer": frozenset({"analyzer", "skills", "mcp"}),
             "tool": frozenset({"tool", "skills", "mcp"}),
@@ -245,6 +245,7 @@ def add_legacy_entrypoint_diagnostics(
             "legacy Python entry point remains available through the internal registry; "
             "it was not enabled as a package",
         )
+
 
 def discover_legacy_entrypoint_names() -> list[str]:
     try:

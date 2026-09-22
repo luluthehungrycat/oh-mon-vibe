@@ -35,11 +35,16 @@ class PluginApprovalRequired(RuntimeError):
 def load_package_entrypoint(package: PluginPackage) -> object:
     entrypoint = package.manifest.entrypoint
     if entrypoint.count(":") != 1:
-        raise PluginLoadError("entrypoint must use exactly one module:attribute separator")
+        raise PluginLoadError(
+            "entrypoint must use exactly one module:attribute separator"
+        )
     module_name, attribute = entrypoint.split(":")
-    if not module_name or not attribute or not all(
-        part.isidentifier() for part in module_name.split(".")
-    ) or not attribute.isidentifier():
+    if (
+        not module_name
+        or not attribute
+        or not all(part.isidentifier() for part in module_name.split("."))
+        or not attribute.isidentifier()
+    ):
         raise PluginLoadError("entrypoint must use module:attribute syntax")
     module_path = _module_path(package.root, module_name)
     if module_path is None:

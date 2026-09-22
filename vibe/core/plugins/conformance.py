@@ -52,9 +52,7 @@ def run_plugin_conformance(package: PluginPackage) -> PluginConformanceReport:
         manifest_ok = parsed == package.manifest
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
         manifest_detail = f"invalid plugin.json: {exc}"
-    evidence.append(
-        PluginConformanceEvidence("manifest", manifest_ok, manifest_detail)
-    )
+    evidence.append(PluginConformanceEvidence("manifest", manifest_ok, manifest_detail))
     evidence.append(
         PluginConformanceEvidence(
             "schema",
