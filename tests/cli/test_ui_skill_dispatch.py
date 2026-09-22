@@ -217,8 +217,9 @@ async def test_popped_queued_skill_does_not_fire_telemetry(
         blocker, release = _block_agent_job(vibe_app_with_skills)
         try:
             chat_input.post_message(ChatInputContainer.Submitted("/my-skill"))
-            await pilot.pause(0.1)
-            assert len(vibe_app_with_skills._input_queue) == 1
+            assert await _wait_until(
+                pilot, lambda: len(vibe_app_with_skills._input_queue) == 1
+            )
 
             await pilot.press("ctrl+c")
             await pilot.pause(0.1)
@@ -244,8 +245,9 @@ async def test_queued_head_skill_injects_skill_tool_message(
         try:
             chat_input.post_message(ChatInputContainer.Submitted("/my-skill"))
             chat_input.post_message(ChatInputContainer.Submitted("follow-up prompt"))
-            await pilot.pause(0.1)
-            assert len(vibe_app_with_skills._input_queue) == 2
+            assert await _wait_until(
+                pilot, lambda: len(vibe_app_with_skills._input_queue) == 2
+            )
         finally:
             await _release_agent_job(vibe_app_with_skills, blocker, release)
 
@@ -281,8 +283,9 @@ async def test_skill_prompt_flushed_before_bash_injects_skill_tool_message(
         try:
             chat_input.post_message(ChatInputContainer.Submitted("/my-skill"))
             chat_input.post_message(ChatInputContainer.Submitted("!echo queued"))
-            await pilot.pause(0.1)
-            assert len(vibe_app_with_skills._input_queue) == 2
+            assert await _wait_until(
+                pilot, lambda: len(vibe_app_with_skills._input_queue) == 2
+            )
         finally:
             await _release_agent_job(vibe_app_with_skills, blocker, release)
 

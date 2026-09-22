@@ -654,11 +654,10 @@ class MessageList(Sequence[LLMMessage]):
         Under deferred init the prompt can land after messages were already
         appended, so insert at the front rather than clobber slot 0.
         """
-        msg = LLMMessage(role=Role.system, content=new)
         if self._data and self._data[0].role == Role.system:
-            self._data[0] = msg
-        else:
-            self._data.insert(0, msg)
+            self._data[0].content = new
+            return
+        self._data.insert(0, LLMMessage(role=Role.system, content=new))
 
     def __len__(self) -> int:
         return len(self._data)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -99,6 +100,7 @@ class EventHandler:
         self._turn_assistant_message: AssistantMessage | None = None
         self.current_streaming_reasoning: ReasoningMessage | None = None
         self.current_tool_group: ToolGroup | None = None
+        self._tool_group_lock = asyncio.Lock()
         self.plan_file_message: PlanFileMessage | None = None
         self._hook_containers: dict[str, HookRunContainer] = {}
         self._tool_call_anchors: dict[str, Widget] = {}
@@ -413,13 +415,18 @@ class EventHandler:
         self.current_tool_group = None
 
     async def _ensure_tool_group(self) -> ToolGroup:
-        if self.current_tool_group is None:
+        async with self._tool_group_lock:
+            if self.current_tool_group is not None:
+                return self.current_tool_group
             group = ToolGroup()
-            self.current_tool_group = group
             await self.mount_callback(group)
-        return self.current_tool_group
+            self.current_tool_group = group
+            return group
 
     async def _mount_in_group(self, group: ToolGroup, widget: Widget) -> None:
+        if not group.is_attached:
+            await self.mount_callback(widget)
+            return
         children = list(group.content_container.children)
         if children:
             await self.mount_callback(widget, after=children[-1])
