@@ -648,6 +648,10 @@ or Firejail isolation. A required plugin or required user policy fails closed
 when protocol, network, workdir, timeout, or cleanup evidence is incomplete;
 there is no silent unsandboxed fallback.
 
+When `sandbox = "auto"` cannot select a backend with complete evidence, the
+plugin is refused rather than run unsandboxed; use `sandbox = "off"` for
+trusted in-process plugins.
+
 Package `mcp.json` is parsed and validated during discovery, but packages that
 declare the `mcp` capability remain inactive until a policy-aware host adapter
 is available; MCP servers are never injected into the ordinary host tool

@@ -113,6 +113,10 @@ class PluginRuntimeManager:
             policy=self.sandbox_policy,
             plan=plan,
         )
+        if self.sandbox_policy == "auto" and plan is None:
+            raise PluginSandboxError(
+                "optional plugin sandbox backend is unavailable; activation refused"
+            )
         if plan is not None and not plan.evidence.complete:
             raise PluginSandboxError(
                 "selected plugin sandbox lacks executable timeout and cleanup evidence"

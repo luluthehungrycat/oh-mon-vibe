@@ -97,3 +97,22 @@ async def test_runtime_manager_isolates_entrypoint_load_failure(tmp_path: Path) 
 
     assert lifecycle.diagnostics[-1].event == "registration_failed"
     assert "startup failed" in lifecycle.diagnostics[-1].reason
+
+
+@pytest.mark.asyncio
+async def test_auto_sandbox_refuses_missing_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = _package(tmp_path)
+    registry = PluginPackageRegistry(enabled={"demo": package})
+    lifecycle = PluginLifecycle()
+    monkeypatch.setattr(
+        "vibe.core.plugins.runtime.select_plugin_sandbox", lambda *args, **kwargs: None
+    )
+
+    await PluginRuntimeManager(
+        registry, lifecycle, sandbox_policy="auto"
+    ).activate_enabled()
+
+    assert lifecycle.diagnostics[-1].event == "registration_failed"
+    assert "backend is unavailable" in lifecycle.diagnostics[-1].reason

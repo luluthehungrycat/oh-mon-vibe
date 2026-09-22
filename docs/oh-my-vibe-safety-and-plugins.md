@@ -69,6 +69,11 @@ without plugin permission enforcement. The existing Python entry-point registry
 remains an internal migration path; it is diagnosed as legacy and never
 silently promoted to a package.
 
+With `sandbox = "auto"`, the initial host refuses activation when no backend
+with complete evidence is available; trusted in-process plugins must use
+`sandbox = "off"` explicitly rather than receiving a silent unsandboxed
+fallback.
+
 ## Legacy Python entry-point contract
 
 Legacy plugins are discovered from the `omv.plugins` Python entry-point group
