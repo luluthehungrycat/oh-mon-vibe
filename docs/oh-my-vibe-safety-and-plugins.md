@@ -61,9 +61,13 @@ outcome = "always"       # always, ask, deny
 The manifest declares semantic `version`, `kind`, `capabilities`,
 package-local `entrypoint`, manual activation, trusted in-process execution,
 and an optional or required sandbox expectation. `skills/` and `mcp.json` are
-fixed, root-contained components and fail independently. The existing Python
-entry-point registry remains an internal migration path; it is diagnosed as
-legacy and never silently promoted to a package.
+fixed, root-contained components and fail independently. Package `mcp.json`
+is parsed and validated during discovery, but an enabled package declaring the
+`mcp` capability remains inactive until a policy-aware host adapter is
+available; OMV never injects those servers into ordinary host configuration
+without plugin permission enforcement. The existing Python entry-point registry
+remains an internal migration path; it is diagnosed as legacy and never
+silently promoted to a package.
 
 ## Legacy Python entry-point contract
 

@@ -648,6 +648,11 @@ or Firejail isolation. A required plugin or required user policy fails closed
 when protocol, network, workdir, timeout, or cleanup evidence is incomplete;
 there is no silent unsandboxed fallback.
 
+Package `mcp.json` is parsed and validated during discovery, but packages that
+declare the `mcp` capability remain inactive until a policy-aware host adapter
+is available; MCP servers are never injected into the ordinary host tool
+configuration without plugin permission enforcement.
+
 Legacy Python entry-point plugins remain available through the internal
 registry and are never silently enabled as manifest packages.
 
