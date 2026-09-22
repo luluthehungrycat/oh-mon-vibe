@@ -14,6 +14,14 @@ Oh My Vibe SHALL expose the selected sandbox backend, version or availability st
 ### Requirement: Sandboxed execution preserves the worktree
 A sandboxed Bash execution SHALL use the current project worktree as its writable working directory, SHALL prevent access to unrelated host files by default, and SHALL apply the configured network policy.
 
+#### Scenario: Network policy is explicit
+- **WHEN** sandboxed Bash execution is configured with `network = "none"`
+- **THEN** the selected backend SHALL disable network access and report `network_isolation = true`
+- **WHEN** sandboxed Bash execution is configured with `network = "host"`
+- **THEN** the selected backend SHALL omit network isolation and report `network_isolation = false`
+- **WHEN** configuration specifies `network = "project"`
+- **THEN** configuration validation SHALL reject it because no current backend provides a project-scoped network primitive
+
 #### Scenario: A routine project command runs
 - **WHEN** a command is eligible for sandboxing and the backend is available
 - **THEN** the command SHALL execute in the sandbox with the project worktree as its working directory and the result SHALL identify the execution as sandboxed

@@ -27,7 +27,7 @@ The initial implementation includes the protocol and deterministic evaluator. Th
 
 ### Sandbox runner
 
-Add a `SandboxBackend` protocol with Linux Bubblewrap and Firejail implementations. Bubblewrap is preferred when `auto` detects it; Firejail remains an explicit or secondary backend. Backends build argv lists rather than shell strings, run with the project directory as the writable scope, apply a configurable network mode, and report startup failures separately from command exit codes. The default mode is `off` for compatibility. When enabled, sandbox startup failure defaults to `ask` before unsandboxed fallback.
+Add a `SandboxBackend` protocol with Linux Bubblewrap and Firejail implementations. Bubblewrap is preferred when `auto` detects it; Firejail remains an explicit or secondary backend. Backends build argv lists rather than shell strings, run with the project directory as the writable scope, support the explicit network modes `none` and `host`, and report startup failures separately from command exit codes. `none` is the default and disables network access; `host` explicitly keeps host networking. A project-scoped network mode is unsupported until a backend exposes a real network-scope primitive. The default mode is `off` for compatibility. When enabled, sandbox startup failure defaults to `ask` before unsandboxed fallback.
 
 The Bash tool will ask the safety runtime for an execution plan. The plan selects the existing terminal transport when available or the local subprocess path, while preserving existing timeout, output limits, and cancellation behavior.
 
@@ -37,7 +37,7 @@ Extend the tool configuration with a nested `safety` section:
 
 - `sandbox`: `off`, `auto`, or `required`
 - `sandbox_backend`: `auto`, `bubblewrap`, `firejail`, or `none`
-- `network`: `none`, `project`, or `host`
+- `network`: `none` or `host`; `project` is unsupported until a backend provides a project-scoped network primitive
 - `fallback`: `ask`, `deny`, or `unsandboxed`
 - `policy`: `deterministic`, `hybrid`, or `plugin`
 - `llm_timeout_seconds`

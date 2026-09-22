@@ -295,7 +295,7 @@ def _matches_pattern(command: str, pattern: str) -> bool:
 class BashSafetyConfig(BaseModel):
     sandbox: Literal["off", "auto", "required"] = "off"
     sandbox_backend: Literal["auto", "bubblewrap", "firejail", "none"] = "auto"
-    network: Literal["none", "project", "host"] = "none"
+    network: Literal["none", "host"] = "none"
     fallback: Literal["ask", "deny", "unsandboxed"] = "ask"
     policy: Literal["deterministic", "hybrid", "plugin"] = "deterministic"
     llm_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
