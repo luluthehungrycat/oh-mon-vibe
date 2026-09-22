@@ -35,7 +35,11 @@ Document trusted in-process execution separately from process-isolated execution
 
 ### Conformance before SDK extraction
 
-Contract tests and one reviewed adapter mapping are prerequisites. This prevents an SDK from encoding unstable assumptions and allows Hermes/OpenCode feasibility to shape the standard.
+Contract tests and one reviewed adapter mapping are prerequisites. The
+design-only Hermes Agent and OpenCode mappings, evidence fixtures, and SDK
+readiness gate are maintained in `adapter-mappings.md`. This prevents an SDK
+from encoding unstable assumptions and allows harness feasibility to shape the
+standard.
 
 ## Risks / Trade-offs
 
@@ -49,6 +53,6 @@ Contract tests and one reviewed adapter mapping are prerequisites. This prevents
 
 1. Add contract documentation and tests around the existing registry without changing safety authority.
 2. Exercise manifest and failure cases in the current host.
-3. Draft adapter mappings for Hermes Agent and OpenCode as design artifacts only.
-4. Review isolation and version-negotiation gaps.
-5. Propose SDK extraction only as a later, separate change once exit criteria are met.
+3. Draft and review adapter mappings for Hermes Agent and OpenCode as design artifacts only.
+4. Review isolation and version-negotiation gaps and record explicit refusal behavior.
+5. Propose SDK extraction only as a later, separate change once the checklist in `adapter-mappings.md` passes.
