@@ -397,6 +397,15 @@ def project_diagnostics(agent_loop: AgentLoop) -> tuple[list[ConfigIssue], int]:
         *(
             _project_plugin_lifecycle_issue(issue)
             for issue in agent_loop.plugin_lifecycle.diagnostics
+            if issue.event
+            in {
+                "registration_failed",
+                "activation_failed",
+                "invocation_failed",
+                "deactivation_failed",
+                "cleanup_failed",
+                "sandbox_required",
+            }
         ),
     ]
     return issues, agent_loop.hooks_count

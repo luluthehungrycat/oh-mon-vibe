@@ -693,14 +693,20 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self.skill_manager = skill_manager
         self.messages.update_system_prompt(self._build_system_prompt())
 
-    async def _reconcile_plugins(self, target_config: VibeConfigSchema) -> None:
+    async def _reconcile_plugins(self, target_config: VibeConfigSchema) -> bool:
         snapshot = target_config.plugins.model_dump(mode="json")
         if snapshot == self._plugin_config_snapshot:
-            return
+            return False
         async with self._plugin_activation_lock:
             if snapshot == self._plugin_config_snapshot:
-                return
+                return False
+            old_lifecycle = self.plugin_lifecycle
             await self.plugin_runtime_manager.shutdown()
+            old_failure_diagnostics = tuple(
+                issue
+                for issue in old_lifecycle.diagnostics
+                if issue.event in {"deactivation_failed", "cleanup_failed"}
+            )
             registry = discover_package_plugins(
                 set(target_config.plugins.enabled), project_root=self.cwd
             )
@@ -708,6 +714,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 registry, discover_legacy_entrypoint_names()
             )
             lifecycle = PluginLifecycle()
+            lifecycle.diagnostics.extend(old_failure_diagnostics)
             runtime_manager = PluginRuntimeManager(
                 registry,
                 lifecycle,
@@ -727,6 +734,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 and components.skills is not None
             )
             self._plugin_config_snapshot = snapshot
+            self._plugins_activated = True
+            return True
 
     async def wait_until_ready(self) -> None:
         """Await deferred initialization (MCP + experiments) from an async context."""
@@ -910,6 +919,12 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         await self._config_orchestrator.reload()
         self.agent_manager.invalidate_config()
         self._ensure_remote_registries()
+        plugin_config_changed = (
+            self.config.plugins.model_dump(mode="json") != self._plugin_config_snapshot
+        )
+        await self._reconcile_plugins(self.config)
+        if plugin_config_changed:
+            self._activate_plugin_components()
         if self.mcp_registry is not None:
             self.mcp_registry.sync_active_servers(self.config.mcp_servers)
 
