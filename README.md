@@ -21,7 +21,7 @@ Oh My Vibe is a command-line coding assistant. It provides a conversational inte
 **Linux and macOS**
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/luluthehungrycat/oh-my-vibe/main/scripts/install.sh | bash
+curl -LsSf https://raw.githubusercontent.com/luluthehungrycat/oh-my-vibe/refs/heads/main/scripts/install.sh | bash
 ```
 
 **Windows**
