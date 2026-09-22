@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added a provider-neutral, credentials-free `LLMAnalyzer` adapter boundary for optional injected classifiers.
 - Bash results and UI displays now expose structured policy, evaluator, sandbox, and fallback metadata.
 - Contributor guidance for preserving vanilla Vibe CLI documentation and placing portable versus harness-specific project skills.
+- Added the `omv.plugin.v1` manifest-first package standard with disabled-by-default discovery from global and project `.omv/plugins/` roots, fixed `skills/` and `mcp.json` components, lifecycle diagnostics, and legacy entry-point migration diagnostics.
+- Added host-owned plugin permission rules (`always`/`ask`/`deny`) with safe read-only defaults, approval for side effects and ambiguity, and deterministic Bash guardrail precedence.
+- Added opt-in plugin sandbox policy (`off`/`auto`/`required`) with host-selected Bubblewrap/Firejail plans, versioned stdio capability evidence, and fail-closed required isolation.
+
+### Fixed
+
+- Bash sandbox network configuration now rejects the unsupported `project` scope and distinguishes the default isolated `none` mode from explicit host networking in Bubblewrap and Firejail capabilities and argv.
 
 ## [2.24.0] - 2026-08-05
 

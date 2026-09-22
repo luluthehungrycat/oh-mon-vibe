@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import shlex
 from string import Formatter
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -19,6 +19,9 @@ from pydantic import (
     model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+if TYPE_CHECKING:
+    from vibe.core.plugins.policy import PluginPermissionPolicy
 
 from vibe.config_values import (
     THINKING_LEVELS as THINKING_LEVELS,
@@ -51,6 +54,44 @@ class ProjectContextConfig(BaseSettings):
 
     default_commit_count: int = 5
     timeout_seconds: float = 2.0
+
+
+class PluginPermissionConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    outcome: Literal["always", "ask", "deny"]
+    plugin: str = "*"
+    capability: str = "*"
+    action: str = "*"
+    command: str = "*"
+
+
+class PluginConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: list[str] = Field(default_factory=list)
+    sandbox: Literal["off", "auto", "required"] = "off"
+    sandbox_backend: Literal["auto", "bubblewrap", "firejail"] = "auto"
+    permissions: list[PluginPermissionConfig] = Field(default_factory=list)
+
+    def permission_policy(self) -> PluginPermissionPolicy:
+        from vibe.core.plugins.policy import (
+            PluginPermissionPolicy,
+            PluginPermissionRule,
+        )
+
+        return PluginPermissionPolicy(
+            tuple(
+                PluginPermissionRule(
+                    outcome=rule.outcome,
+                    plugin=rule.plugin,
+                    capability=rule.capability,
+                    action=rule.action,
+                    command=rule.command,
+                )
+                for rule in self.permissions
+            )
+        )
 
 
 class ExperimentsConfig(BaseSettings):

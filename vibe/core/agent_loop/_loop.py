@@ -78,6 +78,7 @@ from vibe.core.middleware import (
     make_plan_agent_reminder,
 )
 from vibe.core.plan_session import PlanSession
+from vibe.core.plugins import PluginPackageRegistry, discover_package_plugins
 from vibe.core.review import ReviewManager
 from vibe.core.rewind import RewindManager
 from vibe.core.scratchpad import cleanup_scratchpad, init_scratchpad
@@ -471,6 +472,9 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             harness_files=self.harness_files,
         )
         config = self.config
+        self.plugin_package_registry: PluginPackageRegistry = discover_package_plugins(
+            set(config.plugins.enabled), project_root=self.cwd
+        )
         self.experiment_manager = ExperimentManager(
             client=RemoteEvalClient.from_settings(
                 api_host=config.experiments.api_host,

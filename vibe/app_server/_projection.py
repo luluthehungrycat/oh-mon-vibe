@@ -71,6 +71,7 @@ from vibe.core.config import (
     VibeConfigSchema,
 )
 from vibe.core.log_reader import PaginatedLogs
+from vibe.core.plugins import PluginPackageDiagnostic
 from vibe.core.tools.connectors.connector_registry import ConnectorAuthAction
 from vibe.core.tools.connectors.counts import compute_connector_counts
 from vibe.core.tools.remote import AuthStatus, MCPTool
@@ -388,6 +389,10 @@ def project_diagnostics(agent_loop: AgentLoop) -> tuple[list[ConfigIssue], int]:
     issues = [
         *(_project_issue(issue) for issue in agent_loop.hook_config_issues),
         *(_project_issue(issue) for issue in agent_loop.skill_manager.config_issues),
+        *(
+            _project_plugin_issue(issue)
+            for issue in agent_loop.plugin_package_registry.diagnostics
+        ),
     ]
     return issues, agent_loop.hooks_count
 
@@ -649,6 +654,12 @@ def _project_agent(profile: AgentProfile) -> AgentSummary:
 
 def _project_issue(issue: _ConfigIssue) -> ConfigIssue:
     return ConfigIssue(file=str(issue.file), message=issue.message)
+
+
+def _project_plugin_issue(issue: PluginPackageDiagnostic) -> ConfigIssue:
+    return ConfigIssue(
+        file=f"plugin:{issue.package}", message=f"{issue.event}: {issue.reason}"
+    )
 
 
 class _HistoryFields(TypedDict):

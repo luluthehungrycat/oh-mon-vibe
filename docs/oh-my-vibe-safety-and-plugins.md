@@ -17,7 +17,7 @@ The default remains compatible with existing behavior:
 [tools.bash.safety]
 sandbox = "off"          # off, auto, required
 sandbox_backend = "auto" # auto, bubblewrap, firejail, none
-network = "none"         # none, project, host
+network = "none"         # none, host
 fallback = "ask"         # ask, deny, unsandboxed
 policy = "deterministic" # deterministic, hybrid, plugin
 llm_timeout_seconds = 5
@@ -34,18 +34,51 @@ network = "none"
 fallback = "ask"
 ```
 
-Commands that pass core guardrails can run in the project sandbox without a repeated approval prompt. Bubblewrap uses a read-only host view, a writable project worktree, private `/tmp`, isolated `/proc` and `/dev`, and optional network namespace isolation. Firejail remains available as a secondary backend. If the selected backend cannot start, `ask` requires approval before the command falls back to the host. `deny` never falls back; `unsandboxed` is available only as an explicit user choice.
+Commands that pass core guardrails can run in the project sandbox without a repeated approval prompt. Bubblewrap uses a read-only host view, a writable project worktree, private `/tmp`, isolated `/proc` and `/dev`, and the configured network mode: `none` disables network access, while `host` explicitly keeps host networking. `project` is unsupported because neither backend currently provides a project-scoped network primitive. Firejail remains available as a secondary backend. If the selected backend cannot start, `ask` requires approval before the command falls back to the host. `deny` never falls back; `unsandboxed` is available only as an explicit user choice.
 
-## Plugin contract
+## Manifest package standard
 
-Plugins are discovered from the `omv.plugins` Python entry-point group and must be explicitly listed in `enabled_plugins`. They declare a manifest with:
+The current OMV package contract is `omv.plugin.v1` in a regular
+`plugin.json` at the package root. Packages are discovered from
+`~/.omv/plugins/<name>/` and `.omv/plugins/<name>/` as inert manifests; they
+are installed but disabled until `plugins.enabled` explicitly names them.
+Discovery never imports disabled entrypoints.
+
+```toml
+[plugins]
+enabled = ["example"]
+sandbox = "off"          # off, auto, required
+sandbox_backend = "auto" # auto, bubblewrap, firejail
+
+[[plugins.permissions]]
+plugin = "example"
+capability = "tool"
+action = "read"
+command = "cat *"
+outcome = "always"       # always, ask, deny
+```
+
+The manifest declares semantic `version`, `kind`, `capabilities`,
+package-local `entrypoint`, manual activation, trusted in-process execution,
+and an optional or required sandbox expectation. `skills/` and `mcp.json` are
+fixed, root-contained components and fail independently. The existing Python
+entry-point registry remains an internal migration path; it is diagnosed as
+legacy and never silently promoted to a package.
+
+## Legacy Python entry-point contract
+
+Legacy plugins are discovered from the `omv.plugins` Python entry-point group
+and must be explicitly listed in `enabled_plugins`. They declare a manifest with:
 
 - plugin name and version;
 - API version;
-- plugin kind;
-- capabilities.
+- plugin kind (`analyzer`, `sandbox`, or `combined`);
+- capabilities (`analyzer` and/or `sandbox_backend`);
+- trusted in-process execution status.
 
-Plugins can register command analyzers and sandbox backends. They cannot override built-in deny rules or silently grant themselves permission bypasses. Failures are isolated per plugin.
+Unknown capabilities, capabilities outside the declared kind, unsupported API versions, and process-isolated trust requests are rejected. Registration failures remain isolated and are exposed through structured plugin diagnostics with plugin identity, failure reason, trust level, and isolation status.
+
+Plugins can register command analyzers and sandbox backends. Sandbox-backend registration remains metadata-only until a reviewed adapter and isolation contract exists; Bash does not silently execute registry-provided backends. Plugins cannot override built-in deny rules or silently grant themselves permission bypasses. Failures are isolated per plugin.
 
 An LLM command analyzer can therefore be shipped as an optional plugin. Its result is advisory: `allow`, `deny`, or `ask`; timeouts and ambiguous results become human approval, and deterministic guardrails always win. The core project intentionally does not hard-code a provider or credentials into this path.
 

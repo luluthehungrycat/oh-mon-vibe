@@ -165,6 +165,33 @@ active_transcribe_model = "voxtral-realtime"
 active_tts_model = "voxtral-tts"
 ```
 
+### Oh My Vibe plugin packages
+
+Oh My Vibe discovers inert plugin packages from `~/.omv/plugins/` and the
+project-local `.omv/plugins/` directory. Each package has a `plugin.json`
+manifest and remains installed but disabled unless its name is listed under
+`plugins.enabled`. Discovery validates manifests and fixed `skills/` and
+`mcp.json` components without importing plugin code.
+
+```toml
+[plugins]
+enabled = ["example"]
+sandbox = "off"          # off, auto, required
+sandbox_backend = "auto" # auto, bubblewrap, firejail
+
+[[plugins.permissions]]
+plugin = "example"
+capability = "tool"
+action = "read"
+command = "cat *"
+outcome = "always"       # always, ask, deny
+```
+
+Plugin analyzers are advisory. Host Bash guardrails deny dangerous commands,
+ambiguous results request approval, and plugin `always` rules cannot override a
+host denial. Required isolation fails closed when the host cannot produce
+complete protocol, network, workdir, timeout, and cleanup evidence.
+
 ### Providers
 
 ```toml

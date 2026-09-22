@@ -72,6 +72,7 @@ pip install oh-my-vibe
   - [Custom System Prompts](#custom-system-prompts)
   - [Custom Agent Configurations](#custom-agent-configurations)
   - [Tool Management](#tool-management)
+  - [Oh My Vibe Plugin Packages](#oh-my-vibe-plugin-packages)
   - [MCP Server Configuration](#mcp-server-configuration)
   - [Session Management](#session-management)
   - [Update Settings](#update-settings)
@@ -110,7 +111,7 @@ Project skills that are portable across coding-agent harnesses live under `.agen
 
 For the current safety and plugin configuration, see [Oh My Vibe safety and plugins](docs/oh-my-vibe-safety-and-plugins.md). For the project-specific contribution contract, see [AGENTS.md](AGENTS.md).
 
-Bash safety results expose machine-readable policy/evaluator/sandbox/fallback metadata, while the UI shows a concise summary of that state. This makes automatic approvals inspectable without changing vanilla Vibe's default approval behavior.
+Bash safety results expose machine-readable policy/evaluator/sandbox/fallback metadata, while the UI shows a concise summary of that state. The sandbox network policy accepts only `none` (isolated, the default) or explicit `host` networking; project-scoped networking is not advertised until a backend can enforce it.
 
 ### Built-in Agents
 
@@ -605,6 +606,50 @@ Notes:
 
 - MCP tool names use underscores, e.g., `serena_list` not `serena.list`.
 - Regex patterns are matched against the full tool name using fullmatch.
+
+### Oh My Vibe Plugin Packages
+
+Oh My Vibe uses a manifest-first package format. Install packages under
+`~/.omv/plugins/<name>/` or the project-local
+`.omv/plugins/<name>/`; each package must contain a regular `plugin.json`.
+Discovery validates manifests and fixed `skills/` and `mcp.json` components
+without importing plugin code.
+
+Installed packages are disabled by default. Enable them explicitly:
+
+```toml
+[plugins]
+enabled = ["example"]
+sandbox = "off"          # off, auto, required
+sandbox_backend = "auto" # auto, bubblewrap, firejail
+
+[[plugins.permissions]]
+plugin = "example"
+capability = "tool"
+action = "read"
+command = "cat *"
+outcome = "always"       # always, ask, deny
+```
+
+The `plugin.json` manifest uses schema `omv.plugin.v1` and declares
+`name`, semantic `version`, `kind`, `capabilities`, a package-local
+`entrypoint`, manual activation, trust, and sandbox expectation. The current
+package loader accepts trusted in-process plugins; isolated-process packages
+are rejected until the versioned stdio runtime is available.
+
+Plugin permission decisions are host-owned. Safe read-only actions may be
+auto-allowed; side effects default to approval; explicit `always`, `ask`, and
+`deny` rules are matched by plugin, capability, action, and command. Core Bash
+guardrails and explicit human denials take precedence. Ambiguous rules and
+analyzer failures request approval.
+
+`sandbox = "auto"` or `"required"` opts plugins into host-selected Bubblewrap
+or Firejail isolation. A required plugin or required user policy fails closed
+when protocol, network, workdir, timeout, or cleanup evidence is incomplete;
+there is no silent unsandboxed fallback.
+
+Legacy Python entry-point plugins remain available through the internal
+registry and are never silently enabled as manifest packages.
 
 ### MCP Server Configuration
 
