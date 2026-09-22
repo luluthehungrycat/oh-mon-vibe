@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
@@ -31,9 +31,11 @@ class SkillManager:
         config_getter: Callable[[], VibeConfigSchema],
         *,
         harness_files: HarnessFilesManager | None = None,
+        extra_search_paths: Sequence[Path] = (),
     ) -> None:
         self._config_getter = config_getter
         self._harness_files = harness_files or get_harness_files_manager()
+        self._extra_search_paths = tuple(extra_search_paths)
         self._search_paths = self._compute_search_paths(self._config)
         self._config_issues: list[SkillConfigIssue] = []
         self.available_skills: Mapping[str, SkillInfo] = MappingProxyType(
@@ -76,10 +78,10 @@ class SkillManager:
         for path in config.skill_paths:
             if path.is_dir():
                 paths.append(path)
-
         mgr = self._harness_files
         paths.extend(mgr.project_skills_dirs)
         paths.extend(mgr.user_skills_dirs)
+        paths.extend(self._extra_search_paths)
 
         unique: list[Path] = []
         for p in paths:

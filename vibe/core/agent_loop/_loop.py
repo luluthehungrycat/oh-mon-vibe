@@ -485,6 +485,25 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         add_legacy_entrypoint_diagnostics(
             self.plugin_package_registry, discover_legacy_entrypoint_names()
         )
+        plugin_skill_paths = [
+            components.skills
+            for name, components in self.plugin_package_registry.components.items()
+            if name in self.plugin_package_registry.enabled
+            and components.skills is not None
+        ]
+        plugin_mcp_servers = [
+            server
+            for name, components in self.plugin_package_registry.components.items()
+            if name in self.plugin_package_registry.enabled
+            for server in components.mcp_servers
+        ]
+        configured_mcp_names = {server.name for server in config.mcp_servers}
+        config.mcp_servers.extend(
+            server
+            for server in plugin_mcp_servers
+            if server.name not in configured_mcp_names
+        )
+        self._plugin_skill_paths = tuple(plugin_skill_paths)
         self.plugin_lifecycle = PluginLifecycle()
         self.plugin_runtime_manager = PluginRuntimeManager(
             self.plugin_package_registry,
@@ -519,7 +538,9 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             scratchpad_dir=self.scratchpad_dir,
         )
         self.skill_manager = SkillManager(
-            lambda: self.config, harness_files=self.harness_files
+            lambda: self.config,
+            harness_files=self.harness_files,
+            extra_search_paths=self._plugin_skill_paths,
         )
         self._max_turns = max_turns
         self._max_price = max_price
@@ -693,6 +714,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         if self._pending_new_session_telemetry:
             self._pending_new_session_telemetry = False
             self.emit_new_session_telemetry()
+
     @property
     def agent_profile(self) -> AgentProfile:
         return self.agent_manager.active_profile
@@ -2871,7 +2893,9 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             terminal_runtime=self.tool_manager.terminal_runtime,
         )
         skill_manager = SkillManager(
-            config_source.get, harness_files=self.harness_files
+            config_source.get,
+            harness_files=self.harness_files,
+            extra_search_paths=self._plugin_skill_paths,
         )
         system_prompt = self._render_system_prompt(
             skill_manager, target_config, tool_manager
