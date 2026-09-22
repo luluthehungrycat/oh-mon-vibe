@@ -2900,11 +2900,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             if switch_to_agent is not None
             else self.config
         )
-        if generation != self._reload_generation:
-            return
-        await self._reconcile_plugins(target_config)
-        if generation != self._reload_generation:
-            return
+        plugin_config_changed = (
+            target_config.plugins.model_dump(mode="json")
+            != self._plugin_config_snapshot
+        )
 
         # Off-loop: skill discovery and system prompt I/O. reload() is awaited within a
         # turn, so that turn is suspended here -- nothing mutates the shared state this
@@ -2916,6 +2915,15 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         # A newer reload superseded us; let it own the commit.
         if generation != self._reload_generation:
             return
+        if plugin_config_changed:
+            await self._reconcile_plugins(target_config)
+            if generation != self._reload_generation:
+                return
+            prepared = await asyncio.to_thread(
+                self._prepare_reload, target_config, reload_hooks
+            )
+            if generation != self._reload_generation:
+                return
 
         # Synchronous swap: no await, so an in-flight turn can't observe a partial
         # update. Keep it that way -- don't make it async or move it off-thread.
