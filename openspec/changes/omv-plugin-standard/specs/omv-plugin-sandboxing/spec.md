@@ -22,6 +22,13 @@ activation.
 - **WHEN** user policy is `auto` or `required` and an optional plugin provides a compatible isolated-process protocol
 - **THEN** OMV SHALL run it through the selected backend and SHALL report availability, network isolation, writable-workdir, timeout, and cleanup capabilities
 
+#### Scenario: Optional plugin lacks an auto sandbox backend
+
+- **WHEN** user policy is `auto` and no compatible backend with complete
+  capability evidence is available
+- **THEN** OMV SHALL refuse activation rather than run the trusted plugin
+  unsandboxed
+
 ### Requirement: Untrusted plugins cannot claim isolation without evidence
 
 OMV MUST distinguish trusted in-process plugins from isolated-process plugins.
@@ -37,4 +44,5 @@ cancellation behavior, and cleanup guarantee.
 #### Scenario: Sandbox startup fails
 
 - **WHEN** the selected backend fails before plugin code starts
-- **THEN** OMV SHALL apply the configured fallback policy and SHALL keep required-sandbox plugins disabled
+- **THEN** the initial host SHALL refuse activation and SHALL keep
+  required-sandbox plugins disabled

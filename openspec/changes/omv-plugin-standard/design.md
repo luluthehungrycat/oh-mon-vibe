@@ -86,8 +86,9 @@ The manifest declares `sandbox: optional | required`; omission means
 - `off` runs only plugins that do not require isolation; a required plugin is
   refused before activation.
 - `auto` sandboxes optional and required plugins when a compatible backend and
-  process adapter exist; an unavailable backend makes optional plugins ask or
-  refuse according to the user fallback, and always refuses required plugins.
+  process adapter exist; this initial host refuses optional plugins when the
+  backend or complete capability evidence is unavailable, and always refuses
+  required plugins.
 - `required` refuses plugins that cannot provide an isolatable process contract.
 
 In-process plugins are trusted code and cannot claim sandboxed execution. A
