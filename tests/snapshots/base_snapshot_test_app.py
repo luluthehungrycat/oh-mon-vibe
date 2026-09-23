@@ -15,6 +15,7 @@ from tests.stubs.app_server import create_test_app_server_session
 from tests.stubs.fake_account_gateway import FakeAccountGateway
 from tests.stubs.fake_backend import FakeBackend
 from vibe.app_server._account import WhoAmIResult
+from vibe.app_server.connector_catalog import ConnectorCatalogService
 from vibe.app_server.models import AccountPlanKind
 from vibe.cli.textual_ui.app import VibeApp
 from vibe.cli.textual_ui.widgets.chat_input import ChatTextArea
@@ -63,7 +64,7 @@ def default_config(**kwargs) -> VibeConfigSchema:
 
 class BaseSnapshotTestApp(VibeApp):
     CSS_PATH = "../../vibe/cli/textual_ui/app.tcss"
-    _current_agent_name: str = BuiltinAgentName.DEFAULT
+    _current_agent_name: str = BuiltinAgentName.ASK
 
     def __init__(
         self,
@@ -94,11 +95,16 @@ class BaseSnapshotTestApp(VibeApp):
                 )
             ),
         )
+        connector_catalog_service: ConnectorCatalogService | None = kwargs.pop(
+            "connector_catalog_service", None
+        )
 
         super().__init__(
             history_file=kwargs.pop("history_file", Path(".vibehistory")),
             app_server=lambda: create_test_app_server_session(
-                resolved_agent_loop, account_gateway=account_gateway
+                resolved_agent_loop,
+                account_gateway=account_gateway,
+                connector_catalog_service=connector_catalog_service,
             ),
             **kwargs,
         )

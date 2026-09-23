@@ -12,7 +12,6 @@ from vibe.app_server.models import (
 )
 from vibe.app_server.protocol import (
     AgentsListResponse,
-    ConfigReadResponse,
     DiagnosticsListResponse,
     RuntimeReadResponse,
     RuntimeSnapshot,
@@ -42,10 +41,16 @@ class ClientSessionState:
 
     @property
     def custom_skills_count(self) -> int:
-        return sum(skill.source != "builtin" for skill in self.skills)
+        return sum(
+            skill.source != "builtin" and skill.scope != "builtin"
+            for skill in self.skills
+        )
 
     def get_skill(self, name: str) -> SkillSummary | None:
-        return next((skill for skill in self.skills if skill.name == name), None)
+        folded = name.casefold()
+        return next(
+            (skill for skill in self.skills if skill.name.casefold() == folded), None
+        )
 
     def has_tool(self, name: str) -> bool:
         return any(tool.name == name for tool in self.tools)
@@ -61,11 +66,6 @@ class ClientSessionState:
             (index for index, agent in enumerate(primary) if agent.name == current), -1
         )
         return primary[(index + 1) % len(primary)]
-
-    def apply_config(self, response: ConfigReadResponse) -> None:
-        self.config = response.config
-        self.base_config = response.base_config
-        self.state.session.model = response.config.active_model.alias
 
     def apply_agents(self, response: AgentsListResponse) -> None:
         self.active_agent = response.active
@@ -83,7 +83,6 @@ class ClientSessionState:
 
     def apply_runtime(self, snapshot: RuntimeSnapshot) -> None:
         self.config = snapshot.config
-        self.base_config = snapshot.base_config
         self.active_agent = snapshot.active_agent
         self.agents = list(snapshot.agents)
         self.skills = list(snapshot.skills)
@@ -93,7 +92,23 @@ class ClientSessionState:
         self.issues = list(snapshot.issues)
         self.hooks_count = snapshot.hooks_count
         self.connectors = snapshot.connectors
-        self.mcp = snapshot.mcp
+        # The Studio "add connectors" link is resolved on the client during
+        # connector_catalog/read and never rides the runtime snapshot, so a
+        # mutation snapshot (toggle/refresh) would blank it. Carry the last
+        # resolved URL forward until the next catalog read replaces it.
+        previous_mcp = getattr(self, "mcp", None)
+        carried_manage_url = (
+            previous_mcp.manage_connectors_url if previous_mcp is not None else None
+        )
+        self.mcp = (
+            snapshot.mcp
+            if snapshot.mcp.manage_connectors_url is not None
+            else snapshot.mcp.model_copy(
+                update={"manage_connectors_url": carried_manage_url}
+            )
+        )
+        self.bypass_tool_permissions = snapshot.bypass_tool_permissions
+        self.experimental_harness = snapshot.experimental_harness
         self.state.session.model = snapshot.config.active_model.alias
         self.state.session.agent = snapshot.active_agent
         self.state.session.token_usage = snapshot.stats.token_usage

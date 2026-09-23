@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator, Callable, Iterator
 from contextlib import suppress
+import json
 import socket
 import time
 from types import TracebackType
@@ -35,6 +36,8 @@ from vibe.core.auth.mcp_oauth import (
     build_oauth_provider,
     delete_oauth_credentials,
     perform_oauth_login,
+    restore_oauth_credentials,
+    snapshot_oauth_credentials,
     unwrap_oauth_refresh_error,
 )
 from vibe.core.config import MCPOAuth, MCPStreamableHttp
@@ -153,7 +156,56 @@ class TestKeyringTokenStorage:
         assert loaded.access_token == "at"
         assert loaded.refresh_token == "rt"
         assert loaded.scope == "read write"
-        assert (_KEYRING_SERVICE, "mcp-oauth:linear:tokens") in memory_keyring.store
+        raw = memory_keyring.store[(_KEYRING_SERVICE, "mcp-oauth:linear:tokens")]
+        saved_at = json.loads(raw)["expires_at"]
+        assert saved_at == pytest.approx(time.time() + 3600, abs=1)
+
+    @pytest.mark.asyncio
+    async def test_loading_tokens_restores_absolute_expiry(
+        self, memory_keyring: _MemoryKeyring
+    ) -> None:
+        storage = KeyringTokenStorage(alias="linear")
+        tokens = OAuthToken(access_token="at", expires_in=3600, refresh_token="rt")
+
+        with patch("vibe.core.auth.mcp_oauth.time.time", return_value=1000):
+            await storage.set_tokens(tokens)
+        with patch("vibe.core.auth.mcp_oauth.time.time", return_value=1600):
+            loaded = await storage.get_tokens()
+
+        assert loaded is not None
+        assert storage.token_expiry_time == 4600
+
+    @pytest.mark.asyncio
+    async def test_legacy_expiring_tokens_are_considered_expired(
+        self, memory_keyring: _MemoryKeyring
+    ) -> None:
+        storage = KeyringTokenStorage(alias="linear")
+        memory_keyring.store[(_KEYRING_SERVICE, "mcp-oauth:linear:tokens")] = (
+            OAuthToken(
+                access_token="at", expires_in=3600, refresh_token="rt"
+            ).model_dump_json()
+        )
+
+        loaded = await storage.get_tokens()
+
+        assert loaded is not None
+        assert storage.token_expiry_time == -1
+
+    @pytest.mark.asyncio
+    async def test_missing_tokens_do_not_probe_legacy_services(
+        self, memory_keyring: _MemoryKeyring, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        reads: list[tuple[str, str]] = []
+        original = memory_keyring.get_password
+
+        def _record(service: str, username: str) -> str | None:
+            reads.append((service, username))
+            return original(service, username)
+
+        monkeypatch.setattr(memory_keyring, "get_password", _record)
+
+        assert await KeyringTokenStorage(alias="linear").get_tokens() is None
+        assert reads == [(_KEYRING_SERVICE, "mcp-oauth:linear:tokens")]
 
     @pytest.mark.asyncio
     async def test_round_trip_client_info(self, memory_keyring: _MemoryKeyring) -> None:
@@ -227,6 +279,42 @@ class TestKeyringTokenStorage:
         # No keyring backend means nothing was ever stored, so removing an OAuth
         # server (e.g. added with `--no-login` on CI) must not fail.
         await delete_oauth_credentials("linear")
+
+    @pytest.mark.asyncio
+    async def test_oauth_credential_snapshot_restores_exact_keyring_state(
+        self, memory_keyring: _MemoryKeyring
+    ) -> None:
+        """*Prepare*: One OAuth source has tokens, client registration, and fingerprint.
+        *Do*: Snapshot its keyring entries, delete them, and restore the snapshot.
+        *Assert*: Every opaque credential entry returns byte-for-byte unchanged.
+        """
+        # Prepare
+        storage = KeyringTokenStorage(alias="linear")
+        await storage.set_tokens(
+            OAuthToken(
+                access_token="access",
+                token_type="Bearer",
+                expires_in=3600,
+                refresh_token="refresh",
+            )
+        )
+        await storage.set_client_info(
+            OAuthClientInformationFull(
+                client_id="client",
+                redirect_uris=["http://127.0.0.1:47823/callback"],  # type: ignore[list-item]
+                token_endpoint_auth_method="none",
+            )
+        )
+        await Fingerprint.compute(_oauth_server(name="linear")).save("linear")
+        expected = dict(memory_keyring.store)
+
+        # Do
+        backup = await snapshot_oauth_credentials("linear")
+        await delete_oauth_credentials("linear")
+        await restore_oauth_credentials("linear", backup)
+
+        # Assert
+        assert memory_keyring.store == expected
 
 
 class TestFingerprint:
@@ -476,6 +564,54 @@ class TestRefreshAwareProvider:
         return provider
 
     @pytest.mark.asyncio
+    async def test_refresh_without_rotated_token_keeps_previous_refresh_token(
+        self, memory_keyring: _MemoryKeyring
+    ) -> None:
+        provider = self._provider(memory_keyring)
+        response = httpx.Response(
+            200,
+            json={
+                "access_token": "NEW_ACCESS",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            },
+        )
+
+        assert await provider._handle_refresh_response(response)
+
+        tokens = provider.context.current_tokens
+        assert tokens is not None
+        assert tokens.access_token == "NEW_ACCESS"
+        assert tokens.refresh_token == "REFRESH"
+        stored = await provider.context.storage.get_tokens()
+        assert stored is not None
+        assert stored.refresh_token == "REFRESH"
+
+    @pytest.mark.asyncio
+    async def test_refresh_with_rotated_token_keeps_new_refresh_token(
+        self, memory_keyring: _MemoryKeyring
+    ) -> None:
+        provider = self._provider(memory_keyring)
+        response = httpx.Response(
+            200,
+            json={
+                "access_token": "NEW_ACCESS",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": "ROTATED_REFRESH",
+            },
+        )
+
+        assert await provider._handle_refresh_response(response)
+
+        tokens = provider.context.current_tokens
+        assert tokens is not None
+        assert tokens.refresh_token == "ROTATED_REFRESH"
+        stored = await provider.context.storage.get_tokens()
+        assert stored is not None
+        assert stored.refresh_token == "ROTATED_REFRESH"
+
+    @pytest.mark.asyncio
     async def test_invalid_grant_raises_and_clears_in_memory_tokens(
         self, memory_keyring: _MemoryKeyring
     ) -> None:
@@ -528,6 +664,26 @@ class TestRefreshAwareProvider:
 
         assert provider.context.current_tokens is not None
 
+    @pytest.mark.asyncio
+    async def test_initialize_restores_persisted_token_expiry(
+        self, memory_keyring: _MemoryKeyring
+    ) -> None:
+        provider = self._provider(memory_keyring)
+        storage = KeyringTokenStorage(alias="demo")
+        with patch("vibe.core.auth.mcp_oauth.time.time", return_value=1000):
+            await storage.set_tokens(
+                OAuthToken(
+                    access_token="ACCESS", expires_in=3600, refresh_token="REFRESH"
+                )
+            )
+
+        provider.context.current_tokens = None
+        provider.context.token_expiry_time = None
+        with patch("vibe.core.auth.mcp_oauth.time.time", return_value=2000):
+            await provider._initialize()
+
+        assert provider.context.token_expiry_time == 4600
+
 
 class TestRefreshAwareProviderThroughHttpxFlow:
     """Drive the real httpx auth flow so the token-endpoint response reaches our
@@ -568,6 +724,47 @@ class TestRefreshAwareProviderThroughHttpxFlow:
     async def _drive_refresh(self, provider: RefreshAwareOAuthClientProvider) -> None:
         async with httpx.AsyncClient() as client:
             await client.get("https://mcp.sentry.dev/mcp", auth=provider)
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_expired_stored_token_is_refreshed_before_mcp_request(
+        self, memory_keyring: _MemoryKeyring
+    ) -> None:
+        provider = self._armed_provider(memory_keyring)
+        storage = KeyringTokenStorage(alias="sentry")
+        client_info = provider.context.client_info
+        assert client_info is not None
+        await storage.set_client_info(client_info)
+        with patch("vibe.core.auth.mcp_oauth.time.time", return_value=1000):
+            await storage.set_tokens(
+                OAuthToken(
+                    access_token="EXPIRED", expires_in=3600, refresh_token="REFRESH"
+                )
+            )
+        provider.context.current_tokens = None
+        provider.context.client_info = None
+        provider.context.token_expiry_time = None
+        provider._initialized = False
+        refresh = respx.post("https://mcp.sentry.dev/token").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "access_token": "FRESH",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                    "refresh_token": "NEXT_REFRESH",
+                },
+            )
+        )
+        mcp_request = respx.get("https://mcp.sentry.dev/mcp").mock(
+            return_value=httpx.Response(200)
+        )
+
+        with patch("vibe.core.auth.mcp_oauth.time.time", return_value=5000):
+            await self._drive_refresh(provider)
+
+        assert refresh.called
+        assert mcp_request.calls.last.request.headers["Authorization"] == "Bearer FRESH"
 
     @respx.mock
     @pytest.mark.asyncio
@@ -688,6 +885,17 @@ class TestUnwrapOAuthRefreshError:
         assert unwrap_oauth_refresh_error(excinfo.value) is raised
 
 
+class _RaisingStream:
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    async def __aenter__(self) -> None:
+        raise self._error
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+
 class TestPerformOAuthLogin:
     @pytest.mark.asyncio
     async def test_oauth_flow_error_becomes_login_failed(
@@ -710,8 +918,8 @@ class TestPerformOAuthLogin:
             ) -> None:
                 pass
 
-            async def get(self, _url: str) -> None:
-                raise OAuthFlowError("cancelled")
+            def stream(self, *_args: object, **_kwargs: object) -> _RaisingStream:
+                return _RaisingStream(OAuthFlowError("cancelled"))
 
         async def on_url(_url: str) -> None:
             pass
@@ -735,7 +943,7 @@ class TestPerformOAuthLogin:
             )
         errors.append(
             httpx.ConnectError(
-                "connection refused", request=httpx.Request("GET", srv.url)
+                "connection refused", request=httpx.Request("POST", srv.url)
             )
         )
 
@@ -754,8 +962,8 @@ class TestPerformOAuthLogin:
             ) -> None:
                 pass
 
-            async def get(self, _url: str) -> None:
-                raise errors.pop(0)
+            def stream(self, *_args: object, **_kwargs: object) -> _RaisingStream:
+                return _RaisingStream(errors.pop(0))
 
         async def on_url(_url: str) -> None:
             pass
@@ -767,6 +975,66 @@ class TestPerformOAuthLogin:
                 await perform_oauth_login(srv, on_url=on_url)
 
         assert errors == []
+
+    @pytest.mark.asyncio
+    async def test_transient_refresh_discards_stuck_creds_and_retries_fresh(
+        self, memory_keyring: _MemoryKeyring
+    ) -> None:
+        # Seed creds, fail the first refresh transiently (5xx), and assert the
+        # retry runs against an emptied keyring instead of re-refreshing.
+        srv = _oauth_server(name="demo")
+        storage = KeyringTokenStorage(alias="demo")
+        await storage.set_tokens(
+            OAuthToken(access_token="stale", refresh_token="stale-rt", expires_in=1)
+        )
+        await storage.set_client_info(
+            OAuthClientInformationFull(
+                client_id="pruned-dcr-client",
+                redirect_uris=["http://127.0.0.1:47823/callback"],  # type: ignore[list-item]
+                token_endpoint_auth_method="none",
+            )
+        )
+        await Fingerprint.compute(srv).save("demo")
+
+        errors: list[Exception] = [
+            MCPOAuthTransientRefreshError(server_alias="demo", reason="HTTP 500"),
+            OAuthFlowError("fresh authorization reached"),
+        ]
+        creds_at_each_attempt: list[bool] = []
+
+        class TransientThenFreshClient:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            async def __aenter__(self) -> TransientThenFreshClient:
+                return self
+
+            async def __aexit__(self, *_exc: object) -> None:
+                pass
+
+            def stream(self, *_args: object, **_kwargs: object) -> _RaisingStream:
+                creds_at_each_attempt.append(
+                    (_KEYRING_SERVICE, "mcp-oauth:demo:tokens") in memory_keyring.store
+                )
+                return _RaisingStream(errors.pop(0))
+
+        async def on_url(_url: str) -> None:
+            pass
+
+        with patch(
+            "vibe.core.auth.mcp_oauth.VibeAsyncHTTPClient", new=TransientThenFreshClient
+        ):
+            with pytest.raises(
+                MCPOAuthLoginFailed, match="fresh authorization reached"
+            ):
+                await perform_oauth_login(srv, on_url=on_url)
+
+        assert errors == []  # both attempts ran: a retry happened
+        # First attempt saw the stored tokens; the retry saw an emptied keyring.
+        assert creds_at_each_attempt == [True, False]
+        assert await storage.get_tokens() is None
+        assert await storage.get_client_info() is None
+        assert await Fingerprint.load("demo") is None
 
     @pytest.mark.asyncio
     async def test_full_flow_persists_tokens_and_fingerprint(
@@ -789,7 +1057,7 @@ class TestPerformOAuthLogin:
             asyncio.get_event_loop().create_task(fire())
 
         async with respx.mock(assert_all_called=False) as router:
-            router.get(server_url).mock(side_effect=_mcp_responses())
+            router.post(server_url).mock(side_effect=_mcp_responses())
             router.get(
                 "https://mcp.example.com/.well-known/oauth-protected-resource"
             ).mock(
@@ -854,6 +1122,109 @@ class TestPerformOAuthLogin:
         fp = await Fingerprint.load("demo")
         assert fp is not None
         assert fp == Fingerprint.compute(srv)
+
+    @pytest.mark.asyncio
+    async def test_a_server_that_refuses_get_is_still_challenged_into_oauth(
+        self, memory_keyring: _MemoryKeyring
+    ) -> None:
+        # Prepare
+        server_url = "https://mcp.example.com/mcp"
+        srv = _oauth_server(name="demo", url=server_url, scopes=["read"])
+        discovered = False
+
+        async def on_url(_url: str) -> None:
+            pass
+
+        def _resource_metadata(_request: httpx.Request) -> httpx.Response:
+            nonlocal discovered
+            discovered = True
+            raise httpx.ConnectError("stop here")
+
+        # Do
+        async with respx.mock(assert_all_called=False) as router:
+            get_route = router.get(server_url).mock(
+                return_value=httpx.Response(405, text="Method Not Allowed")
+            )
+            post_route = router.post(server_url).mock(
+                return_value=httpx.Response(
+                    401,
+                    headers={
+                        "WWW-Authenticate": (
+                            "Bearer resource_metadata="
+                            '"https://mcp.example.com'
+                            '/.well-known/oauth-protected-resource"'
+                        )
+                    },
+                )
+            )
+            router.get(
+                "https://mcp.example.com/.well-known/oauth-protected-resource"
+            ).mock(side_effect=_resource_metadata)
+
+            with pytest.raises(MCPOAuthLoginFailed):
+                await perform_oauth_login(srv, on_url=on_url)
+
+        # Assert
+        assert not get_route.called
+        assert post_route.called
+        request = post_route.calls.last.request
+        assert json.loads(request.content)["method"] == "initialize"
+        assert request.headers["accept"] == "application/json, text/event-stream"
+        assert discovered
+        assert await Fingerprint.load("demo") is None
+
+    @pytest.mark.asyncio
+    async def test_probe_without_challenge_fails_instead_of_saving_fingerprint(
+        self, memory_keyring: _MemoryKeyring
+    ) -> None:
+        # A probe the server never challenges leaves no token: login must fail, not save a fingerprint (VIBE-4667).
+        server_url = "https://mcp.example.com/mcp"
+        srv = _oauth_server(name="demo", url=server_url, scopes=["read"])
+
+        async def on_url(_url: str) -> None:
+            pass
+
+        async with respx.mock(assert_all_called=False) as router:
+            post_route = router.post(server_url).mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+            with pytest.raises(MCPOAuthLoginFailed):
+                await perform_oauth_login(srv, on_url=on_url)
+
+        assert post_route.called
+        assert await KeyringTokenStorage(alias="demo").get_tokens() is None
+        assert await Fingerprint.load("demo") is None
+
+    @pytest.mark.asyncio
+    async def test_the_challenge_carries_the_headers_the_server_was_declared_with(
+        self, memory_keyring: _MemoryKeyring
+    ) -> None:
+        # Prepare
+        server_url = "https://mcp.example.com/mcp"
+        srv = _oauth_server(name="demo", url=server_url, scopes=["read"])
+
+        async def on_url(_url: str) -> None:
+            pass
+
+        # Do
+        async with respx.mock(assert_all_called=False) as router:
+            post_route = router.post(server_url).mock(
+                side_effect=httpx.ConnectError(
+                    "stop here", request=httpx.Request("POST", server_url)
+                )
+            )
+            with pytest.raises(MCPOAuthLoginFailed):
+                await perform_oauth_login(
+                    srv,
+                    on_url=on_url,
+                    headers={"X-Figma-Plugin-Bundle": "figma_prod@2_2_96"},
+                )
+
+        # Assert
+        request = post_route.calls.last.request
+        assert request.headers["x-figma-plugin-bundle"] == "figma_prod@2_2_96"
+        # Never surrendered to a declaration: the transport routes on it.
+        assert request.headers["accept"] == "application/json, text/event-stream"
 
 
 def _mcp_responses() -> Callable[[httpx.Request], httpx.Response]:

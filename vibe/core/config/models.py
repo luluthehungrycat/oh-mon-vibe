@@ -62,9 +62,21 @@ class ExperimentsConfig(BaseSettings):
 
 
 class SessionLoggingConfig(BaseSettings):
+    # Matches its sibling groups. Under per-field merging the union of keys
+    # from every layer reaches the validator, so forbidding extras would turn
+    # one unrecognised key in any layer -- a project file naming a setting from
+    # a newer Vibe, say -- into a hard config-load failure.
+    model_config = SettingsConfigDict(extra="ignore")
+
     save_dir: str = ""
     session_prefix: str = "session"
     enabled: bool = True
+    # Background LLM-generated session titles (shown in --resume and the
+    # terminal tab). Off falls back to the first-message preview. Default off:
+    # the utility model (mistral-vibe-cli-fast) is not served by every Mistral
+    # deployment (dedicated/on-prem), where these calls return 400s, so titling
+    # is opt-in.
+    generate_titles: bool = False
 
     @field_validator("save_dir", mode="before")
     @classmethod
@@ -85,9 +97,20 @@ class ProviderConfig(BaseModel):
     api_key_env_var: str = ""
     browser_auth_base_url: str | None = None
     browser_auth_api_base_url: str | None = None
+    # Split-horizon deployments (e.g. behind an SAP Cloud Connector) expose the
+    # console under a virtual host the CLI reaches but the server does not know
+    # about, so it returns sign-in/poll URLs on its own public host. When True,
+    # returned URLs are re-homed onto the configured browser auth base URLs
+    # instead of being rejected for an origin mismatch.
+    browser_auth_allow_origin_rewrite: bool = False
     api_style: str = "openai"
     backend: Backend = Backend.GENERIC
     reasoning_field_name: str = "reasoning_content"
+    # Whether this provider reliably terminates streams with a finish reason.
+    # When True, a stream that ends without one is treated as an incomplete
+    # stream (and retried). Set to False for OpenAI-compatible endpoints that
+    # do not emit a finish reason, to avoid spurious incomplete-stream errors.
+    emits_finish_reason: bool = True
     project_id: str = ""
     region: str = ""
     extra_headers: dict[str, str] = Field(default_factory=dict)
@@ -416,6 +439,7 @@ class ModelConfig(BaseModel):
     name: str
     provider: str
     alias: str
+    display_name: str | None = None
     temperature: float = 0.2
     input_price: float = 0.0  # Price per million input tokens
     output_price: float = 0.0  # Price per million output tokens

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import stat
 import tomllib
 from unittest.mock import patch
 
@@ -13,6 +15,7 @@ from vibe.core.trusted_folders import (
     find_git_repo_ancestor,
     find_repo_trustable_files_for_cwd,
     find_trustable_files,
+    find_untrusted_config_dirs,
     has_agents_md_file,
 )
 
@@ -27,6 +30,27 @@ class TestTrustedFoldersManager:
         manager = TrustedFoldersManager()
         assert manager.is_trusted(tmp_path) is None
         assert trusted_file.is_file()
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+    def test_creates_owner_only_trust_store(self, tmp_path: Path) -> None:
+        """The trust store is a security-decision record, so it lands owner-only."""
+        trusted_file = TRUSTED_FOLDERS_FILE.path
+        trusted_file.unlink(missing_ok=True)
+
+        TrustedFoldersManager()
+
+        assert stat.S_IMODE(trusted_file.stat().st_mode) & 0o077 == 0
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+    def test_keeps_existing_file_mode(self, tmp_path: Path) -> None:
+        trusted_file = TRUSTED_FOLDERS_FILE.path
+        trusted_file.parent.mkdir(parents=True, exist_ok=True)
+        trusted_file.write_text("trusted = []\n", encoding="utf-8")
+        trusted_file.chmod(0o644)
+
+        TrustedFoldersManager().add_trusted(tmp_path)
+
+        assert stat.S_IMODE(trusted_file.stat().st_mode) == 0o644
 
     def test_loads_existing_file(self, tmp_path: Path) -> None:
         trusted_file = TRUSTED_FOLDERS_FILE.path
@@ -422,6 +446,73 @@ class TestFindTrustableFiles:
         (tmp_path / ".vibe" / "tools").mkdir(parents=True)
         result = find_trustable_files(tmp_path)
         assert result.count(".vibe/") == 1
+
+
+class TestFindUntrustedConfigDirs:
+    def test_detects_untrusted_vibe_under_trusted_cwd(self, tmp_path: Path) -> None:
+        vibe_dir = tmp_path / ".vibe"
+        (vibe_dir / "tools").mkdir(parents=True)
+        manager = TrustedFoldersManager()
+        manager.add_trusted(tmp_path)
+        manager.add_untrusted(vibe_dir)
+
+        assert find_untrusted_config_dirs(tmp_path, manager=manager) == [
+            vibe_dir.resolve()
+        ]
+
+    def test_returns_empty_when_cwd_not_trusted(self, tmp_path: Path) -> None:
+        vibe_dir = tmp_path / ".vibe"
+        (vibe_dir / "tools").mkdir(parents=True)
+        manager = TrustedFoldersManager()
+        manager.add_untrusted(vibe_dir)
+
+        # cwd itself is undecided, so there is nothing to recover.
+        assert find_untrusted_config_dirs(tmp_path, manager=manager) == []
+
+    def test_returns_empty_when_cwd_explicitly_untrusted(self, tmp_path: Path) -> None:
+        vibe_dir = tmp_path / ".vibe"
+        (vibe_dir / "tools").mkdir(parents=True)
+        manager = TrustedFoldersManager()
+        manager.add_untrusted(tmp_path)
+        manager.add_untrusted(vibe_dir)
+
+        assert find_untrusted_config_dirs(tmp_path, manager=manager) == []
+
+    def test_ignores_config_dir_that_is_not_explicitly_untrusted(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / ".vibe" / "tools").mkdir(parents=True)
+        manager = TrustedFoldersManager()
+        manager.add_trusted(tmp_path)
+
+        assert find_untrusted_config_dirs(tmp_path, manager=manager) == []
+
+    def test_ignores_empty_config_dir(self, tmp_path: Path) -> None:
+        vibe_dir = tmp_path / ".vibe"
+        vibe_dir.mkdir()
+        manager = TrustedFoldersManager()
+        manager.add_trusted(tmp_path)
+        manager.add_untrusted(vibe_dir)
+
+        # No content means find_local_config_dirs ignores it.
+        assert find_untrusted_config_dirs(tmp_path, manager=manager) == []
+
+    def test_detects_multiple_untrusted_config_dirs_sorted(
+        self, tmp_path: Path
+    ) -> None:
+        vibe_dir = tmp_path / ".vibe"
+        agents_dir = tmp_path / ".agents"
+        (vibe_dir / "tools").mkdir(parents=True)
+        (agents_dir / "skills").mkdir(parents=True)
+        manager = TrustedFoldersManager()
+        manager.add_trusted(tmp_path)
+        manager.add_untrusted(vibe_dir)
+        manager.add_untrusted(agents_dir)
+
+        assert find_untrusted_config_dirs(tmp_path, manager=manager) == [
+            agents_dir.resolve(),
+            vibe_dir.resolve(),
+        ]
 
 
 def _make_git_repo(path: Path) -> None:

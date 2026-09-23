@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 import json
-from typing import Any
 
 from mistralai.client import Mistral
 from mistralai.client.models import (
@@ -15,6 +14,7 @@ from mistralai.client.models import (
 from mistralai.extra.realtime import UnknownRealtimeEvent
 
 from vibe.app_server.config import AudioProviderView, TranscribeModelConfigView
+from vibe.cli.audio_request_metadata import RequestMetadataGetter
 from vibe.cli.transcribe.transcribe_client_port import (
     TranscribeDone,
     TranscribeError,
@@ -25,13 +25,17 @@ from vibe.cli.transcribe.transcribe_client_port import (
 from vibe.utils.api_keys import resolve_api_key
 from vibe.utils.http import VibeAsyncHTTPClient, build_ssl_context, get_user_agent
 
+# The server rejects an end-of-stream flush when no audio was captured (the user
+# released before speaking). This is a benign empty recording, not a failure.
+_EMPTY_RECORDING_MARKER = "before sending any audio bytes"
+
 
 class MistralTranscribeClient:
     def __init__(
         self,
         provider: AudioProviderView,
         model: TranscribeModelConfigView,
-        metadata_getter: Callable[[], dict[str, Any]] | None = None,
+        metadata_getter: RequestMetadataGetter | None = None,
     ) -> None:
         self._api_key = resolve_api_key(provider.api_key_env_var) or ""
         self._server_url = provider.api_base
@@ -61,26 +65,60 @@ class MistralTranscribeClient:
     ) -> AsyncIterator[TranscribeEvent]:
         client = self._get_client()
         metadata = self._metadata_getter()
-        async for event in client.audio.realtime.transcribe_stream(
-            audio_stream=audio_stream,
-            model=self._model_name,
-            audio_format=self._audio_format,
-            target_streaming_delay_ms=self._target_streaming_delay_ms,
-            http_headers={
-                "user-agent": get_user_agent("mistral"),
-                "x-metadata": json.dumps(metadata),
-            },
-        ):
-            if isinstance(event, RealtimeTranscriptionSessionCreated):
-                yield TranscribeSessionCreated(request_id=event.session.request_id)
-            elif isinstance(event, TranscriptionStreamTextDelta):
-                yield TranscribeTextDelta(text=event.text)
-            elif isinstance(event, TranscriptionStreamDone):
+        completed = False
+        stream_ended = False
+
+        async def _tracked_audio() -> AsyncIterator[bytes]:
+            nonlocal stream_ended
+            async for chunk in audio_stream:
+                yield chunk
+            stream_ended = True
+
+        try:
+            async for event in client.audio.realtime.transcribe_stream(
+                audio_stream=_tracked_audio(),
+                model=self._model_name,
+                audio_format=self._audio_format,
+                target_streaming_delay_ms=self._target_streaming_delay_ms,
+                http_headers={
+                    "user-agent": get_user_agent("mistral"),
+                    "x-metadata": json.dumps(metadata),
+                },
+            ):
+                if isinstance(event, RealtimeTranscriptionSessionCreated):
+                    yield TranscribeSessionCreated(request_id=event.session.request_id)
+                elif isinstance(event, TranscriptionStreamTextDelta):
+                    yield TranscribeTextDelta(text=event.text)
+                elif isinstance(event, TranscriptionStreamDone):
+                    completed = True
+                    yield TranscribeDone()
+                elif isinstance(event, RealtimeTranscriptionError):
+                    message = str(event.error.message)
+                    if _EMPTY_RECORDING_MARKER in message:
+                        completed = True
+                        yield TranscribeDone()
+                    else:
+                        yield TranscribeError(message=message)
+                elif isinstance(event, UnknownRealtimeEvent):
+                    continue
+        except RuntimeError as exc:
+            # The realtime SDK's send task flushes audio without re-checking
+            # whether the connection was torn down first, so a normal end of
+            # stream races into RuntimeError("Connection is closed"). It's the
+            # SDK teardown race, not a failure — genuine errors arrive above as
+            # RealtimeTranscriptionError events.
+            if "Connection is closed" not in str(exc):
+                raise
+            # Only benign once the local audio stream has been fully sent. If it
+            # drops mid-recording, surface an error so the caller stops the
+            # recorder instead of going idle with the mic still open.
+            if not stream_ended:
+                yield TranscribeError(
+                    message="Connection closed before the recording finished"
+                )
+                return
+            if not completed:
                 yield TranscribeDone()
-            elif isinstance(event, RealtimeTranscriptionError):
-                yield TranscribeError(message=str(event.error.message))
-            elif isinstance(event, UnknownRealtimeEvent):
-                continue
 
     async def close(self) -> None:
         client = self._client

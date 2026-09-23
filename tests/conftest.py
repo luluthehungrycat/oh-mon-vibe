@@ -4,6 +4,8 @@ from collections.abc import Awaitable, Callable, Generator
 import os
 from pathlib import Path
 import sys
+import time
+from types import SimpleNamespace
 from typing import Any
 
 import keyring
@@ -49,6 +51,51 @@ from vibe.core.utils.concurrency import run_sync
 from vibe.utils import keyring as keyring_utils
 from vibe.utils.platform import resolve_windows_shell
 
+_TESTS_ROOT = Path(__file__).parent
+_LOCAL_XDIST_GROUPS = {
+    Path("core/test_history_properties.py"): "history_properties",
+    Path("core/test_system_prompt.py"): "git_processes",
+    Path("core/test_trusted_folders.py"): "git_processes",
+    Path("core/test_worktree.py"): "git_processes",
+}
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--experimental-harness",
+        action="store_true",
+        default=False,
+        help="Run backend contract tests with the Unified Harness backend.",
+    )
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    local_run = not os.environ.get("BUILDKITE") and not os.environ.get("GITHUB_ACTIONS")
+    for item in items:
+        try:
+            relative_path = Path(item.path).relative_to(_TESTS_ROOT)
+        except ValueError:
+            continue
+        if local_run and (group := _LOCAL_XDIST_GROUPS.get(relative_path)):
+            item.add_marker(pytest.mark.xdist_group(name=group))
+            continue
+        if relative_path.parts[0] != "e2e":
+            continue
+        if relative_path.name == "test_mock_server.py":
+            continue
+        group = (
+            "subprocess_characterization"
+            if relative_path.parts[1] == "agent_loop_characterization"
+            else "subprocess_cli"
+        )
+        item.add_marker(pytest.mark.xdist_group(name=group))
+
+
+@pytest.fixture
+def experimental_harness(pytestconfig: pytest.Config) -> bool:
+    return bool(pytestconfig.getoption("--experimental-harness"))
+
 
 class _EmptyKeyring(KeyringBackend):
     """A keyring backend that stores nothing, used to keep tests off the real OS keyring."""
@@ -87,6 +134,7 @@ def _isolate_git_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    monkeypatch.setenv("GCM_INTERACTIVE", "never")
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
     monkeypatch.setenv("GIT_CONFIG_KEY_0", "commit.gpgsign")
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", "false")
@@ -208,7 +256,11 @@ def _scratchpad_dir(
         d.mkdir(parents=True, exist_ok=True)
         return str(d)
 
-    monkeypatch.setattr("vibe.core.scratchpad.tempfile.mkdtemp", _fake_mkdtemp)
+    # Replace Scratchpad's module reference instead of mutating the process-wide
+    # tempfile module, which would also affect build-backend tests.
+    monkeypatch.setattr(
+        "vibe.core.scratchpad.tempfile", SimpleNamespace(mkdtemp=_fake_mkdtemp)
+    )
 
     yield scratchpad_root
 
@@ -231,6 +283,8 @@ def _mock_platform(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setenv("SHELL", "/bin/sh")
+    if not hasattr(os, "getuid"):
+        monkeypatch.setattr(os, "getuid", lambda: 0, raising=False)
     resolve_auto_theme.cache_clear()
     monkeypatch.setattr("vibe.cli._theme_detection.detect_terminal_dark", lambda: None)
     monkeypatch.setattr(
@@ -246,6 +300,16 @@ def _mock_update_commands(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(autouse=True)
 def _disable_feedback_bar(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("vibe.core.feedback.FEEDBACK_PROBABILITY", 0)
+
+
+@pytest.fixture(autouse=True)
+def _disable_auto_title_generation(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Auto-title generation fires a background model call after turns; off by
+    # default so it never consumes mocked responses. Title tests re-patch this.
+    async def _noop(messages: Any, *, config: Any, previous_title: Any = None) -> None:
+        return None
+
+    monkeypatch.setattr("vibe.core.session.title_model.generate_session_title", _noop)
 
 
 @pytest.fixture(autouse=True)
@@ -367,7 +431,6 @@ def set_agent_config(agent: AgentLoop, config: VibeConfigSchema) -> None:
             orchestrator._config = config
         case _:
             raise TypeError(f"unexpected orchestrator {orchestrator!r}")
-    agent.agent_manager.invalidate_config()
 
 
 def stub_config_reload(
@@ -411,6 +474,32 @@ def _prepare_test_config_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     kwargs.setdefault("include_project_context", False)
     kwargs.setdefault("include_prompt_detail", False)
     return kwargs
+
+
+async def wait_until(
+    pilot: Any, predicate: Callable[[], bool], timeout: float = 2.0
+) -> bool:
+    """Poll the Textual app until ``predicate`` holds, returning whether it did.
+
+    Returns ``True`` as soon as ``predicate()`` is truthy, or ``False`` if the
+    timeout elapses first. It deliberately does not raise: callers assert the
+    result (``assert await wait_until(...)`` to require the state, or
+    ``assert not await wait_until(...)`` to require a state stays absent for the
+    window).
+
+    The short ``pilot.pause`` delay both yields to the message pump and advances
+    wall-clock time so timer/debounce-driven UI state settles. This is *not* a
+    substitute for synchronising on real state: wait on *authoritative* signals
+    (e.g. server-confirmed queue length via ``app.app_server``) rather than the
+    client's optimistic projections (``len(app._queue)`` is set before the enqueue
+    RPC lands), which is a common source of ordering flakes.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await pilot.pause(0.05)
+    return predicate()
 
 
 def build_test_vibe_config(
@@ -468,12 +557,11 @@ def load_orchestrator() -> OrchestratorLoader[VibeConfigSchema]:
 def build_test_agent_loop(
     *,
     config: VibeConfigSchema | None = None,
-    agent_name: str = BuiltinAgentName.DEFAULT,
+    agent_name: str = BuiltinAgentName.ASK,
     backend: BackendLike | None = None,
     enable_streaming: bool = False,
     **kwargs,
 ) -> AgentLoop:
-
     resolved_config = config or build_test_vibe_config()
     orchestrator = run_sync(_load_orchestrator(resolved_config))
     return AgentLoop(
@@ -534,11 +622,14 @@ def build_test_vibe_app(
         )
     )
     history_file = kwargs.pop("history_file", Path(".vibehistory"))
+    startup = kwargs.pop("startup", None) or StartupOptions(
+        initial_prompt=kwargs.pop("initial_prompt", None)
+    )
 
     return VibeApp(
         app_server=app_server_source,
         history_file=history_file,
-        startup=StartupOptions(initial_prompt=kwargs.pop("initial_prompt", None)),
+        startup=startup,
         current_version=resolved_current_version,
         update_notifier=resolved_update_notifier,
         update_cache_repository=resolved_update_cache_repository,

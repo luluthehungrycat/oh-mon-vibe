@@ -19,7 +19,11 @@ from vibe.core.tools.base import (
     ToolError,
     ToolPermission,
 )
-from vibe.core.tools.builtins.bash import BashToolConfig
+from vibe.core.tools.builtins.bash import (
+    BashToolConfig,
+    CapturedShellResult,
+    completed_shell_result,
+)
 from vibe.core.tools.builtins.experimental_bash import (
     BashLogFile,
     BashLogFileArgs,
@@ -35,7 +39,6 @@ from vibe.core.tools.builtins.experimental_bash import (
     BashStdinResult,
     ExperimentalBash,
     ExperimentalBashArgs,
-    ExperimentalBashResult,
     ExperimentalBashToolConfig,
     ManagedShellError,
     _BashPermissionMixin,
@@ -51,11 +54,12 @@ from vibe.core.tools.builtins.managed_shell.backend import ManagedShellBackendEr
 from vibe.core.tools.io_port import ShellCommandRequest
 from vibe.core.tools.permissions import PermissionContext, RequiredPermission
 from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
-from vibe.core.tools.utils import is_path_within_workdir
+from vibe.core.tools.utils import ToolPath, is_path_within_workdir, resolve_tool_path
 from vibe.core.types import ToolResultEvent, ToolStreamEvent
 from vibe.core.utils import is_windows, kill_async_subprocess
+from vibe.core.workspace import Workspace
 from vibe.observability.logging import logger
-from vibe.utils.io import decode_safe
+from vibe.utils.io import decode_console_safe
 from vibe.utils.tool_presentation import ToolEffectKind
 
 if TYPE_CHECKING:
@@ -284,7 +288,11 @@ def _split_windows_command_parts(command: str) -> list[str]:
                 _flush_windows_command_part(parts, buffer)
                 index += 2
                 continue
-            if char in {"&", "|", ";", "\n", "\r"}:
+            # ``2>&1`` and ``*>&1`` duplicate an existing stream; the ampersand
+            # is part of the redirect rather than a command separator.
+            if char in {"&", "|", ";", "\n", "\r"} and not (
+                char == "&" and buffer and buffer[-1] == ">"
+            ):
                 _flush_windows_command_part(parts, buffer)
                 index += 1
                 continue
@@ -561,12 +569,24 @@ def _windows_redirection_targets(command: str) -> list[str]:
     return targets
 
 
+def _windows_file_redirection_targets(command: str) -> list[str]:
+    """Return output redirects that can write a file.
+
+    PowerShell's null variable and CMD's null device discard output. Descriptor
+    duplication is filtered by ``_read_windows_redirection_target``.
+    """
+    return [
+        target
+        for target in _windows_redirection_targets(command)
+        if target.casefold() not in {"$null", "nul", "nul:"}
+    ]
+
+
 def _windows_path_parent(
     token: str,
     *,
     command_cwd: Path,
-    cwd: Path,
-    project_roots: list[Path],
+    workspace: Workspace,
     scratchpad_dir: Path | None,
     environment: dict[str, str],
 ) -> tuple[str | None, bool]:
@@ -597,9 +617,9 @@ def _windows_path_parent(
         resolved = command_cwd / resolved
     resolved = resolved.resolve()
 
-    if is_path_within_workdir(
-        str(resolved), cwd=cwd, project_roots=project_roots
-    ) or is_scratchpad_path(str(resolved), scratchpad_dir=scratchpad_dir):
+    if is_path_within_workdir(str(resolved), workspace=workspace) or is_scratchpad_path(
+        str(resolved), scratchpad_dir=scratchpad_dir
+    ):
         return None, False
     return str(resolved) if resolved.is_dir() else str(resolved.parent), False
 
@@ -608,15 +628,14 @@ def _analyze_windows_paths(
     command_parts: list[str],
     *,
     command_cwd: Path,
-    cwd: Path,
-    project_roots: list[Path],
+    workspace: Workspace,
     scratchpad_dir: Path | None,
     environment: dict[str, str],
 ) -> tuple[set[str], set[str]]:
     dirs: set[str] = set()
     dynamic_paths: set[str] = set()
     if not is_path_within_workdir(
-        str(command_cwd), cwd=cwd, project_roots=project_roots
+        str(command_cwd), workspace=workspace
     ) and not is_scratchpad_path(str(command_cwd), scratchpad_dir=scratchpad_dir):
         dirs.add(str(command_cwd))
 
@@ -624,8 +643,7 @@ def _analyze_windows_paths(
         parent, dynamic = _windows_path_parent(
             token,
             command_cwd=command_cwd,
-            cwd=cwd,
-            project_roots=project_roots,
+            workspace=workspace,
             scratchpad_dir=scratchpad_dir,
             environment=environment,
         )
@@ -641,7 +659,7 @@ def _analyze_windows_paths(
         executable, arguments = _windows_invoked_command(tokens)
         if executable != _windows_basename(executable):
             collect(executable)
-        for target in _windows_redirection_targets(part):
+        for target in _windows_file_redirection_targets(part):
             collect(target)
 
         command = _windows_command_name(executable)
@@ -676,29 +694,6 @@ def _get_windows_base_env(overrides: dict[str, str] | None) -> dict[str, str]:
     return {**os.environ, **_get_windows_env_overrides(overrides)}
 
 
-def _completed_windows_shell_result(
-    *, command: str, shell: str, stdout: str, stderr: str, returncode: int
-) -> ExperimentalBashResult:
-    if returncode != 0:
-        message = f"Command failed: {command!r}\nReturn code: {returncode}"
-        if stderr:
-            message += f"\nStderr: {stderr}"
-        if stdout:
-            message += f"\nStdout: {stdout}"
-        raise ToolError(message)
-
-    return ExperimentalBashResult(
-        command=command,
-        status="completed",
-        exit_code=returncode,
-        shell=shell,
-        output=stdout + stderr,
-        stdout=stdout,
-        stderr=stderr,
-        returncode=returncode,
-    )
-
-
 class WindowsShellToolConfig(ExperimentalBashToolConfig):
     pass
 
@@ -713,7 +708,9 @@ class WindowsShellArgs(BaseModel):
         ge=0,
         description="Foreground wait time before the command is killed.",
     )
-    cwd: str | None = Field(default=None, description="Working directory override.")
+    cwd: ToolPath | None = Field(
+        default=None, description="Working directory override."
+    )
     env: dict[str, str] | None = Field(
         default=None, description="Environment variable overrides."
     )
@@ -767,7 +764,7 @@ class WindowsShellPermissionMixin[ConfigT: BashToolConfig](
         return False
 
     def _build_windows_context_permissions(
-        self, shell: str | None, env: dict[str, str] | None
+        self, command_parts: list[str], shell: str | None, env: dict[str, str] | None
     ) -> list[RequiredPermission]:
         required: list[RequiredPermission] = []
         if shell:
@@ -787,6 +784,19 @@ class WindowsShellPermissionMixin[ConfigT: BashToolConfig](
                     label=f"custom environment ({names})",
                 )
             )
+        redirection_targets = {
+            target
+            for part in command_parts
+            for target in _windows_file_redirection_targets(part)
+        }
+        required.extend(
+            self._build_command_required_permission(
+                invocation_pattern=f"output redirection: {target}",
+                session_pattern=f"output redirection: {target}",
+                label=f"output redirection ({target})",
+            )
+            for target in sorted(redirection_targets)
+        )
         return required
 
     def _resolve_windows_permission(
@@ -801,23 +811,26 @@ class WindowsShellPermissionMixin[ConfigT: BashToolConfig](
         if not command_parts:
             return None
 
-        guardrail_permission = self._resolve_guardrail_permission(command_parts)
+        command_cwd = resolve_tool_path(cwd, self.cwd)
+        guardrail_permission = self._resolve_guardrail_permission(
+            command_parts, command_cwd=command_cwd, preserve_backslashes=True
+        )
         if (
             guardrail_permission
             and guardrail_permission.permission == ToolPermission.NEVER
         ):
             return guardrail_permission
 
-        command_cwd = Path(cwd).expanduser().resolve() if cwd is not None else self.cwd
         outside_dirs, dynamic_paths = _analyze_windows_paths(
             command_parts,
             command_cwd=command_cwd,
-            cwd=self.cwd,
-            project_roots=self.harness_files.project_roots,
+            workspace=self.workspace,
             scratchpad_dir=self.scratchpad_dir,
             environment={**os.environ, **(env or {})},
         )
-        context_required = self._build_windows_context_permissions(shell, env)
+        context_required = self._build_windows_context_permissions(
+            command_parts, shell, env
+        )
         if (
             self._is_unconditionally_allowed(
                 command_parts, outside_dirs | dynamic_paths, context_required
@@ -826,9 +839,8 @@ class WindowsShellPermissionMixin[ConfigT: BashToolConfig](
         ):
             return PermissionContext(permission=ToolPermission.ALWAYS)
 
-        required = self._build_required_permissions(
-            command_parts, outside_dirs, context_required
-        )
+        required = self._build_required_permissions(command_parts, outside_dirs)
+        required.extend(context_required)
         required.extend(
             self._build_command_required_permission(
                 invocation_pattern=f"dynamic path: {path}",
@@ -849,9 +861,9 @@ class WindowsShellPermissionMixin[ConfigT: BashToolConfig](
 class WindowsShell(
     WindowsShellPermissionMixin[WindowsShellToolConfig],
     BaseTool[
-        WindowsShellArgs, ExperimentalBashResult, WindowsShellToolConfig, BaseToolState
+        WindowsShellArgs, CapturedShellResult, WindowsShellToolConfig, BaseToolState
     ],
-    ToolUIData[WindowsShellArgs, ExperimentalBashResult],
+    ToolUIData[WindowsShellArgs, CapturedShellResult],
 ):
     effect_kind = ToolEffectKind.SHELL
     description: ClassVar[str] = "Run a PowerShell command."
@@ -880,7 +892,7 @@ class WindowsShell(
 
     @classmethod
     def get_result_display(cls, event: ToolResultEvent) -> ToolResultDisplay:
-        if not isinstance(event.result, ExperimentalBashResult):
+        if not isinstance(event.result, CapturedShellResult):
             return ToolResultDisplay(
                 success=False, message=event.error or event.skip_reason or "No result"
             )
@@ -897,7 +909,7 @@ class WindowsShell(
 
     async def run(
         self, args: WindowsShellArgs, ctx: InvokeContext | None = None
-    ) -> AsyncGenerator[ToolStreamEvent | ExperimentalBashResult, None]:
+    ) -> AsyncGenerator[ToolStreamEvent | CapturedShellResult, None]:
         requested_timeout = (
             float(args.timeout) if args.timeout is not None else args.timeout_seconds
         )
@@ -905,7 +917,7 @@ class WindowsShell(
         max_bytes = self.config.max_output_bytes
         proc: asyncio.subprocess.Process | None = None
         try:
-            cwd = Path(args.cwd).expanduser().resolve() if args.cwd else self.cwd
+            cwd = resolve_tool_path(args.cwd, self.cwd)
             shell = resolve_powershell_shell(args.shell, self.config.shell)
             argv = build_windows_shell_argv(shell, args.command)
             if (
@@ -931,12 +943,12 @@ class WindowsShell(
                     raise ToolError(
                         f"Command timed out after {timeout:g}s: {args.command!r}"
                     ) from None
-                yield _completed_windows_shell_result(
+                yield completed_shell_result(
                     command=args.command,
                     shell=shell,
                     stdout=result.stdout[:max_bytes],
                     stderr=result.stderr[:max_bytes],
-                    returncode=result.returncode,
+                    exit_code=result.returncode,
                 )
                 return
 
@@ -960,13 +972,12 @@ class WindowsShell(
 
             stdout = _decode_limited(stdout_bytes, max_bytes)
             stderr = _decode_limited(stderr_bytes, max_bytes)
-            returncode = proc.returncode or 0
-            yield _completed_windows_shell_result(
+            yield completed_shell_result(
                 command=args.command,
                 shell=shell,
                 stdout=stdout,
                 stderr=stderr,
-                returncode=returncode,
+                exit_code=proc.returncode or 0,
             )
         except (ToolError, asyncio.CancelledError):
             raise
@@ -1099,4 +1110,4 @@ class WindowsShellLogFile(BashLogFile):
 def _decode_limited(raw: bytes | None, max_bytes: int) -> str:
     if not raw:
         return ""
-    return decode_safe(raw[:max_bytes], from_subprocess=True).text
+    return decode_console_safe(raw[:max_bytes])

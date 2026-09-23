@@ -69,6 +69,7 @@ pip install oh-my-vibe
 - [Configuration](#configuration)
   - [Configuration File Location](#configuration-file-location)
   - [API Key Configuration](#api-key-configuration)
+  - [OpenTelemetry Tracing](#opentelemetry-tracing)
   - [Custom System Prompts](#custom-system-prompts)
   - [Custom Agent Configurations](#custom-agent-configurations)
   - [Tool Management](#tool-management)
@@ -92,7 +93,7 @@ pip install oh-my-vibe
   - Manage a `todo` list to track the agent's work.
   - Ask interactive questions to gather user input (`ask_user_question`).
   - Delegate tasks to subagents for parallel work (`task`).
-- **Project-Aware Context**: Vibe automatically scans your project's file structure and Git status to provide relevant context to the agent, improving its understanding of your codebase.
+- **Project-Aware Context**: Vibe automatically provides your project's location, Git branch, and recent commit history to the agent, improving its understanding of your codebase.
 - **Advanced CLI Experience**: Built with modern libraries for a smooth and efficient workflow.
   - Autocompletion for slash commands (`/`) and file paths (`@`).
   - Image attachments via `@` mentions — `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp` files are sent to vision-capable models (e.g. Mistral Medium 3.5) as native multimodal content.
@@ -116,9 +117,9 @@ Bash safety results expose machine-readable policy/evaluator/sandbox/fallback me
 
 Vibe comes with several built-in agent profiles, each designed for different use cases:
 
-- **`default`**: Standard agent that requires approval for tool executions. Best for general use.
+- **`ask`**: Requires approval for tool executions.
 - **`plan`**: Read-only agent for exploration and planning. Auto-approves safe tools like `grep` and `read`.
-- **`accept-edits`**: Auto-approves file edits only (`write_file`, `edit`). Useful for code refactoring.
+- **`accept-edits`**: The default agent. Auto-approves file edits only (`write_file`, `edit`). Useful for code refactoring.
 - **`auto-approve`**: Auto-approves all tool executions. Use with caution.
 
 Use the `--agent` flag to select a different agent:
@@ -134,7 +135,7 @@ To change the default agent used when `--agent` is not passed, set
 default_agent = "plan"
 ```
 
-Valid values are `default`, `plan`, `accept-edits`, `auto-approve`,
+Valid values are `ask`, `plan`, `accept-edits`, `auto-approve`,
 `lean` (only when listed in `installed_agents`), or the name of any
 custom agent file in `~/.vibe/agents/` or the project's `.vibe/agents/`
 directory. Subagents such as `explore` are not accepted.
@@ -158,6 +159,26 @@ The `task` tool allows the agent to delegate work to subagents:
 ```
 
 Create custom subagents by adding `agent_type = "subagent"` to your agent configuration. Vibe comes with a built-in subagent called `explore`, a read-only subagent for codebase exploration and skill loading used internally for delegation.
+
+When the Unified Harness is active, the interactive prompt shows each known
+subagent's name, type, live status, and latest measured context size. Opening a
+subagent also shows its active status above the prompt and its context use in the
+bottom-right gauge. With an empty or locally edited prompt, press Down from its
+last line to focus the list;
+unsent text stays in the prompt. Use Up and Down to highlight a row, then press
+Enter to open it; with the mouse, hover to highlight and click to open. Select **Main
+conversation** to return, or press Escape from a subagent view. Ctrl+C adds a
+local-only, error-styled user message explaining that subagents cannot be
+controlled directly; return to Main and ask the main agent to stop one. Press
+Ctrl+C again to quit Vibe. After
+opening Main conversation, press Up from its row to focus the prompt. While a
+subagent view is open, Up stops at the Main row. Idle subagents remain listed as
+**ready** because the main agent can send them more instructions. Explicitly
+stopped subagents leave the list after you return to Main. The first subagent
+update does not add a local information message. When a subagent becomes ready,
+its transcript shows a local information message explaining how to give it a
+new goal or stop it from Main. Set `show_subagent_status_list = false` in
+`config.toml`, or change it through `/config`, to hide this UI.
 
 ### Interactive User Questions
 
@@ -234,13 +255,14 @@ Most modern terminals should work, but older or minimal terminal emulators may h
 Simply run `omv` to enter the interactive chat loop.
 
 - **Multi-line Input**: Press `Ctrl+J` or `Shift+Enter` for select terminals to insert a newline.
-- **File Paths**: Reference files in your prompt using the `@` symbol for smart autocompletion (e.g., `> Read the file @src/agent.py`).
+- **File Paths**: Reference files in your prompt using the `@` symbol for smart autocompletion (e.g., `> Read the file @src/agent.py`). A bare `@` quickly lists immediate non-hidden entries; after a path character, Git workspaces suggest tracked and non-ignored files. Pasting a standalone existing absolute or home-relative file or folder also creates a mention.
 - **Shell Commands**: Prefix any command with `!` to execute it directly in your shell, bypassing the agent (e.g., `> !ls -l`).
 - **External Editor**: Press `Ctrl+G` to edit your current input in an external editor.
 - **Tool Output Toggle**: Press `Ctrl+O` to toggle the tool output view.
 - **Todo View Toggle**: Press `Ctrl+T` to toggle the todo list view.
 - **Debug Console**: Press `Ctrl+\` to toggle the debug console.
-- **Agent Selection**: Press `Shift+Tab` to cycle through agents (default, plan, ...).
+- **Agent Selection**: Press `Shift+Tab` to cycle through agents (ask, plan, ...).
+- **Queueing**: Prompts submitted while the agent is working are queued by the app server. Empty `Enter` or `Ctrl+Enter` steers the queued prompts into the active turn; on Unified Harness sessions, this atomically consumes the stored queue item. `Ctrl+C` removes the newest queued prompt. `Escape` interrupts the active turn and pauses remaining prompts, and `Enter` resumes a paused queue. Shell commands and non-side-channel slash commands require an idle session.
 - **Exit**: Type `/exit`, `exit`, `quit`, `:q`, or `:quit` in the input box, or press `Ctrl+C` / `Ctrl+D` twice within ~1 second. Set `ask_confirmation_on_exit = false` (or toggle it in `/config`) to make `Ctrl+D` quit on the first press; `Ctrl+C` always requires confirmation.
 
 ### Copying & Text Selection
@@ -270,7 +292,7 @@ You can run Vibe non-interactively by piping input or using the `--prompt` flag.
 vibe --prompt "Refactor the main function in cli/main.py to be more modular."
 ```
 
-By default, it uses your configured `default_agent` (`default` unless changed).
+By default, it uses your configured `default_agent` (`accept-edits` unless changed).
 To approve all tool calls without prompting, pass `--auto-approve` or `--yolo`
 (also available for interactive sessions):
 
@@ -340,6 +362,10 @@ If a model response is interrupted by a backend error, use `/retry` to continue
 from the partial response. Add optional guidance after the command, for example
 `/retry keep the conclusion concise`.
 
+Use `/mcp` or `/connectors` to browse configured MCP servers and workspace
+connectors. The browser starts on the first item; press Up or Left to focus its
+fuzzy search bar, then Up again to wrap to the last item.
+
 ### Custom Slash Commands via Skills
 
 You can define your own slash commands through the skills system. Skills are reusable components that extend Vibe's functionality.
@@ -389,6 +415,25 @@ allowed-tools:
 
 This skill helps analyze code quality and suggest improvements.
 ```
+
+By default, both the user and the model can invoke a skill. Invocation controls
+are independent:
+
+- `user-invocable: false` hides the skill from the `/` menu and prevents direct
+  `/skill-name` invocation while still allowing the model to load it.
+- `disable-model-invocation: true` follows the Claude Code convention and makes
+  the skill explicit-only: users can still invoke `/skill-name`, but the model
+  does not see or invoke it automatically.
+- Skills using OpenAI's `agents/openai.yaml` convention can express the same
+  explicit-only behavior. Vibe applies this policy regardless of active model or provider:
+
+  ```yaml
+  policy:
+    allow_implicit_invocation: false
+  ```
+
+  If the policy metadata is malformed or contains an unknown policy field,
+  Vibe reports the issue and keeps the skill explicit-only.
 
 ### Skill Discovery
 
@@ -475,6 +520,31 @@ enable_system_trust_store = true
 
 `SSL_CERT_FILE` and `SSL_CERT_DIR` are still supported and are loaded as additional trust anchors.
 
+### OpenTelemetry Tracing
+
+Vibe can export traces for agent, model, and tool operations over OTLP/HTTP. Enable tracing in `config.toml`:
+
+```toml
+enable_otel = true
+```
+
+By default, Vibe sends traces to the telemetry endpoint associated with the configured Mistral provider and authenticates with that provider's API key. `enable_telemetry` must also remain enabled.
+
+To send traces to another collector, configure its base URL. Vibe appends `/v1/traces`; configure authentication with the standard `OTEL_EXPORTER_OTLP_*` environment variables when needed.
+
+```toml
+enable_otel = true
+otel_endpoint = "https://collector.example.com:4318"
+```
+
+Span attributes are redacted on the client before export. The default mode redacts sensitive values, `strict` redacts sensitive attributes entirely, and `none` disables redaction:
+
+```toml
+otel_redaction = "default" # "default", "strict", or "none"
+```
+
+Use `none` only when the collector is trusted to receive potentially sensitive prompt, response, and tool data.
+
 ### Custom System Prompts
 
 You can create `AGENTS.md` files to add custom instructions. You can also replace the entire system prompt.
@@ -510,6 +580,9 @@ compaction_prompt_id = "my_compaction_prompt"
 ```
 
 Any extra instructions passed to `/compact ...` are appended after the configured compaction prompt.
+
+Compaction keeps the same session and visible conversation. Later model requests
+use the latest compacted context followed by newer messages.
 
 ### Custom Agent Configurations
 
@@ -828,6 +901,15 @@ vibe --resume abc123
 
 Session logging must be enabled in your configuration for these features to work.
 
+The first user message pins the resolved model to that session. Resuming keeps
+the pinned model even if your configured default changes. `/model` uses the
+normal config persistence target and updates an existing session override
+immediately; the session file is synchronized when the next user message is
+sent. An explicit persistent target selected through `/config` changes only
+that layer. `/clear` starts a new, unpinned conversation that follows the
+current config. If a selected model is no longer configured, Vibe falls back
+to the current default model.
+
 #### Working Directory Control
 
 Use the `--workdir` option to specify a working directory:
@@ -856,9 +938,42 @@ The worktree lives under `$OMV_HOME/worktrees/<repo-name>-<repo-hash>/NAME` and 
 
 Existing worktrees are reused only when they belong to the same git repository and are checked out on branch `NAME`; otherwise Vibe exits with an error instead of running in the wrong checkout.
 
+Pass `--worktree` with no name to have Vibe name one for you:
+
+```bash
+vibe "Fix the login bug" --worktree     # -> fix-the-login-bug, on vibe/fix-the-login-bug
+vibe --worktree                         # no prompt -> a random slug, e.g. brave-quiet-otter
+```
+
+The name comes from your prompt, shortened to whole words. Without a prompt — or when the prompt has nothing usable in it, such as emoji only — Vibe generates a random slug instead. Unlike the named form, this never reuses an existing worktree: Vibe claims a free name, adding `-2`, `-3` and so on if needed, so two sessions started at once can never land in the same checkout. The branch is always `vibe/<name>`, matching the worktrees Le Chat Desktop creates.
+
+Order matters, because `--worktree` takes an optional value: `vibe --worktree "Fix the login bug"` reads the prompt as the *name*. Put the prompt first, or separate it with `--`:
+
+```bash
+vibe --worktree -- "Fix the login bug"
+```
+
 Automatic cleanup only applies to worktrees Vibe created this run, and only after a session actually started — a startup failure (bad config, `--continue` with no sessions) never deletes anything, and a reused worktree is always left in place. When an interactive session exits, Vibe removes the worktree directory automatically if there are no uncommitted changes, untracked files, or commits beyond the commit where the worktree session started. If any of those exist, Vibe asks whether to keep or remove the worktree. When Vibe created the branch it is deleted alongside the worktree; a branch that already existed and was merely attached is kept unless you confirm its deletion. Keeping preserves the directory and branch so you can return later; removing force-deletes them, discarding changes, untracked files, and commits. Programmatic runs (`vibe -p ... --worktree NAME`) do not clean up automatically because there is no exit prompt; remove them manually with `git worktree remove`. `--worktree` is ignored with `--setup` and `--check-upgrade`.
 
 Sessions are scoped per directory, so `-c`/`--continue` and the `--resume` picker only see sessions started inside that worktree. To carry a session across worktrees, resume it explicitly by ID with `--resume <ID>`.
+
+#### Worktree ownership
+
+Whichever way a worktree is created, Vibe writes an ownership record beside it under `$VIBE_HOME/worktrees/.claims/<repo-name>-<repo-hash>/<name>/`, recording the branch, the commit the session started from, and whether Vibe created the branch. Nothing is ever removed without one: a worktree you made yourself, or one whose record is missing or unreadable, is left alone.
+
+The record directory also holds a marker per session currently working in the worktree. Sessions from different clients run in separate processes with nothing shared between them, so a marker is the only evidence that someone else is still in there. A worktree with any marker left is kept. A process killed outright leaves its marker behind and the worktree survives, which is the direction worth failing in.
+
+The app-server never removes a worktree on its own. Closing a session does not count: the desktop app releases an idle session's process a second after each turn to reclaim it, and the session stays live and resumable, so its worktree outlives that. A worktree that exists is removed in exactly one situation — **you delete its session**. It still has to be one Vibe created, held by nobody else, and free of uncommitted changes, untracked files, and commits made since the session began; anything else is kept and logged.
+
+Two things are cleaned up without asking, neither of which is a worktree you could have worked in. A session whose very first turn never completed has its worktree rolled back, because such a session is never published and leaves no session file — there is nothing to return to. And a reservation that never became a worktree, an empty directory left by a claim whose `git worktree add` did not land, is discarded the next time a session starts in that repo.
+
+The cost of that conservatism is that a worktree whose app-server was killed outright stays on disk, holding a marker for a session that no longer exists. Removing it is a judgement about whether you are finished with the work, which only you can make.
+
+On Windows, Vibe resolves an absolute Git executable for automatic repository
+inspection and ignores executables inside the current project. Set
+`GIT_PYTHON_GIT_EXECUTABLE` to an absolute path when using a custom or portable
+Git installation. Vibe still starts when no trusted Git executable is available;
+only Git-dependent metadata and features are unavailable.
 
 ### Update Settings
 
@@ -899,6 +1014,19 @@ This affects where Oh My Vibe looks for:
 - `prompts/` - Custom system and compaction prompts
 - `tools/` - Custom tools
 - `logs/` - Session logs
+
+Custom tools will be deprecated in a future release. Prefer skills for new
+extensions; Vibe can help migrate existing custom tools to skills.
+
+### Logging
+
+Vibe writes structured logs to `~/.vibe/logs/vibe.log`. Use `/log-level` to open an interactive picker that lets you set the session override and/or persist a level to `config.toml`. You can also set `log_level` directly in `config.toml` or via the `/config` screen.
+
+Valid levels: `DEBUG`, `INFO`, `WARNING` (default), `ERROR`, `CRITICAL`.
+
+Precedence: session override > `LOG_LEVEL` env var > `log_level` in config.toml > default.
+
+The `LOG_LEVEL` environment variable overrides the config value at startup. Use `DEBUG_MODE=true` to force `DEBUG` at startup.
 
 ## Editors/IDEs
 

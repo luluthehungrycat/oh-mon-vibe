@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Iterator, Sequence
 import copy
 from enum import StrEnum, auto
 from pathlib import Path
+import threading
 from typing import TYPE_CHECKING, Annotated, Any, Literal, overload
 from uuid import uuid4
 
@@ -168,6 +169,19 @@ class ChildSessionLink(BaseModel):
     relative_path: str | None = None
 
 
+# Session state rather than a message, because the worktree is created before
+# the session has a first turn: there is no message it could belong to, and the
+# transcript is rebuilt on every resume from what was persisted here.
+class WorktreeContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entry_id: str
+    name: str
+    branch: str
+    path: str
+    created_at: int
+
+
 class SessionMetadata(BaseModel):
     session_id: str
     parent_session_id: str | None = None
@@ -176,12 +190,32 @@ class SessionMetadata(BaseModel):
     git_commit: str | None
     git_branch: str | None
     environment: dict[str, str | None]
+    # Where the session began. ``environment.working_directory`` follows it as
+    # it moves, so between them the record names both the directory the user
+    # started in and the one the session is working in. Neither on its own can
+    # do that, which is the whole reason this field exists.
+    origin_directory: str | None = None
     username: str
     child_sessions: list[ChildSessionLink] = Field(default_factory=list)
     loops: list[ScheduledLoop] = Field(default_factory=list)
     title: str | None = None
     title_source: Literal["auto", "manual"] = "auto"
+    bumped_at: str | None = None
+    # When the user pinned this session, or ``None`` while it is unpinned. A
+    # timestamp rather than a flag so the pinned shelf can be ordered by when
+    # each pin was made without a second field to keep in step.
+    pinned_at: str | None = None
+    # The sticky GrowthBook variant assignment, persisted so a resumed session
+    # keeps its buckets. NOTE: plan/org attributes and user_plan are user-scoped,
+    # not session-scoped, so they are deliberately NOT persisted here — they are
+    # re-resolved from the user-scoped whoami/identity cache on every session, so
+    # resuming never reports a stale plan.
     experiments: EvalResponse | None = None
+    # Session-scoped config snapshot. New sessions pin ``active_model`` to its
+    # resolved alias before their first user turn; older snapshots remain valid.
+    config: dict[str, JsonValue] | None = None
+    import_provenance: dict[str, JsonValue] | None = None
+    created_worktree: WorktreeContext | None = None
 
 
 StrToolChoice = Literal["auto", "none", "any", "required"]
@@ -311,8 +345,7 @@ class LLMMessage(BaseModel):
     images: list[ImageAttachment] | None = None
     injected: bool = False
     reasoning_content: Content | None = None
-    reasoning_state: list[str] | None = None
-    reasoning_signature: str | None = None
+    reasoning_payloads: list[dict[str, Any]] | None = None
     reasoning_message_id: str | None = None
     tool_calls: list[ToolCall] | None = None
     name: str | None = None
@@ -323,6 +356,7 @@ class LLMMessage(BaseModel):
     input_text: str | None = None
     resources: list[UserResource] | None = None
     manual_shell: ManualShellContext | None = None
+    context_boundary: Literal["compaction"] | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -341,8 +375,7 @@ class LLMMessage(BaseModel):
             "role": role,
             "content": getattr(v, "content", ""),
             "reasoning_content": reasoning_content,
-            "reasoning_state": getattr(v, "reasoning_state", None),
-            "reasoning_signature": getattr(v, "reasoning_signature", None),
+            "reasoning_payloads": getattr(v, "reasoning_payloads", None),
             "reasoning_message_id": getattr(v, "reasoning_message_id", None)
             or (str(uuid4()) if reasoning_content else None),
             "tool_calls": getattr(v, "tool_calls", None),
@@ -356,6 +389,7 @@ class LLMMessage(BaseModel):
             "input_text": getattr(v, "input_text", None),
             "resources": getattr(v, "resources", None),
             "manual_shell": getattr(v, "manual_shell", None),
+            "context_boundary": getattr(v, "context_boundary", None),
         }
 
     def __add__(self, other: LLMMessage) -> LLMMessage:
@@ -379,18 +413,10 @@ class LLMMessage(BaseModel):
         if not reasoning_content:
             reasoning_content = None
 
-        reasoning_signature = (self.reasoning_signature or "") + (
-            other.reasoning_signature or ""
-        )
-        if not reasoning_signature:
-            reasoning_signature = None
-
-        reasoning_state: list[str] | None = None
-        if self.reasoning_state or other.reasoning_state:
-            reasoning_state = [
-                *(self.reasoning_state or []),
-                *(other.reasoning_state or []),
-            ]
+        reasoning_payloads = [
+            *(self.reasoning_payloads or []),
+            *(other.reasoning_payloads or []),
+        ] or None
 
         tool_calls_map = OrderedDict[int, ToolCall]()
         for tool_calls in [self.tool_calls or [], other.tool_calls or []]:
@@ -418,8 +444,7 @@ class LLMMessage(BaseModel):
             content=content,
             images=self.images if self.images is not None else other.images,
             reasoning_content=reasoning_content,
-            reasoning_state=reasoning_state,
-            reasoning_signature=reasoning_signature,
+            reasoning_payloads=reasoning_payloads,
             reasoning_message_id=self.reasoning_message_id
             or other.reasoning_message_id,
             tool_calls=list(tool_calls_map.values()) or None,
@@ -434,6 +459,7 @@ class LLMMessage(BaseModel):
                 self.input_text if self.input_text is not None else other.input_text
             ),
             resources=self.resources if self.resources is not None else other.resources,
+            context_boundary=self.context_boundary or other.context_boundary,
         )
 
 
@@ -532,12 +558,16 @@ class ToolResultEvent(BaseEvent):
     tool_class: type[BaseTool] | None
     result: BaseModel | None = None
     error: str | None = None
+    error_display: str | None = None
     skipped: bool = False
     skip_reason: str | None = None
     cancelled: bool = False
     duration: float | None = None
     tool_call_id: str
     presentation: ToolResultPresentation | None = None
+    decision: Literal["execute", "skip"] | None = None
+    approval_type: Literal["always", "never", "ask"] | None = None
+    approval_source: Literal["config", "smart", "user", "bypass", "never"] | None = None
 
 
 class ToolStreamEvent(BaseEvent):
@@ -616,6 +646,14 @@ class ContextClearedEvent(BaseEvent):
 
 class SessionTitleUpdatedEvent(BaseEvent):
     title: str
+    session_id: str
+
+
+class BackgroundWorkEvent(BaseEvent):
+    work_id: str
+    kind: Literal["session_title"]
+    phase: Literal["started", "finished"]
+    session_id: str
 
 
 type SwitchAgentCallback = Callable[[str], Awaitable[None]]
@@ -627,6 +665,7 @@ class MessageList(Sequence[LLMMessage]):
     def __init__(self, initial: list[LLMMessage] | None = None) -> None:
         self._data: list[LLMMessage] = list(initial) if initial else []
         self._reset_hooks: list[Callable[[], None]] = []
+        self._lock = threading.RLock()
 
     def append(self, msg: LLMMessage) -> None:
         self._data.append(msg)
@@ -643,10 +682,24 @@ class MessageList(Sequence[LLMMessage]):
         self._reset_hooks.append(hook)
 
     def reset(self, new: list[LLMMessage]) -> None:
-        """Replace contents silently (never notifies)."""
-        self._data = list(new)
-        for hook in self._reset_hooks:
-            hook()
+        """Replace contents and fire reset hooks (e.g. RewindManager)."""
+        with self._lock:
+            self._data = list(new)
+            for hook in self._reset_hooks:
+                hook()
+
+    def reset_preserving_system(self, tail: list[LLMMessage]) -> None:
+        """Atomically keep existing system messages and replace the rest.
+
+        Held under the same lock as ``update_system_prompt`` so a concurrent
+        deferred-init thread cannot interleave its system-prompt insert with
+        this read-then-replace and corrupt the list.
+        """
+        with self._lock:
+            system = [m for m in self._data if m.role is Role.system]
+            self._data = [*system, *tail]
+            for hook in self._reset_hooks:
+                hook()
 
     def update_system_prompt(self, new: str) -> None:
         """Replace the system prompt, or insert it if none exists yet.
@@ -655,10 +708,11 @@ class MessageList(Sequence[LLMMessage]):
         appended, so insert at the front rather than clobber slot 0.
         """
         msg = LLMMessage(role=Role.system, content=new)
-        if self._data and self._data[0].role == Role.system:
-            self._data[0] = msg
-        else:
-            self._data.insert(0, msg)
+        with self._lock:
+            if self._data and self._data[0].role == Role.system:
+                self._data[0] = msg
+            else:
+                self._data.insert(0, msg)
 
     def __len__(self) -> int:
         return len(self._data)
@@ -671,7 +725,12 @@ class MessageList(Sequence[LLMMessage]):
         return self._data[index]
 
     def __iter__(self) -> Iterator[LLMMessage]:
-        return iter(self._data)
+        # Snapshot under the lock: only __iter__ hands element-by-element
+        # control back to Python, so the deferred-init thread's insert(0)
+        # could shift indices mid-iteration. Other read dunders are single
+        # C-level ops and stay atomic under the GIL without locking.
+        with self._lock:
+            return iter(list(self._data))
 
     def __contains__(self, item: object) -> bool:
         return item in self._data
