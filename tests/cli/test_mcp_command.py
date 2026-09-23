@@ -9,12 +9,12 @@ from unittest.mock import AsyncMock
 import pytest
 import tomli_w
 
+from vibe.app_server import _mcp_auth, mcp_catalog
 from vibe.cli import entrypoint, mcp_command as mcp_cli
 from vibe.core.auth import MCPOAuthError
 from vibe.core.config import MCPOAuth, MCPStaticAuth, MCPStdio, MCPStreamableHttp
 from vibe.core.config.default_orchestrator import build_default_orchestrator
 from vibe.core.config.types import ConcurrencyConflictError
-from vibe.core.tools.mcp import management as mcp_management
 from vibe.core.trusted_folders import trusted_folders_manager
 
 
@@ -279,19 +279,27 @@ def test_mcp_add_oauth_logs_in_and_opens_browser(
     capsys: pytest.CaptureFixture[str],
     config_dir: Path,
 ) -> None:
+    """*Prepare*: A process-owned OAuth login emits one authorization URL.
+    *Do*: Add an OAuth MCP source with immediate login.
+    *Assert*: The CLI opens the URL and retains the canonical persisted source.
+    """
+    # Prepare
     opened_urls: list[str] = []
 
-    async def fake_login(server, *, on_url) -> None:
+    async def fake_login(server, *, on_url, headers) -> None:
         assert isinstance(server.auth, MCPOAuth)
+        assert headers == {}
         await on_url("https://auth.example/authorize")
 
-    monkeypatch.setattr(mcp_management, "perform_oauth_login", fake_login)
+    monkeypatch.setattr(_mcp_auth, "perform_oauth_login", fake_login)
     monkeypatch.setattr(
         mcp_cli.webbrowser, "open", lambda url: opened_urls.append(url) or True
     )
 
+    # Do
     _run_mcp("add", "linear", "--url", "https://mcp.linear.app/mcp")
 
+    # Assert
     output = capsys.readouterr().out
     assert "https://auth.example/authorize" in output
     assert output.startswith("Added MCP server `linear`.\n")
@@ -305,14 +313,22 @@ def test_mcp_add_oauth_keeps_config_after_login_failure(
     capsys: pytest.CaptureFixture[str],
     config_dir: Path,
 ) -> None:
-    async def fail_login(server, *, on_url) -> None:
+    """*Prepare*: Process-owned OAuth login fails after catalog persistence.
+    *Do*: Add an OAuth MCP source with immediate login.
+    *Assert*: The command fails cleanly while the source remains persisted.
+    """
+
+    # Prepare
+    async def fail_login(server, *, on_url, headers) -> None:
         raise MCPOAuthError("login failed")
 
-    monkeypatch.setattr(mcp_management, "perform_oauth_login", fail_login)
+    monkeypatch.setattr(_mcp_auth, "perform_oauth_login", fail_login)
 
+    # Do
     with pytest.raises(SystemExit) as exc_info:
         _run_mcp("add", "linear", "--url", "https://mcp.linear.app/mcp")
 
+    # Assert
     assert exc_info.value.code == 1
     captured = capsys.readouterr()
     assert captured.out == "Added MCP server `linear`.\n"
@@ -380,6 +396,11 @@ def test_mcp_add_persists_headers_and_timeouts(config_dir: Path) -> None:
 def test_mcp_add_rejects_invalid_auth_combinations(
     args: tuple[str, ...], message: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """*Prepare*: Mutually incompatible authentication flags.
+    *Do*: Add a remote MCP source with those flags.
+    *Assert*: The CLI rejects the combination with the expected explanation.
+    """
+    # Prepare
     with pytest.raises(SystemExit) as exc_info:
         _run_mcp("add", "docs", "--url", "https://mcp.example.com/mcp", *args)
 
@@ -432,6 +453,46 @@ def test_mcp_add_works_without_provider_api_key(
     )
 
     assert len(_persisted_servers(config_dir)) == 1
+
+
+def test_mcp_add_rejects_lan_http_without_flag(
+    capsys: pytest.CaptureFixture[str], config_dir: Path
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        _run_mcp(
+            "add",
+            "gitlab-local",
+            "--transport",
+            "http",
+            "--header",
+            "Authorization=Bearer test",
+            "--url",
+            "http://192.168.0.8:3002/",
+        )
+
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 2
+    assert "unless it points to localhost" in captured.err
+    assert _persisted_servers(config_dir) == []
+
+
+def test_mcp_add_allows_lan_http_with_flag(
+    capsys: pytest.CaptureFixture[str], config_dir: Path
+) -> None:
+    _run_mcp(
+        "add",
+        "gitlab-local",
+        "--transport",
+        "http",
+        "--header",
+        "Authorization=Bearer test",
+        "--url",
+        "http://192.168.0.8:3002/",
+        "--allow-insecure-http",
+    )
+
+    assert capsys.readouterr().out == "Added MCP server `gitlab-local`.\n"
+    assert _persisted_servers(config_dir)[0]["url"] == "http://192.168.0.8:3002/"
 
 
 def test_mcp_remove_deletes_static_server(
@@ -511,10 +572,12 @@ def test_mcp_remove_cleans_up_oauth_credentials(
     _run_mcp("add", "linear", "--url", "https://mcp.linear.app/mcp", "--no-login")
     capsys.readouterr()
     cleanup = AsyncMock()
-    monkeypatch.setattr(mcp_management, "delete_oauth_credentials", cleanup)
+    monkeypatch.setattr(_mcp_auth, "delete_oauth_credentials", cleanup)
 
+    # Do
     _run_mcp("remove", "linear")
 
+    # Assert
     cleanup.assert_awaited_once_with("linear")
     assert capsys.readouterr().out == "Removed MCP server `linear`.\n"
     assert _persisted_servers(config_dir) == []
@@ -525,19 +588,24 @@ def test_mcp_remove_keeps_config_after_oauth_cleanup_failure(
     capsys: pytest.CaptureFixture[str],
     config_dir: Path,
 ) -> None:
-    # Credentials are cleaned up before the config entry is removed, so a cleanup
-    # failure leaves the config entry in place (nothing was removed to restore).
+    """*Prepare*: Credential cleanup fails for one persisted OAuth source.
+    *Do*: Attempt removal through the sessionless catalog facade.
+    *Assert*: The command fails and leaves authoritative config unchanged.
+    """
+    # Prepare
     _run_mcp("add", "linear", "--url", "https://mcp.linear.app/mcp", "--no-login")
     capsys.readouterr()
     monkeypatch.setattr(
-        mcp_management,
+        _mcp_auth,
         "delete_oauth_credentials",
         AsyncMock(side_effect=MCPOAuthError("keyring unavailable")),
     )
 
+    # Do
     with pytest.raises(SystemExit) as exc_info:
         _run_mcp("remove", "linear")
 
+    # Assert
     assert exc_info.value.code == 2
     assert "keyring unavailable" in capsys.readouterr().err
     assert _persisted_servers(config_dir)[0]["name"] == "linear"
@@ -546,17 +614,62 @@ def test_mcp_remove_keeps_config_after_oauth_cleanup_failure(
 def test_mcp_remove_reports_concurrency_conflict_cleanly(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # A concurrent config write surfaces as a clean CLI error, not a traceback.
+    """*Prepare*: The sessionless catalog removal hits a concurrent config write.
+    *Do*: Run the CLI remove command.
+    *Assert*: Argparse reports a clean conflict without a traceback.
+    """
+
+    # Prepare
     async def conflict(*_args: object, **_kwargs: object) -> None:
         raise ConcurrencyConflictError("expected-fp", "actual-fp")
 
-    monkeypatch.setattr(mcp_cli, "remove_mcp_server_and_credentials", conflict)
+    monkeypatch.setattr(mcp_catalog, "remove_mcp_server", conflict)
 
+    # Do
     with pytest.raises(SystemExit) as exc_info:
         _run_mcp("remove", "linear")
 
+    # Assert
     assert exc_info.value.code == 2
     assert "modified externally" in capsys.readouterr().err
+
+
+def test_mcp_remove_restores_credentials_after_config_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    config_dir: Path,
+) -> None:
+    """*Prepare*: An OAuth source whose config removal conflicts after credential cleanup.
+    *Do*: Remove it through the sessionless catalog facade.
+    *Assert*: The credential backup is restored and the configured source remains usable.
+    """
+    # Prepare
+    _run_mcp("add", "linear", "--url", "https://mcp.linear.app/mcp", "--no-login")
+    capsys.readouterr()
+    backup = object()
+    snapshot = AsyncMock(return_value=backup)
+    cleanup = AsyncMock()
+    restore = AsyncMock()
+
+    async def conflict(*_args: object, **_kwargs: object) -> None:
+        raise ConcurrencyConflictError("expected-fp", "actual-fp")
+
+    monkeypatch.setattr(_mcp_auth, "snapshot_oauth_credentials", snapshot)
+    monkeypatch.setattr(_mcp_auth, "delete_oauth_credentials", cleanup)
+    monkeypatch.setattr(_mcp_auth, "restore_oauth_credentials", restore)
+    monkeypatch.setattr(mcp_catalog, "remove_mcp_server", conflict)
+
+    # Do
+    with pytest.raises(SystemExit) as exc_info:
+        _run_mcp("remove", "linear")
+
+    # Assert
+    assert exc_info.value.code == 2
+    assert "modified externally" in capsys.readouterr().err
+    snapshot.assert_awaited_once_with("linear")
+    cleanup.assert_awaited_once_with("linear")
+    restore.assert_awaited_once_with("linear", backup)
+    assert _persisted_servers(config_dir)[0]["name"] == "linear"
 
 
 def test_mcp_remove_targets_user_config_when_project_config_exists(

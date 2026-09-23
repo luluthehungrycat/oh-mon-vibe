@@ -9,7 +9,11 @@ from textual.containers import Vertical
 from textual.message import Message
 
 from vibe.app_server.models import AgentSafety
+from vibe.cli.autocompletion.base import CompletionEntry
 from vibe.cli.autocompletion.completers import CommandCompleter, PathCompleter
+from vibe.cli.autocompletion.inline_skill_completion import (
+    InlineSkillCompletionController,
+)
 from vibe.cli.autocompletion.path_completion import PathCompletionController
 from vibe.cli.autocompletion.slash_command import SlashCommandController
 from vibe.cli.commands import CommandRegistry
@@ -18,23 +22,46 @@ from vibe.cli.textual_ui.widgets.chat_input.completion_manager import (
     MultiCompletionManager,
 )
 from vibe.cli.textual_ui.widgets.chat_input.completion_popup import CompletionPopup
+from vibe.cli.textual_ui.widgets.chat_input.subagent_list import SubagentList
 from vibe.cli.textual_ui.widgets.chat_input.text_area import ChatTextArea
 from vibe.cli.voice_manager.voice_manager_port import VoiceManagerPort
 
 SAFETY_BORDER_CLASSES: dict[AgentSafety, str] = {
     AgentSafety.SAFE: "border-safe",
     AgentSafety.DESTRUCTIVE: "border-warning",
+    AgentSafety.SMART: "border-warning",
     AgentSafety.YOLO: "border-error",
 }
 
 
-class ChatInputContainer(Vertical):
+class ChatInputContainer(Vertical):  # noqa: PLR0904 - cohesive input surface API
     ID_INPUT_BOX = "input-box"
 
     class Submitted(Message):
         def __init__(self, value: str) -> None:
             self.value = value
             super().__init__()
+
+    class QueueEditSubmitted(Message):
+        def __init__(self, value: str) -> None:
+            self.value = value
+            super().__init__()
+
+    class QueueEditConsumed(Message):
+        def __init__(self, value: str) -> None:
+            self.value = value
+            super().__init__()
+
+    class QueueRemoveRequested(Message):
+        pass
+
+    class QueueSelectionScroll(Message):
+        def __init__(self, queue_index: int) -> None:
+            self.queue_index = queue_index
+            super().__init__()
+
+    class QueueModeExited(Message):
+        pass
 
     def __init__(
         self,
@@ -45,6 +72,9 @@ class ChatInputContainer(Vertical):
         skill_entries_getter: Callable[[], list[tuple[str, str]]] | None = None,
         file_watcher_for_autocomplete_getter: Callable[[], bool] | None = None,
         voice_manager: VoiceManagerPort | None = None,
+        queue_edit_active_getter: Callable[[], bool] | None = None,
+        queue_items_getter: Callable[[], list[tuple[int, str]]] | None = None,
+        queue_selected_index_getter: Callable[[], int | None] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -57,6 +87,9 @@ class ChatInputContainer(Vertical):
             file_watcher_for_autocomplete_getter
         )
         self._voice_manager = voice_manager
+        self._queue_edit_active_getter = queue_edit_active_getter
+        self._queue_items_getter = queue_items_getter
+        self._queue_selected_index_getter = queue_selected_index_getter
         self._custom_border_label: str | None = None
 
         self._completion_manager = MultiCompletionManager([
@@ -67,17 +100,25 @@ class ChatInputContainer(Vertical):
                 ),
                 self,
             ),
+            InlineSkillCompletionController(
+                self._skill_entries_getter or (lambda: []),
+                self,
+                self._input_is_default_mode,
+            ),
         ])
         self._body: ChatInputBody | None = None
 
-    def _get_slash_entries(self) -> list[tuple[str, str]]:
+    def _get_slash_entries(self) -> list[CompletionEntry]:
         entries = [
-            (alias, command.description)
+            CompletionEntry(alias, command.description)
             for command in self._command_registry.commands.values()
             for alias in sorted(command.aliases)
         ]
         if self._skill_entries_getter:
-            entries.extend(self._skill_entries_getter())
+            entries.extend(
+                CompletionEntry(alias, desc)
+                for alias, desc in self._skill_entries_getter()
+            )
         return sorted(entries)
 
     def compose(self) -> ComposeResult:
@@ -91,9 +132,14 @@ class ChatInputContainer(Vertical):
                 command_registry=self._command_registry,
                 id="input-body",
                 voice_manager=self._voice_manager,
+                queue_edit_active_getter=self._queue_edit_active_getter,
+                queue_items_getter=self._queue_items_getter,
+                queue_selected_index_getter=self._queue_selected_index_getter,
             )
 
             yield self._body
+
+        yield SubagentList(id="subagent-list")
 
     def on_mount(self) -> None:
         if not self._body:
@@ -107,6 +153,20 @@ class ChatInputContainer(Vertical):
         self, _event: ChatInputBody.CompletionResetRequested
     ) -> None:
         self._completion_manager.reset()
+
+    def on_chat_text_area_navigate_below(
+        self, event: ChatTextArea.NavigateBelow
+    ) -> None:
+        event.stop()
+        subagent_list = self.query_one(SubagentList)
+        if not subagent_list.focus_first() and self.input_widget is not None:
+            self.input_widget.set_app_focus(True)
+
+    def on_subagent_list_focus_input_requested(
+        self, event: SubagentList.FocusInputRequested
+    ) -> None:
+        event.stop()
+        self.focus_input()
 
     @property
     def input_widget(self) -> ChatTextArea | None:
@@ -129,18 +189,34 @@ class ChatInputContainer(Vertical):
                 widget.get_full_text(), widget._get_full_cursor_offset()
             )
 
+    def _input_is_default_mode(self) -> bool:
+        widget = self.input_widget
+        return widget is None or widget.is_default_mode
+
     def dismiss_completion(self) -> bool:
-        if self._completion_manager.is_active:
-            self._completion_manager.reset()
-            return True
-        return False
+        return self._completion_manager.dismiss()
 
     def focus_input(self) -> None:
         if self._body:
             self._body.focus_input()
 
+    def set_subagent_view(
+        self, active: bool, *, restore_input_focus: bool = True
+    ) -> None:
+        input_box = self.query_one(f"#{self.ID_INPUT_BOX}")
+        if not active:
+            input_box.display = True
+            if restore_input_focus:
+                self.focus_input()
+            return
+        if self.input_widget is not None:
+            self.input_widget.set_app_focus(False)
+        input_box.display = False
+        self.clear_completion_suggestions()
+        self.query_one(SubagentList).focus()
+
     def render_completion_suggestions(
-        self, suggestions: list[tuple[str, str]], selected_index: int
+        self, suggestions: list[CompletionEntry], selected_index: int
     ) -> None:
         try:
             popup = self.query_one(CompletionPopup)
@@ -154,6 +230,14 @@ class ChatInputContainer(Vertical):
         except Exception:
             return
         popup.hide()
+
+    def show_inline_suggestion(self, suggestion: str) -> None:
+        if widget := self.input_widget:
+            widget.set_inline_suggestion(suggestion)
+
+    def clear_inline_suggestion(self) -> None:
+        if widget := self.input_widget:
+            widget.clear_inline_suggestion()
 
     def _format_insertion(self, replacement: str, suffix: str) -> str:
         """Format the insertion text with appropriate spacing.
@@ -201,6 +285,35 @@ class ChatInputContainer(Vertical):
         event.stop()
         self.post_message(self.Submitted(event.value))
 
+    def on_chat_input_body_queue_edit_submitted(
+        self, event: ChatInputBody.QueueEditSubmitted
+    ) -> None:
+        event.stop()
+        self.post_message(self.QueueEditSubmitted(event.value))
+
+    def on_chat_input_body_queue_edit_consumed(
+        self, event: ChatInputBody.QueueEditConsumed
+    ) -> None:
+        event.stop()
+        self.post_message(self.QueueEditConsumed(event.value))
+
+    def on_chat_input_body_queue_remove_requested(
+        self, event: ChatInputBody.QueueRemoveRequested
+    ) -> None:
+        event.stop()
+        self.post_message(self.QueueRemoveRequested())
+
+    def on_chat_input_body_queue_selection_scroll(
+        self, event: ChatInputBody.QueueSelectionScroll
+    ) -> None:
+        event.stop()
+        self.post_message(self.QueueSelectionScroll(event.queue_index))
+
+    def on_chat_input_body_queue_mode_exited(
+        self, _event: ChatInputBody.QueueModeExited
+    ) -> None:
+        self.post_message(self.QueueModeExited())
+
     @property
     def switching_mode(self) -> bool:
         return self._body.switching_mode if self._body else False
@@ -218,6 +331,16 @@ class ChatInputContainer(Vertical):
     def set_safety(self, safety: AgentSafety) -> None:
         self._safety = safety
         self._apply_input_box_chrome()
+
+    def replace_command_registry(self, registry: CommandRegistry) -> None:
+        self._command_registry = registry
+
+    def replace_voice_manager(self, voice_manager: VoiceManagerPort | None) -> None:
+        if self._voice_manager is voice_manager:
+            return
+        self._voice_manager = voice_manager
+        if self._body:
+            self._body.replace_voice_manager(voice_manager)
 
     def set_agent_name(self, name: str) -> None:
         self._agent_name = name

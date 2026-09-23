@@ -1,16 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
-
-
-@dataclass(frozen=True)
-class AcpCommandContext:
-    vibe_code_enabled: bool = False
-
-
-type CommandAvailability = Callable[[AcpCommandContext], bool]
 
 
 class AcpCommandKind(StrEnum):
@@ -21,6 +12,7 @@ class AcpCommandKind(StrEnum):
     MCP = auto()
     TELEPORT = auto()
     PROXY_SETUP = auto()
+    RETRY = auto()
     LEANSTALL = auto()
     UNLEANSTALL = auto()
     DATA_RETENTION = auto()
@@ -34,32 +26,19 @@ class AcpCommand:
     description: str
     kind: AcpCommandKind
     input_hint: str | None = None
-    is_available: CommandAvailability | None = None
 
 
 @dataclass
 class AcpCommandRegistry:
     """Registry of ACP commands. Notifies listeners when commands change."""
 
-    vibe_code_enabled: bool = False
     _commands: dict[str, AcpCommand] = field(default_factory=dict)
-    _context: AcpCommandContext = field(init=False, default_factory=AcpCommandContext)
 
     def __post_init__(self) -> None:
-        self.refresh(AcpCommandContext(vibe_code_enabled=self.vibe_code_enabled))
+        self.refresh()
 
-    def refresh(self, context: AcpCommandContext) -> None:
-        self._context = context
-        self._commands = {
-            name: command
-            for name, command in _build_commands().items()
-            if self._is_available(command)
-        }
-
-    def _is_available(self, command: AcpCommand) -> bool:
-        if command.is_available is None:
-            return True
-        return command.is_available(self._context)
+    def refresh(self) -> None:
+        self._commands = _build_commands()
 
     @property
     def commands(self) -> dict[str, AcpCommand]:
@@ -102,13 +81,21 @@ def _build_commands() -> dict[str, AcpCommand]:
             name="teleport",
             description="Teleport session to Vibe Code Web",
             kind=AcpCommandKind.TELEPORT,
-            is_available=lambda ctx: ctx.vibe_code_enabled,
         ),
         "proxy-setup": AcpCommand(
             name="proxy-setup",
             description="Configure proxy and SSL certificate settings",
             kind=AcpCommandKind.PROXY_SETUP,
             input_hint="KEY value to set, KEY to unset, or empty for help",
+        ),
+        "retry": AcpCommand(
+            name="retry",
+            description=(
+                "Continue an interrupted model response; optionally pass "
+                "additional instructions"
+            ),
+            kind=AcpCommandKind.RETRY,
+            input_hint="Optional additional instructions for the continuation",
         ),
         "leanstall": AcpCommand(
             name="leanstall",

@@ -10,7 +10,7 @@ from tests.agent_loop.e2e.conftest import MistralAPI, build_e2e_agent_loop
 from tests.backend.data.mistral import mistral_completion
 from tests.conftest import build_test_vibe_config
 from vibe.core.agents.models import BuiltinAgentName
-from vibe.core.tools.builtins.bash import BashResult
+from vibe.core.tools.builtins.bash import CapturedShellResult
 from vibe.core.types import (
     ApprovalRequestEvent,
     ApprovalResponse,
@@ -61,8 +61,8 @@ async def _run_bash(
 async def test_bash_captures_stdout(mistral_api: MistralAPI) -> None:
     result = await _run_bash(mistral_api, "echo hello")
 
-    bash_result = cast(BashResult, result.result)
-    assert bash_result.returncode == 0
+    bash_result = cast(CapturedShellResult, result.result)
+    assert bash_result.exit_code == 0
     assert "hello" in bash_result.stdout
 
 
@@ -70,7 +70,7 @@ async def test_bash_captures_stdout(mistral_api: MistralAPI) -> None:
 async def test_bash_captures_stderr(mistral_api: MistralAPI) -> None:
     result = await _run_bash(mistral_api, "echo oops >&2")
 
-    bash_result = cast(BashResult, result.result)
+    bash_result = cast(CapturedShellResult, result.result)
     assert "oops" in bash_result.stderr
 
 
@@ -94,14 +94,14 @@ async def test_bash_timeout_surfaces_as_error(mistral_api: MistralAPI) -> None:
 async def test_bash_output_truncated_to_max_bytes(mistral_api: MistralAPI) -> None:
     result = await _run_bash(mistral_api, "yes x | head -c 100000")
 
-    bash_result = cast(BashResult, result.result)
+    bash_result = cast(CapturedShellResult, result.result)
     assert len(bash_result.stdout) <= 16_000
 
 
 @pytest.mark.asyncio
 async def test_bash_denylisted_command_is_skipped(mistral_api: MistralAPI) -> None:
     result = await _run_bash(
-        mistral_api, "vim file.txt", agent_name=BuiltinAgentName.DEFAULT
+        mistral_api, "vim file.txt", agent_name=BuiltinAgentName.ASK
     )
 
     assert result.skipped is True
@@ -115,11 +115,11 @@ async def test_bash_allowlisted_command_runs_without_approval(
 ) -> None:
     # No interaction responder is available; an allowlisted command still runs.
     result = await _run_bash(
-        mistral_api, "echo allowed", agent_name=BuiltinAgentName.DEFAULT
+        mistral_api, "echo allowed", agent_name=BuiltinAgentName.ASK
     )
 
     assert result.skipped is False
-    assert "allowed" in cast(BashResult, result.result).stdout
+    assert "allowed" in cast(CapturedShellResult, result.result).stdout
 
 
 @pytest.mark.asyncio
@@ -129,7 +129,7 @@ async def test_bash_non_allowlisted_command_requires_approval(
     result = await _run_bash(
         mistral_api,
         "touch newfile.txt",
-        agent_name=BuiltinAgentName.DEFAULT,
+        agent_name=BuiltinAgentName.ASK,
         approval=ApprovalResponse.YES,
     )
 
@@ -144,7 +144,7 @@ async def test_bash_non_allowlisted_command_denied_at_prompt_is_skipped(
     result = await _run_bash(
         mistral_api,
         "touch denied.txt",
-        agent_name=BuiltinAgentName.DEFAULT,
+        agent_name=BuiltinAgentName.ASK,
         approval=ApprovalResponse.NO,
     )
 
@@ -160,7 +160,7 @@ async def test_bash_command_touching_outside_workdir_requires_approval(
     result = await _run_bash(
         mistral_api,
         f"touch {outside}",
-        agent_name=BuiltinAgentName.DEFAULT,
+        agent_name=BuiltinAgentName.ASK,
         approval=ApprovalResponse.NO,
     )
 

@@ -19,7 +19,13 @@ from vibe.core.tools.base import (
 from vibe.core.tools.io_port import ToolIOPort
 from vibe.core.tools.permissions import PermissionContext
 from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
-from vibe.core.tools.utils import resolve_file_tool_permission
+from vibe.core.tools.utils import (
+    DEFAULT_SENSITIVE_PATTERNS,
+    ToolPath,
+    display_file_path,
+    resolve_file_tool_permission,
+    resolve_tool_path,
+)
 from vibe.core.types import ToolStreamEvent
 from vibe.utils import VIBE_WARNING_TAG
 from vibe.utils.io import read_lines_safe_async
@@ -51,7 +57,7 @@ def _display_relative(path: Path, base: Path) -> Path:
 
 
 class ReadFileArgs(BaseModel):
-    file_path: str = Field(description="The absolute path to the file to read")
+    file_path: ToolPath = Field(description="The absolute path to the file to read")
     offset: int | None = Field(
         default=None,
         ge=1,
@@ -78,7 +84,7 @@ class ReadFileResult(BaseModel):
 class ReadFileConfig(BaseToolConfig):
     permission: ToolPermission = ToolPermission.ALWAYS
     sensitive_patterns: list[str] = Field(
-        default=["**/.env", "**/.env.*"],
+        default_factory=lambda: list(DEFAULT_SENSITIVE_PATTERNS),
         description="File patterns that trigger ASK even when permission is ALWAYS.",
     )
     max_read_bytes: int = Field(
@@ -106,8 +112,7 @@ class ReadFile(
             denylist=self.config.denylist,
             config_permission=self.config.permission,
             sensitive_patterns=self.config.sensitive_patterns,
-            cwd=self.cwd,
-            project_roots=self.harness_files.project_roots,
+            workspace=self.workspace,
             scratchpad_dir=self.scratchpad_dir,
         )
 
@@ -213,10 +218,7 @@ class ReadFile(
         if not raw_path.strip():
             raise ToolError("file_path cannot be empty")
 
-        path = Path(raw_path).expanduser()
-        if not path.is_absolute():
-            path = self.cwd / path
-        path = path.resolve()
+        path = resolve_tool_path(raw_path, self.cwd)
 
         if not path.exists():
             raise ToolError(f"File not found at: {path}")
@@ -227,7 +229,7 @@ class ReadFile(
     @classmethod
     def format_call_display(cls, args: ReadFileArgs) -> ToolCallDisplay:
         suffix = "(scratchpad)" if is_scratchpad_display_path(args.file_path) else ""
-        message = args.file_path
+        message = display_file_path(args.file_path)
         extras: list[str] = []
         if args.offset:
             extras.append(f"from line {args.offset}")
@@ -251,10 +253,9 @@ class ReadFile(
                 success=False, message=event.error or event.skip_reason or "No result"
             )
 
-        path_obj = Path(event.result.file_path)
         n = event.result.num_lines
         word = "line" if n == 1 else "lines"
-        message = f"{n} {word} from {path_obj.name}"
+        message = f"{n} {word} from {display_file_path(event.result.file_path)}"
         suffix_parts: list[str] = []
         if is_scratchpad_display_path(event.result.file_path):
             suffix_parts.append("(scratchpad)")

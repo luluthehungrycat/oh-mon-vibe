@@ -19,10 +19,16 @@ from vibe.core.tools.base import (
 )
 from vibe.core.tools.permissions import PermissionContext
 from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
-from vibe.core.tools.utils import resolve_file_tool_permission
+from vibe.core.tools.utils import (
+    DEFAULT_SENSITIVE_PATTERNS,
+    ToolPath,
+    matches_sensitive_pattern,
+    resolve_file_tool_permission,
+    resolve_tool_path,
+)
 from vibe.core.types import ToolStreamEvent
 from vibe.core.utils import kill_async_subprocess
-from vibe.utils.io import decode_safe, read_safe
+from vibe.utils.io import decode_console_safe, read_safe
 from vibe.utils.tool_presentation import ToolEffectKind
 
 if TYPE_CHECKING:
@@ -37,7 +43,7 @@ class GrepBackend(StrEnum):
 class GrepToolConfig(BaseToolConfig):
     permission: ToolPermission = ToolPermission.ALWAYS
     sensitive_patterns: list[str] = Field(
-        default=["**/.env", "**/.env.*"],
+        default_factory=lambda: list(DEFAULT_SENSITIVE_PATTERNS),
         description="File patterns that trigger ASK even when permission is ALWAYS.",
     )
 
@@ -86,7 +92,7 @@ class GrepToolConfig(BaseToolConfig):
 
 class GrepArgs(BaseModel):
     pattern: str = Field(description="The regex pattern to search for in file contents")
-    path: str = Field(
+    path: ToolPath = Field(
         default=".",
         description="The file or directory to search in. Defaults to the current working directory.",
     )
@@ -190,8 +196,7 @@ class Grep(
             denylist=self.config.denylist,
             config_permission=self.config.permission,
             sensitive_patterns=self.config.sensitive_patterns,
-            cwd=self.cwd,
-            project_roots=self.harness_files.project_roots,
+            workspace=self.workspace,
             scratchpad_dir=self.scratchpad_dir,
         )
 
@@ -223,11 +228,7 @@ class Grep(
         if not args.pattern.strip():
             raise ToolError("Empty search pattern provided.")
 
-        path_obj = Path(args.path).expanduser()
-        if not path_obj.is_absolute():
-            path_obj = self.cwd / path_obj
-
-        if not path_obj.exists():
+        if not resolve_tool_path(args.path, self.cwd).exists():
             raise ToolError(f"Path does not exist: {args.path}")
 
     def _collect_exclude_patterns(self) -> list[str]:
@@ -326,16 +327,8 @@ class Grep(
                     f"Search timed out after {self.config.default_timeout}s"
                 )
 
-            stdout = (
-                decode_safe(stdout_bytes, from_subprocess=True).text
-                if stdout_bytes
-                else ""
-            )
-            stderr = (
-                decode_safe(stderr_bytes, from_subprocess=True).text
-                if stderr_bytes
-                else ""
-            )
+            stdout = decode_console_safe(stdout_bytes) if stdout_bytes else ""
+            stderr = decode_console_safe(stderr_bytes) if stderr_bytes else ""
 
             if proc.returncode not in {0, 1}:
                 error_msg = stderr or f"Process exited with code {proc.returncode}"
@@ -348,10 +341,25 @@ class Grep(
         except Exception as exc:
             raise ToolError(f"Error running grep: {exc}") from exc
 
+    def _drop_sensitive_matches(self, lines: list[str]) -> list[str]:
+        """Remove matches from files that read/edit tools gate as sensitive."""
+        patterns = self.config.sensitive_patterns
+        if not patterns:
+            return lines
+
+        kept: list[str] = []
+        for line in lines:
+            match = GrepMatch.from_output_line(line, self.cwd)
+            if match and matches_sensitive_pattern(match.path, patterns):
+                continue
+            kept.append(line)
+        return kept
+
     def _parse_output(
         self, stdout: str, max_matches: int, pattern: str = ""
     ) -> GrepResult:
         output_lines = stdout.splitlines() if stdout else []
+        output_lines = self._drop_sensitive_matches(output_lines)
 
         truncated_lines = output_lines[:max_matches]
         truncated_output = "\n".join(truncated_lines)

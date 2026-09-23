@@ -11,6 +11,7 @@ from vibe.core.config.harness_files import (
 )
 from vibe.core.config.layer import ConfigLayer, RawConfig
 from vibe.core.config.layers.admin import AdminConfigLayer
+from vibe.core.config.layers.agent_profile import AgentProfileLayer
 from vibe.core.config.layers.default import DefaultConfigLayer
 from vibe.core.config.layers.environment import EnvironmentLayer
 from vibe.core.config.layers.growthbook import GrowthbookLayer
@@ -26,18 +27,19 @@ async def build_default_orchestrator(
     data: dict[str, Any] | None = None,
     *,
     harness_files: HarnessFilesManager | None = None,
-    require_api_key: bool = True,
 ) -> ConfigOrchestrator[VibeConfigSchema]:
     """Build the CLI ConfigOrchestrator with the standard layer stack.
 
     Priority order (lowest to highest): schema defaults, GrowthBook experiments,
     user TOML, project TOML, VIBE_* env vars, runtime overrides, agent profile
-    overrides. Both the user and project TOML layers are installed together when
+    overrides, enforced admin config. The agent-profile slot ships empty and is
+    filled in place by AgentManager; the admin layer stays on top so an enforced
+    org config shadows every layer below it. Both the user and project TOML
+    layers are installed together when
     their sources are enabled, so a trusted project config inherits unspecified
     values from the user config and both TOML layers override GrowthBook
-    assignments. The default persistence target is the project layer when one is
-    discovered and trusted, otherwise the user layer, otherwise an ephemeral
-    fallback.
+    assignments. The default persistence target is the user layer, otherwise a
+    trusted project layer, otherwise an ephemeral fallback.
     """
     manager = harness_files or get_harness_files_manager()
     user_layer = (
@@ -49,17 +51,18 @@ async def build_default_orchestrator(
         ProjectConfigLayer(
             path=manager.cwd or Path.cwd(), trust_store=manager.trust_store
         )
-        if "project" in manager.sources
+        if manager.project_source_enabled
         else None
     )
     override_layer = OverridesLayer(data=data or {})
 
     def default_layer_resolver() -> ConfigLayer[RawConfig]:
-        if project_layer is not None and project_layer.is_trusted:
-            if project_layer.is_file_discovered or user_layer is None:
-                return project_layer
+        # User config wins by default: a project config discovered by walking up
+        # parents is rarely the scope the user meant in a monorepo.
         if user_layer is not None:
             return user_layer
+        if project_layer is not None and project_layer.is_trusted:
+            return project_layer
         return override_layer
 
     layers = [
@@ -69,9 +72,9 @@ async def build_default_orchestrator(
         *([project_layer] if project_layer is not None else []),
         EnvironmentLayer(schema=VibeConfigSchema),
         override_layer,
-        # AgentProfileLayer(),
-        # Highest priority: org-enforced config populated at runtime. It shadows
-        # every layer above, which is the enforcement mechanism.
+        # Empty slot filled in place by AgentManager when a profile is selected
+        AgentProfileLayer(),
+        # Highest priority: org-enforced config populated at runtime.
         AdminConfigLayer(),
     ]
 
@@ -81,7 +84,6 @@ async def build_default_orchestrator(
         schema=VibeConfigSchema,
         layers=layers,
         default_layer_resolver=default_layer_resolver,
-        validation_context={"require_api_key": require_api_key},
     )
     await asyncio.to_thread(
         configure_ssl_context,
@@ -99,5 +101,4 @@ async def build_user_config_orchestrator() -> ConfigOrchestrator[VibeConfigSchem
         schema=VibeConfigSchema,
         layers=[user_layer],
         default_layer_resolver=lambda: user_layer,
-        validation_context={"require_api_key": False},
     )

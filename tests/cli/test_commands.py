@@ -1,6 +1,23 @@
 from __future__ import annotations
 
-from vibe.cli.commands import Command, CommandContext, CommandRegistry
+import re
+
+import pytest
+
+from vibe.cli.commands import Command, CommandRegistry
+from vibe.core.skills.builtins.vibe import SKILL as VIBE_SKILL
+
+_SKILL_MODULE = "vibe/core/skills/builtins/vibe.py"
+
+# A backticked token that opens with a slash, e.g. `/help` or `/loop <interval>`.
+# The match stops at the first non-name character, so argument placeholders still
+# yield the bare command. The lookahead must reject every name character as well
+# as `/`, otherwise the regex backtracks and reads `/v1/traces` as `/v`.
+_SLASH_TOKEN_RE = re.compile(r"`(/[a-z0-9][a-z0-9-]*)(?![a-z0-9\-/])")
+
+# Slash-shaped tokens in the skill prose that are deliberately not commands:
+# they stand in for the name of a user-invocable skill.
+_NON_COMMAND_TOKENS = frozenset({"/skill", "/skill-name", "/word"})
 
 
 class TestCommandRegistry:
@@ -48,6 +65,27 @@ class TestCommandRegistry:
         assert result == ("clear", registry.commands["clear"], "")
         assert registry.commands["clear"].handler == "_clear_history"
 
+    def test_clear_command_accepts_optional_prompt(self) -> None:
+        registry = CommandRegistry()
+
+        result = registry.parse_command("/clear fix the bug")
+
+        assert result is not None
+        cmd_name, cmd, cmd_args = result
+        assert cmd_name == "clear"
+        assert cmd.handler == "_clear_history"
+        assert cmd_args == "fix the bug"
+
+    def test_new_alias_accepts_optional_prompt(self) -> None:
+        registry = CommandRegistry()
+
+        result = registry.parse_command("/new hello")
+
+        assert result is not None
+        cmd_name, _, cmd_args = result
+        assert cmd_name == "clear"
+        assert cmd_args == "hello"
+
     def test_parse_command_uses_get_command_name(self) -> None:
         """parse_command and get_command_name stay in sync for same input."""
         registry = CommandRegistry()
@@ -68,34 +106,12 @@ class TestCommandRegistry:
         assert registry.parse_command("/exit") is None
         assert registry.get_command_name("/help") == "help"
 
-    def test_teleport_command_hidden_without_eligible_context(self) -> None:
+    def test_vibe_code_commands_are_always_registered(self) -> None:
         registry = CommandRegistry()
-        assert registry.get_command_name("/teleport") is None
-        assert registry.parse_command("/teleport") is None
 
-    def test_teleport_command_registration_uses_resolved_context(self) -> None:
-        registry = CommandRegistry(vibe_code_enabled=True)
         assert registry.get_command_name("/teleport") == "teleport"
         assert registry.has_command("teleport")
-
-    def test_teleport_command_registration_uses_latest_context(self) -> None:
-        registry = CommandRegistry(vibe_code_enabled=True)
-        assert registry.get_command_name("/teleport") == "teleport"
-
-        registry.refresh(CommandContext(vibe_code_enabled=False))
-        assert registry.get_command_name("/teleport") is None
-
-    def test_teleport_help_text_uses_resolved_context(self) -> None:
-        registry = CommandRegistry()
-        assert "/teleport" not in registry.get_help_text()
-
-        eligible_registry = CommandRegistry(vibe_code_enabled=True)
-        assert eligible_registry.get("teleport") is not None
-        assert "/teleport" in eligible_registry.get_help_text()
-
-    def test_vibe_code_project_command_registered_when_vibe_code_enabled(self) -> None:
-        registry = CommandRegistry(vibe_code_enabled=True)
-
+        assert "/teleport" in registry.get_help_text()
         assert registry.get_command_name("/remote-project") == "remote-project"
         result = registry.parse_command("/remote-project")
         assert result is not None
@@ -136,6 +152,17 @@ class TestCommandRegistry:
         assert cmd.handler == "_rename_session"
         assert cmd_args == "Better title"
 
+    def test_branch_command_registration(self) -> None:
+        registry = CommandRegistry()
+        assert registry.get_command_name("/branch") == "branch"
+        result = registry.parse_command("/branch")
+        assert result is not None
+        _, cmd, cmd_args = result
+        assert cmd.handler == "_branch_session"
+        assert cmd_args == ""
+        assert cmd.side_channel is False
+        assert cmd.exits is False
+
     def test_parse_command_keeps_args_for_no_arg_commands(self) -> None:
         registry = CommandRegistry()
         result = registry.parse_command("/help extra")
@@ -174,7 +201,17 @@ class TestCommandRegistry:
         cmd_name, cmd, cmd_args = result
         assert cmd_name == "loop"
         assert cmd.handler == "_loop_command"
+        assert cmd.side_channel is False
         assert cmd_args == "30s ping"
+
+    @pytest.mark.parametrize(
+        "command_name",
+        ["config", "model", "thinking", "log-level", "proxy-setup", "voice", "theme"],
+    )
+    def test_config_picker_commands_require_idle(self, command_name: str) -> None:
+        registry = CommandRegistry()
+
+        assert registry.commands[command_name].side_channel is False
 
     def test_exit_command_accepts_bare_synonyms(self) -> None:
         registry = CommandRegistry()
@@ -219,3 +256,66 @@ class TestCommandRegistry:
         help_text = registry.get_help_text()
         for alias in ["`/exit`", "`exit`", "`quit`", "`:q`", "`:quit`"]:
             assert alias in help_text, alias
+
+
+class TestBuiltinSkillCommandDrift:
+    """The builtin `vibe` skill is loaded into the model's context, so any slash
+    command it names is one the model will confidently recommend. A command that
+    is documented there but absent from the registry is a phantom: the user types
+    it and it does nothing. These tests keep the two in sync.
+    """
+
+    @staticmethod
+    def _all_aliases() -> set[str]:
+        # Deliberately the unfiltered command table rather than a live registry:
+        # `/paste-image` is macOS-only and `/teleport` / `/remote-project` need
+        # Vibe Code, but the skill documents all three with their conditions, and
+        # the guard must hold on every platform.
+        return {
+            alias
+            for command in CommandRegistry()._build_commands().values()  # pyright: ignore[reportPrivateUsage]
+            for alias in command.aliases
+        }
+
+    @staticmethod
+    def _documented_commands() -> set[str]:
+        found = set(_SLASH_TOKEN_RE.findall(VIBE_SKILL.prompt))
+        return found - _NON_COMMAND_TOKENS
+
+    def test_every_command_documented_in_builtin_skill_is_registered(self) -> None:
+        known = self._all_aliases()
+        phantoms = sorted(self._documented_commands() - known)
+        assert not phantoms, (
+            f"{_SKILL_MODULE} documents slash command(s) that "
+            f"CommandRegistry._build_commands() does not register: "
+            f"{', '.join(phantoms)}. The skill is loaded into the model's "
+            f"context, so the model will recommend commands that do not exist. "
+            f"Either register them or delete them from the skill text."
+        )
+
+    def test_builtin_skill_documents_the_user_facing_commands(self) -> None:
+        # Guards the reverse direction: a newly registered command that never
+        # makes it into the skill text is invisible to the model. Add the command
+        # to the skill's "Built-in Slash Commands" section, or list its canonical
+        # alias here if it is internal and deliberately undocumented.
+        undocumented_by_design: frozenset[str] = frozenset()
+        documented = self._documented_commands()
+        missing = sorted(
+            f"/{name}"
+            for name in CommandRegistry()._build_commands()  # pyright: ignore[reportPrivateUsage]
+            if f"/{name}" not in documented and f"/{name}" not in undocumented_by_design
+        )
+        assert not missing, (
+            f"Command(s) registered in CommandRegistry._build_commands() but not "
+            f"mentioned in {_SKILL_MODULE}: {', '.join(missing)}. The model only "
+            f"knows the commands that skill names."
+        )
+
+    def test_guard_detects_a_phantom_command(self) -> None:
+        # The guard is only worth having if it actually fires, and the regex has
+        # to survive argument placeholders.
+        assert _SLASH_TOKEN_RE.findall("- `/loop <interval> <prompt>` - Schedule") == [
+            "/loop"
+        ]
+        assert _SLASH_TOKEN_RE.findall("Vibe appends `/v1/traces`.") == []
+        assert "/terminal-setup" not in self._all_aliases()

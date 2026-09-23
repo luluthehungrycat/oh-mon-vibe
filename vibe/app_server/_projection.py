@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 import hashlib
 import json
 from pathlib import Path
@@ -8,12 +8,14 @@ from typing import Literal, Protocol, TypedDict
 
 from pydantic import JsonValue
 
+from vibe.app_server._session_model import active_model_is_pinned
 from vibe.app_server._shell import restored_shell_effect_state, shell_effect_detail
 from vibe.app_server._tool_projection import (
     project_effect_detail,
     project_effect_output_value,
 )
 from vibe.app_server._utils import now_ms
+from vibe.app_server._worktree_effects import WorktreeEffect
 from vibe.app_server.config import (
     AudioProviderView,
     ConfigView,
@@ -45,6 +47,7 @@ from vibe.app_server.models import (
     MCPSourceSummary,
     MCPState,
     MCPToolSummary,
+    PublicCheckpointEntry,
     PublicEffectEntry,
     PublicEntryGenerationStatus,
     PublicError,
@@ -59,7 +62,7 @@ from vibe.app_server.models import (
     ToolSummary,
 )
 from vibe.core.agent_loop import AgentLoop
-from vibe.core.agents import AgentProfile
+from vibe.core.agents import AgentProfile, BuiltinAgentName
 from vibe.core.config import (
     ModelConfig,
     TranscribeClient,
@@ -70,9 +73,9 @@ from vibe.core.config import (
     TTSProviderConfig,
     VibeConfigSchema,
 )
+from vibe.core.config.orchestrator import ConfigOrchestrator
 from vibe.core.log_reader import PaginatedLogs
-from vibe.core.plugins import PluginPackageDiagnostic
-from vibe.core.plugins.lifecycle import PluginLifecycleDiagnostic
+from vibe.core.skills.models import SkillInfo, SkillSource
 from vibe.core.tools.connectors.connector_registry import ConnectorAuthAction
 from vibe.core.tools.connectors.counts import compute_connector_counts
 from vibe.core.tools.remote import AuthStatus, MCPTool
@@ -81,36 +84,51 @@ from vibe.core.types import (
     LLMMessage,
     Role,
     SessionMetadata,
+    WorktreeContext,
 )
-from vibe.core.utils import CANCELLATION_TAG, TOOL_ERROR_TAG, TaggedText
+from vibe.core.utils import CANCELLATION_TAG, TOOL_ERROR_TAG, TaggedText, name_matches
 from vibe.user_content import UserResource
+from vibe.utils.mcp import format_tool_display_description
 from vibe.utils.tool_presentation import ToolCallPresentation
 
 
-def project_config(agent_loop: AgentLoop, *, base: bool = False) -> ConfigView:
+def project_config(agent_loop: AgentLoop) -> ConfigView:
     return project_config_view(
-        agent_loop.base_config if base else agent_loop.config,
-        active_model_pinned=bool(
-            agent_loop.config_orchestrator.persisted_active_model()
-        ),
+        agent_loop.config,
+        active_model_pinned=active_model_is_pinned(agent_loop.config_orchestrator),
+        awaiting_experiment_model=agent_loop.awaiting_experiment_model,
     )
 
 
 def project_config_view(
-    config: VibeConfigSchema, *, active_model_pinned: bool = False
+    config: VibeConfigSchema,
+    *,
+    active_model_pinned: bool = False,
+    awaiting_experiment_model: bool = False,
+    # Whether the caller's backend can show a blind model a description in
+    # place of the pixels. Only the Unified one can, so the legacy projection
+    # keeps reporting the active model's own vision.
+    image_fallback: bool = False,
 ) -> ConfigView:
     transcribe_model = config.get_active_transcribe_model()
     tts_model = config.get_active_tts_model()
-    default_model_alias = (
-        config.resolve_default_model_alias()
-        if active_model_pinned
-        else config.get_active_model().alias
-    )
+    active_model = config.get_active_model()
+    # A describer, not Core's resource-link projection, is what makes the
+    # promise good for every source kind: the link only exists for a
+    # file-backed image, so an inline one would still reach a blind model.
+    describable = image_fallback and config.get_vision_fallback_model() is not None
     return ConfigView(
-        active_model=_project_model_config(config.get_active_model()),
+        active_model=_project_model_config(active_model),
         active_model_pinned=active_model_pinned,
-        default_model_alias=default_model_alias,
+        images_supported=active_model.supports_images or describable,
+        awaiting_experiment_model=awaiting_experiment_model,
+        # The configured default, never the active model: clients render it as
+        # the "Default (currently X)" hint, which must stay stable while a pin
+        # is in effect.
+        default_model_alias=config.resolve_default_model_alias(),
+        default_agent=config.default_agent,
         theme=config.theme,
+        log_level=config.log_level,
         disable_welcome_banner_animation=config.disable_welcome_banner_animation,
         show_greeting=config.show_greeting,
         autocopy_to_clipboard=config.autocopy_to_clipboard,
@@ -119,10 +137,16 @@ def project_config_view(
         voice_mode_enabled=config.voice_mode_enabled,
         narrator_enabled=config.narrator_enabled,
         show_thinking_nodes=config.show_thinking_nodes,
+        show_subagent_status_list=config.show_subagent_status_list,
+        worktree_limit=config.worktree_limit,
         enable_update_checks=config.enable_update_checks,
         enable_notifications=config.enable_notifications,
-        vibe_code_enabled=config.vibe_code_enabled,
-        models=[_project_model_config(model) for model in config.models.values()],
+        experimental_enable_tab_status=config.experimental_enable_tab_status,
+        enable_telemetry=config.enable_telemetry,
+        experimental_enable_registry_skills=config.experimental_enable_registry_skills,
+        models=[
+            _project_model_config(model) for model in config.available_models().values()
+        ],
         transcribe_models=[model.alias for model in config.transcribe_models],
         tts_models=[model.alias for model in config.tts_models],
         transcription=TranscriptionConfigView(
@@ -158,6 +182,7 @@ def _project_model_config(model: ModelConfig) -> ModelConfigView:
         alias=model.alias,
         thinking=model.thinking,
         supports_images=model.supports_images,
+        display_name=model.display_name or model.alias,
     )
 
 
@@ -220,31 +245,153 @@ def project_stats(agent_loop: AgentLoop) -> AgentStatsSnapshot:
     )
 
 
-def project_agents(agent_loop: AgentLoop) -> tuple[AgentSummary, list[AgentSummary]]:
-    return (
-        _project_agent(agent_loop.agent_profile),
-        [
-            _project_agent(profile)
-            for profile in agent_loop.agent_manager.available_agents.values()
-        ],
-    )
-
-
-def project_skills(agent_loop: AgentLoop) -> list[SkillSummary]:
-    return [
-        SkillSummary.model_validate({
-            "name": skill.name,
-            "description": skill.description,
-            "prompt": skill.prompt,
-            "user_invocable": skill.user_invocable,
-            "source": skill.source.value,
-        })
-        for skill in agent_loop.skill_manager.available_skills.values()
+def project_agent_summaries(
+    active: AgentProfile, available: Iterable[AgentProfile]
+) -> tuple[AgentSummary, list[AgentSummary]]:
+    return project_agent_summary(active), [
+        project_agent_summary(profile) for profile in available
     ]
 
 
+# Modes hidden from the Unified Harness mode picker/cycle. They stay selectable
+# (resume, pinned running mode, explicit ``--agent``/switch); only the list the
+# client offers is trimmed.
+_UNIFIED_HIDDEN_PICKER_AGENTS: frozenset[str] = frozenset({BuiltinAgentName.PLAN})
+
+
+def project_unified_agent_summaries(
+    active: AgentProfile, available: Iterable[AgentProfile]
+) -> tuple[AgentSummary, list[AgentSummary]]:
+    """Project agents for a Unified Harness client, hiding plan mode from the picker.
+
+    The active profile is always projected, so a session already running a hidden
+    mode still reports it; only the selectable list drops the hidden modes.
+    """
+    visible = [
+        profile
+        for profile in available
+        if profile.name not in _UNIFIED_HIDDEN_PICKER_AGENTS
+    ]
+    return project_agent_summaries(active, visible)
+
+
+def project_agents(agent_loop: AgentLoop) -> tuple[AgentSummary, list[AgentSummary]]:
+    return project_agent_summaries(
+        agent_loop.agent_profile, agent_loop.agent_manager.available_agents.values()
+    )
+
+
+def project_skill_summaries(skills: Iterable[SkillInfo]) -> list[SkillSummary]:
+    return [_skill_summary(skill) for skill in skills]
+
+
+def _skill_summary(
+    skill: SkillInfo, enabled: bool = True, locked: bool = False
+) -> SkillSummary:
+    return SkillSummary.model_validate({
+        "name": skill.name,
+        "description": skill.description,
+        "prompt": skill.prompt,
+        "user_invocable": skill.user_invocable,
+        "source": skill.source.value,
+        "scope": skill.scope.value,
+        "registry": skill.registry.model_dump() if skill.registry else None,
+        "enabled": enabled,
+        "locked": locked,
+    })
+
+
+def project_skills(agent_loop: AgentLoop) -> list[SkillSummary]:
+    return project_skill_summaries(agent_loop.skill_manager.available_skills.values())
+
+
+def writable_disabled_skills(
+    orchestrator: ConfigOrchestrator[VibeConfigSchema],
+) -> Sequence[str] | None:
+    """The writable layer's own ``disabled_skills``, or None when unavailable.
+
+    ``disabled_skills`` concat-merges, so the effective list is every layer at
+    once while a toggle can only add to or remove from the writable one. Reads
+    the cached layer rather than loading, to stay usable from sync projection.
+    """
+    try:
+        layer = orchestrator.get_layer(orchestrator.writable_layer_name)
+    except KeyError:
+        return None
+    data = layer.cached_data
+    if data is None:
+        return None
+    names = getattr(data, "disabled_skills", None)
+    return list(names) if names else []
+
+
+def project_installed_skill_summaries(
+    skills: Iterable[SkillInfo],
+    config: VibeConfigSchema,
+    user_disabled: Sequence[str] | None = None,
+) -> list[SkillSummary]:
+    """Browser rows for *skills*, marked against the config's skill filters.
+
+    ``enabled`` is whether the agent loads the skill. ``locked`` is whether the
+    browser can change that, and the two are independent: a skill can be
+    enabled and locked, or disabled and locked.
+
+    ``user_disabled`` is the writable layer's own ``disabled_skills``.
+    ``disabled_skills`` concatenates across layers, so a name a project or admin
+    layer disabled cannot be re-enabled by rewriting the writable one; without
+    it a row offers a toggle that silently does nothing. Omitting the argument
+    assumes a single layer.
+
+    Plugin skills are locked: they come from an installed plugin and are managed
+    through ``/plugins``, not by this config.
+    """
+    allowed = config.enabled_skills
+    disabled = config.disabled_skills
+    own = list(disabled if user_disabled is None else user_disabled)
+
+    def _enabled(info: SkillInfo) -> bool:
+        if info.source is SkillSource.PLUGIN:
+            return True
+        if allowed:
+            return name_matches(info.name, allowed)
+        return not (disabled and name_matches(info.name, disabled))
+
+    def _locked(info: SkillInfo) -> bool:
+        if info.source is SkillSource.PLUGIN:
+            return True
+        if allowed:
+            return True
+        if not disabled:
+            return False
+        patterns = [pattern for pattern in disabled if pattern != info.name]
+        if name_matches(info.name, patterns):
+            return True
+        return name_matches(info.name, disabled) and info.name not in own
+
+    return [_skill_summary(info, _enabled(info), _locked(info)) for info in skills]
+
+
+def project_installed_skills(agent_loop: AgentLoop) -> list[SkillSummary]:
+    """One row per installed skill, mirroring the agent's resolved state.
+
+    ``installed_skills`` is the deduped, project/source-wins set the agent loads
+    (builtins excluded) *including* disabled skills, so a skill turned off stays
+    in the list marked not-enabled and can be turned back on; enabled rows are
+    exactly what the agent uses.
+    """
+    return project_installed_skill_summaries(
+        agent_loop.skill_manager.installed_skills(),
+        agent_loop.config,
+        writable_disabled_skills(agent_loop.config_orchestrator),
+    )
+
+
 def project_tools(agent_loop: AgentLoop) -> list[ToolSummary]:
-    return [ToolSummary(name=name) for name in agent_loop.tool_manager.available_tools]
+    custom_tool_names = agent_loop.tool_manager.custom_tool_names
+    return [
+        ToolSummary(name=name, is_custom=name in custom_tool_names)
+        for name in agent_loop.tool_manager.available_tools
+    ]
 
 
 def project_connectors(agent_loop: AgentLoop) -> ConnectorCounts:
@@ -258,12 +405,18 @@ def project_mcp(
     agent_loop: AgentLoop, *, discovery_errors: Mapping[str, str] | None = None
 ) -> MCPState:
     tools = _project_mcp_tools(agent_loop)
+    discovery_errors_set = set(discovery_errors) if discovery_errors else set()
+    connector_registry = agent_loop.connector_registry
+    connector_error = (
+        connector_registry.bootstrap_error() if connector_registry is not None else None
+    )
     return MCPState(
         sources=[
-            *_project_mcp_servers(agent_loop, tools),
+            *_project_mcp_servers(agent_loop, tools, discovery_errors_set),
             *_project_mcp_connectors(agent_loop, tools),
         ],
         discovery_errors=dict(discovery_errors or {}),
+        connector_error=connector_error,
     )
 
 
@@ -283,15 +436,12 @@ def _project_mcp_tools(
             if tool_class.is_connector()
             else MCPSourceKind.SERVER
         )
-        description = (
-            (tool_class.description or "")
-            .removeprefix(f"[{source_name}] ")
-            .split("\n")[0]
-        )
         tools.setdefault((kind, source_name), []).append(
             MCPToolSummary(
                 name=tool_class.get_remote_name(),
-                description=description,
+                description=format_tool_display_description(
+                    tool_class.description, source_name=source_name
+                ),
                 enabled=tool_name in available,
             )
         )
@@ -299,7 +449,9 @@ def _project_mcp_tools(
 
 
 def _project_mcp_servers(
-    agent_loop: AgentLoop, tools: dict[tuple[MCPSourceKind, str], list[MCPToolSummary]]
+    agent_loop: AgentLoop,
+    tools: dict[tuple[MCPSourceKind, str], list[MCPToolSummary]],
+    discovery_errors: set[str],
 ) -> list[MCPSourceSummary]:
     registry = agent_loop.mcp_registry
     server_statuses = registry.status() if registry is not None else {}
@@ -307,6 +459,8 @@ def _project_mcp_servers(
     for server in agent_loop.config.mcp_servers:
         if server.disabled:
             status = MCPSourceStatus.DISABLED
+        elif server.name in discovery_errors:
+            status = MCPSourceStatus.UNAVAILABLE
         else:
             match server_statuses.get(server.name):
                 case AuthStatus.NEEDS_AUTH:
@@ -358,16 +512,32 @@ def _project_mcp_connectors(
                     status = MCPSourceStatus.NEEDS_SETUP
                 case _:
                     status = MCPSourceStatus.UNAVAILABLE
+        error = (
+            connector_registry.connector_error_for(name)
+            if connector_registry is not None
+            else None
+        )
+        source_tools = {
+            tool.name: tool for tool in tools.get((MCPSourceKind.CONNECTOR, name), [])
+        }
+        if connector_registry is not None:
+            for descriptor in connector_registry.get_catalog_tools(name):
+                source_tools.setdefault(
+                    descriptor.name,
+                    MCPToolSummary(
+                        name=descriptor.name,
+                        description=descriptor.description or "",
+                        enabled=False,
+                    ),
+                )
         sources.append(
             MCPSourceSummary(
                 name=name,
                 kind=MCPSourceKind.CONNECTOR,
                 transport="connector",
                 status=status,
-                tools=sorted(
-                    tools.get((MCPSourceKind.CONNECTOR, name), []),
-                    key=lambda tool: tool.name,
-                ),
+                tools=sorted(source_tools.values(), key=lambda tool: tool.name),
+                error=error,
             )
         )
     return sources
@@ -471,6 +641,9 @@ def project_message_history(
         if metadata is not None
         else {}
     )
+    # First: the worktree is created before the session has a single message.
+    if metadata is not None and metadata.created_worktree is not None:
+        entries.append(_history_worktree(session_id, metadata.created_worktree))
     for index, message in enumerate(messages):
         _project_stored_message(
             session_id,
@@ -494,6 +667,9 @@ def _project_stored_message(
     child_sessions: dict[str, str],
 ) -> None:
     if message.role is Role.system:
+        return
+    if message.context_boundary == "compaction":
+        _append_compaction_history(session_id, message, index, created_at, entries)
         return
     if message.injected:
         _append_injected_history(session_id, message, entries)
@@ -525,6 +701,16 @@ def _project_stored_message(
             )
 
 
+def _history_worktree(session_id: str, worktree: WorktreeContext) -> PublicEffectEntry:
+    restored = WorktreeEffect.restored(worktree)
+    return PublicEffectEntry(
+        **_history_fields(session_id, worktree.entry_id, worktree.created_at),
+        title="worktree",
+        detail=restored.detail,
+        state=restored.state,
+    )
+
+
 def _append_injected_history(
     session_id: str, message: LLMMessage, entries: list[PublicHistoryEntry]
 ) -> None:
@@ -537,6 +723,26 @@ def _append_injected_history(
             title="shell",
             detail=shell_effect_detail(shell.command),
             state=restored_shell_effect_state(shell),
+        )
+    )
+
+
+def _append_compaction_history(
+    session_id: str,
+    message: LLMMessage,
+    index: int,
+    created_at: int,
+    entries: list[PublicHistoryEntry],
+) -> None:
+    message_id = message.message_id or f"history:{index}:compaction"
+    entries.append(
+        PublicCheckpointEntry(
+            **_history_fields(
+                session_id, f"checkpoint:compaction:{message_id}", created_at
+            ),
+            kind="compaction",
+            message="Context compacted",
+            details={},
         )
     )
 
@@ -656,7 +862,7 @@ class _ConfigIssue(Protocol):
     message: str
 
 
-def _project_agent(profile: AgentProfile) -> AgentSummary:
+def project_agent_summary(profile: AgentProfile) -> AgentSummary:
     return AgentSummary(
         name=profile.name,
         display_name=profile.display_name,
