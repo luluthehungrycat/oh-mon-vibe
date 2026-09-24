@@ -1,6 +1,6 @@
 [project]
 name = "oh-my-vibe"
-version = "2.24.0"
+version = "2.25.7"
 description = "Oh My Vibe, a downstream CLI coding assistant"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -152,7 +152,7 @@ exclude = ["**/__pycache__/**", "**/*.pyc", "vibe/cli-rust/**"]
 features = ["extension-module"]
 
 [project.scripts]
-omv = "vibe.cli.entrypoint:main"
+omv = "vibe.cli.launcher:main"
 omv-acp = "vibe.acp.entrypoint:main"
 omv-app-server = "vibe.app_server.stdio:main"
 

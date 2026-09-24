@@ -72,7 +72,7 @@ pub struct Client {
     active_session: ActiveSession,
 }
 
-/// How to launch the backend; defaults to `uv run --quiet vibe-app-server --experimental-harness`.
+/// How to launch the backend; defaults to `uv run --quiet omv-app-server --experimental-harness`.
 pub struct Launch {
     pub program: String,
     pub args: Vec<String>,
@@ -88,7 +88,7 @@ impl Default for Launch {
         // Source checkout: run the app-server through uv from the project root.
         Self {
             program: "uv".into(),
-            args: ["run", "--quiet", "vibe-app-server"]
+            args: ["run", "--quiet", "omv-app-server"]
                 .into_iter()
                 .map(str::to_owned)
                 .chain(DEFAULT_APP_SERVER_ARGS.iter().map(|s| (*s).to_owned()))

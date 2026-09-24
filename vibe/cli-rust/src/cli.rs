@@ -25,7 +25,12 @@ pub enum OutputFormat {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "vibe", version = env!("CARGO_PKG_VERSION"), disable_version_flag = true, about = "Rust TUI for Vibe (PoC)")]
+#[command(
+    name = "omv",
+    version = env!("CARGO_PKG_VERSION"),
+    disable_version_flag = true,
+    about = "Oh My Vibe Rust CLI"
+)]
 pub struct Cli {
     /// Show version and exit.
     #[arg(short = 'v', long = "version", action = ArgAction::Version)]

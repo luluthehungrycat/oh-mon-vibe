@@ -39,7 +39,9 @@ jobs:
           REQUIRE_SENTRY_DSN: "true"
         run: bash ./scripts/ci/inject-sentry-dsn.sh
 
-      - name: Build package
+      - name: Build package (Linux without optional voice)
+        env:
+          CARGO_BUILD_FLAGS: --no-default-features
         run: uv build --wheel
 
       - name: List distributions

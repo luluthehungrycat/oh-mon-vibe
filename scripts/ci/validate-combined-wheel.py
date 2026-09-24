@@ -1,4 +1,4 @@
-"""Validate an installed Vibe wheel owns both native delivery components."""
+"""Validate an installed Oh My Vibe wheel owns both native delivery components."""
 
 from __future__ import annotations
 
@@ -13,6 +13,10 @@ import vibe
 
 def main() -> None:
     vibe_version = metadata.version("oh-my-vibe")
+    if vibe_version != vibe.__version__:
+        raise RuntimeError(
+            f"package version {vibe_version} differs from runtime version {vibe.__version__}"
+        )
     installed_distributions = {
         distribution.metadata["Name"] for distribution in metadata.distributions()
     }

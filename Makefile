@@ -1,4 +1,4 @@
-# vibe-rs build/run helpers for vibe/cli-rust/; run from this dir so `uv run vibe-app-server` resolves.
+# vibe-rs build/run helpers for vibe/cli-rust/; run from this dir so `uv run omv-app-server` resolves.
 M = --manifest-path vibe/cli-rust/Cargo.toml
 BIN = vibe/cli-rust/target/release/vibe-rs
 # Extra cargo flags, e.g. CARGO_BUILD_FLAGS=--no-default-features to drop `voice` and its ALSA dependency.
@@ -15,7 +15,7 @@ export VIBE_APP_SERVER_CWD = .
 # VIBE_APP_SERVER_CWD); the guard only activates when that checkout exists.
 HARNESS_SRC ?=
 HARNESS_EDITABLE = $(if $(HARNESS_SRC),$(if $(wildcard $(HARNESS_SRC)/pyproject.toml),--with-editable $(HARNESS_SRC) ,),)
-start run release profile-stress: export VIBE_APP_SERVER_CMD = uv run --quiet $(HARNESS_EDITABLE)vibe-app-server --experimental-harness
+start run release profile-stress: export VIBE_APP_SERVER_CMD = uv run --quiet $(HARNESS_EDITABLE)omv-app-server --experimental-harness
 
 # Set QUIET=1 to suppress per-test output (only failures, slowest, and summary).
 QUIET ?=

@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
-# Onedir build for vibe-app-server — no per-launch extraction overhead.
-# Build: uv run --group build pyinstaller vibe-app-server.spec
-# Output: dist/vibe-app-server-dir/vibe-app-server  (+  dist/vibe-app-server-dir/_internal/)
+# Onedir build for omv-app-server — no per-launch extraction overhead.
+# Build: uv run --group build pyinstaller omv-app-server.spec
+# Output: dist/omv-app-server-dir/omv-app-server  (+  dist/omv-app-server-dir/_internal/)
 # UPX stays off: it rewrites the Mach-O header and invalidates the macOS code signature.
 
 from importlib.util import find_spec
@@ -70,7 +70,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="vibe-app-server",
+    name="omv-app-server",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -92,5 +92,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="vibe-app-server-dir",
+    name="omv-app-server-dir",
 )

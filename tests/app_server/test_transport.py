@@ -361,7 +361,7 @@ async def test_stdio_server_uses_the_same_json_rpc_lifecycle() -> None:
 
     assert responses[0]["result"] == {
         "serverInfo": {
-            "name": "vibe-app-server",
+            "name": "omv-app-server",
             "version": responses[0]["result"]["serverInfo"]["version"],
         }
     }

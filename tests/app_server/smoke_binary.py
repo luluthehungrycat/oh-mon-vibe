@@ -58,7 +58,9 @@ async def read_response(
 async def smoke_binary(binary: Path, *, experimental_harness: bool) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         env = os.environ.copy()
-        env["VIBE_HOME"] = str(Path(tmp) / ".vibe")
+        home = str(Path(tmp) / ".omv")
+        env["OMV_HOME"] = home
+        env["VIBE_HOME"] = home
         env["VIBE_TEST_DISABLE_KEYRING"] = "1"
         env["MISTRAL_API_KEY"] = "smoke-test"
         arguments = ["--experimental-harness"] if experimental_harness else []
@@ -94,7 +96,7 @@ async def smoke_binary(binary: Path, *, experimental_harness: bool) -> None:
                 failure = f"unexpected initialize response: {response}"
             else:
                 server_info = result.get("serverInfo", {})
-                if server_info.get("name") != "vibe-app-server":
+                if server_info.get("name") != "omv-app-server":
                     failure = f"unexpected server info: {server_info}"
                 else:
                     print("PASS: app-server initialize")
@@ -139,7 +141,7 @@ def main() -> None:
 
     binary_dir = args.binary_dir
     binary_name = (
-        "vibe-app-server.exe" if platform.system() == "Windows" else "vibe-app-server"
+        "omv-app-server.exe" if platform.system() == "Windows" else "omv-app-server"
     )
     binary = binary_dir / binary_name
     if not binary.exists():

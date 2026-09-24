@@ -198,17 +198,22 @@ jobs:
           fi
           "$python" scripts/ci/validate-combined-wheel.py
 
-      - name: Smoke test Rust mode (VIBE_CLI=rust)
+      - name: Smoke test Rust mode and app-server startup
         shell: bash
         env:
           VIBE_CLI: rust
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
-            omv=".smoke/Scripts/omv"
+            python=".smoke/Scripts/python.exe"
+            omv=".smoke/Scripts/omv.exe"
+            server_dir=".smoke/Scripts"
           else
+            python=".smoke/bin/python"
             omv=".smoke/bin/omv"
+            server_dir=".smoke/bin"
           fi
-          "$omv" --version
+          "$python" scripts/ci/smoke-rust-cli.py "$omv"
+          "$python" tests/app_server/smoke_binary.py "$server_dir" --experimental-harness
 
   snapshot-tests:
     name: Snapshot Tests

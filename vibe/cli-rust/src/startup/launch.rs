@@ -49,7 +49,7 @@ pub fn resolve_launch(
     }
     // Full command line (program + args), parsed with POSIX shell quoting so an
     // argument path with spaces survives (e.g. `uv run --with-editable "/a b/harness"
-    // vibe-app-server --experimental-harness`). The value already carries every param
+    // omv-app-server --experimental-harness`). The value already carries every param
     // it needs, so the always-on params are not appended here. On unbalanced quotes
     // shlex returns None; fall back to a plain whitespace split rather than fail.
     if let Some(cmd) = cmd {

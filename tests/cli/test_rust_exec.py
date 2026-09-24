@@ -40,7 +40,7 @@ def test_bundled_binary_execs_with_app_server_bin(
     monkeypatch.setattr("sys.platform", "linux")
     # Present in the parent env; the bundled path must drop both.
     monkeypatch.setenv("VIBE_APP_SERVER_CWD", "/stale")
-    monkeypatch.setenv("VIBE_APP_SERVER_CMD", "uv run vibe-app-server")
+    monkeypatch.setenv("VIBE_APP_SERVER_CMD", "uv run omv-app-server")
     calls = _capture_execvpe(monkeypatch)
 
     rust.exec_rust_cli(["--version"])
@@ -76,9 +76,9 @@ def test_source_checkout_execs_release_binary(
     monkeypatch.setattr(rust, "_PROJECT_ROOT", project_root)
     monkeypatch.setattr("sys.platform", "linux")
     # Present in the parent env; the source path must drop it.
-    monkeypatch.setenv("VIBE_APP_SERVER_BIN", "/stale/vibe-app-server")
+    monkeypatch.setenv("VIBE_APP_SERVER_BIN", "/stale/omv-app-server")
     # The Makefile owns this on the source path; it must survive so `make run` works.
-    monkeypatch.setenv("VIBE_APP_SERVER_CMD", "uv run vibe-app-server")
+    monkeypatch.setenv("VIBE_APP_SERVER_CMD", "uv run omv-app-server")
     calls = _capture_execvpe(monkeypatch)
 
     rust.exec_rust_cli(["some", "arg"])
@@ -90,7 +90,7 @@ def test_source_checkout_execs_release_binary(
     assert isinstance(env, dict)
     assert env["VIBE_APP_SERVER_CWD"] == str(project_root)
     assert "VIBE_APP_SERVER_BIN" not in env
-    assert env["VIBE_APP_SERVER_CMD"] == "uv run vibe-app-server"
+    assert env["VIBE_APP_SERVER_CMD"] == "uv run omv-app-server"
 
 
 def test_source_checkout_builds_when_release_missing(

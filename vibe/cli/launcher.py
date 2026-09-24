@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import sys
 
-# Kept intentionally tiny: the `vibe` console script lands here, so a Rust
+# Kept intentionally tiny: the `omv` console script lands here, so a Rust
 # invocation must reach the Rust binary without importing the Python CLI stack.
 #
 # The implementation (Rust vs. Python) is chosen by the undocumented `VIBE_CLI`

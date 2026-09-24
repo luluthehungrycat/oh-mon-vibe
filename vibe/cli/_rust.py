@@ -7,10 +7,10 @@ import sys
 
 if sys.platform == "win32":
     _BIN_NAME = "vibe-rs.exe"
-    _APP_SERVER_SCRIPT = "vibe-app-server.exe"
+    _APP_SERVER_SCRIPT = "omv-app-server.exe"
 else:
     _BIN_NAME = "vibe-rs"
-    _APP_SERVER_SCRIPT = "vibe-app-server"
+    _APP_SERVER_SCRIPT = "omv-app-server"
 
 # vibe/
 #   _bin/                <-- Exists if the Rust CLI is bundled in the wheel.
@@ -26,7 +26,7 @@ _PKG_ROOT = Path(__file__).resolve().parents[1]
 _BUNDLED_BIN = _PKG_ROOT / "_bin" / _BIN_NAME
 _MANIFEST = _PKG_ROOT / "cli-rust" / "Cargo.toml"
 _RELEASE_BIN = _PKG_ROOT / "cli-rust" / "target" / "release" / _BIN_NAME
-# The Python project root, where `uv run vibe-app-server` resolves.
+# The Python project root, where `uv run omv-app-server` resolves.
 _PROJECT_ROOT = _PKG_ROOT.parent
 
 
@@ -35,7 +35,7 @@ def exec_rust_cli(passthrough: list[str]) -> None:
     env = {**os.environ}
     if _BUNDLED_BIN.exists():
         binary = _BUNDLED_BIN
-        # Wheel install: point the Rust client at the installed vibe-app-server
+        # Wheel install: point the Rust client at the installed omv-app-server.
         env["VIBE_APP_SERVER_BIN"] = str(
             Path(sys.argv[0]).resolve().parent / _APP_SERVER_SCRIPT
         )

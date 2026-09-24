@@ -14,7 +14,7 @@ def test_pty_helper_flag_ignores_inherited_rust_selector(
     # reach the Python entrypoint, not launch Rust.
     monkeypatch.setenv("VIBE_CLI", "rust")
     monkeypatch.setattr(
-        "sys.argv", ["vibe", "--internal-posix-pty-helper", "3", "4", "5"]
+        "sys.argv", ["omv", "--internal-posix-pty-helper", "3", "4", "5"]
     )
 
     def _fail_rust(_passthrough: list[str]) -> None:
@@ -48,13 +48,17 @@ def test_upgrade_commands_use_python_with_rust_selected(
     monkeypatch: pytest.MonkeyPatch, args: list[str]
 ) -> None:
     monkeypatch.setenv("VIBE_CLI", "rust")
-    monkeypatch.setattr("sys.argv", ["vibe", *args])
+    monkeypatch.setattr("sys.argv", ["omv", *args])
 
     def _fail_rust(_passthrough: list[str]) -> None:
         raise AssertionError("Rust CLI launched for an upgrade command")
 
     def _entrypoint() -> None:
-        assert vibe.cli.entrypoint.parse_arguments().check_upgrade
+        parsed = vibe.cli.entrypoint.parse_arguments()
+        if args[0] == "update":
+            assert parsed.initial_prompt == "update"
+        else:
+            assert parsed.check_upgrade
         raise SystemExit(0)
 
     monkeypatch.setattr("vibe.cli._rust.exec_rust_cli", _fail_rust)
@@ -80,7 +84,7 @@ def test_rust_selector_launches_rust_for_non_python_commands(
     monkeypatch: pytest.MonkeyPatch, args: list[str]
 ) -> None:
     monkeypatch.setenv("VIBE_CLI", "rust")
-    monkeypatch.setattr("sys.argv", ["vibe", *args])
+    monkeypatch.setattr("sys.argv", ["omv", *args])
 
     called_with: list[list[str]] = []
 
