@@ -46,7 +46,6 @@ from vibe.core.config.models import (
     MissingAPIKeyError,
     ModelConfig,
     OtelRedactionMode,
-    PluginConfig,
     ProjectContextConfig,
     ProviderConfig,
     SessionLoggingConfig,
@@ -391,13 +390,6 @@ class VibeConfigSchema(ConfigSchema):
         WithDeepMerge(),
         BeforeValidator(_normalize_tool_configs),
     ] = Field(default_factory=dict)
-    plugins: Annotated[PluginConfig, WithDeepMerge()] = Field(
-        default_factory=PluginConfig,
-        description=(
-            "Installed OMV plugins remain disabled until explicitly listed in enabled; "
-            "sandbox defaults to off."
-        ),
-    )
     tool_paths: Annotated[
         list[Path], WithConcatMerge(), BeforeValidator(_expand_paths)
     ] = Field(

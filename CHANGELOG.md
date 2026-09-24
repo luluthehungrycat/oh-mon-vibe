@@ -14,9 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added a provider-neutral, credentials-free `LLMAnalyzer` adapter boundary for optional injected classifiers.
 - Bash results and UI displays now expose structured policy, evaluator, sandbox, and fallback metadata.
 - Contributor guidance for preserving vanilla Vibe CLI documentation and placing portable versus harness-specific project skills.
-- Added the `omv.plugin.v1` manifest-first package standard with disabled-by-default discovery from global and project `.omv/plugins/` roots, fixed `skills/` and `mcp.json` components, lifecycle diagnostics, and legacy entry-point migration diagnostics.
-- Added host-owned plugin permission rules (`always`/`ask`/`deny`) with safe read-only defaults, approval for side effects and ambiguity, and deterministic Bash guardrail precedence.
-- Added opt-in plugin sandbox policy (`off`/`auto`/`required`) with host-selected Bubblewrap/Firejail plans, versioned stdio capability evidence, and fail-closed required isolation.
+- Reconciled the plugin path with upstream Mistral Vibe v2.25.7 and Agent Plugins 1.0 package files (`plugin.json`, `mcp.json`, and `skills/`).
+- Limited OMV plugin claims to standard Agent Plugins skills/MCP and upstream discovery; OMV-specific native analyzers/tools/hooks and plugin sandbox enforcement are deferred.
 
 ### Fixed
 

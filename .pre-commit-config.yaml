@@ -36,8 +36,10 @@ repos:
     hooks:
       - id: ruff-check
         args: [--fix, --unsafe-fixes]
+        exclude: ^harness/
       - id: ruff-format
         args: [--check]
+        exclude: ^harness/
 
   - repo: https://github.com/crate-ci/typos
     rev: 392b78fe18a52790c53f42456e46124f77346842 # v1.34.0
@@ -46,6 +48,7 @@ repos:
         args: [--write-changes]
         exclude: |
           (?x)^(
+            harness/|
             __snapshots__/.*\.svg$|
             client-e2e/goldens/.*\.svg$
           )

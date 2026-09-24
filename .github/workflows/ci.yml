@@ -182,11 +182,11 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
-            vibe=".smoke/Scripts/vibe"
+            omv=".smoke/Scripts/omv"
           else
-            vibe=".smoke/bin/vibe"
+            omv=".smoke/bin/omv"
           fi
-          "$vibe" --version
+          "$omv" --version
 
       - name: Smoke test bundled Harness
         shell: bash
@@ -204,11 +204,11 @@ jobs:
           VIBE_CLI: rust
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
-            vibe=".smoke/Scripts/vibe"
+            omv=".smoke/Scripts/omv"
           else
-            vibe=".smoke/bin/vibe"
+            omv=".smoke/bin/omv"
           fi
-          "$vibe" --version
+          "$omv" --version
 
   snapshot-tests:
     name: Snapshot Tests

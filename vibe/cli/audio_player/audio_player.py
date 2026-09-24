@@ -98,13 +98,14 @@ class AudioPlayer:
 
             gen = self._playback_generator()
             next(gen)  # prime the generator
-            self._stream = ma.PlaybackDevice(
+            stream = ma.PlaybackDevice(
                 output_format=ma.SampleFormat.SIGNED16,
                 nchannels=channels,
                 sample_rate=sample_rate,
                 buffersize_msec=DEFAULT_BUFFER_MS,
             )
-            self._stream.start(gen)
+            self._stream = stream
+            stream.start(gen)
             self._playing = True
 
     def stop(self) -> None:

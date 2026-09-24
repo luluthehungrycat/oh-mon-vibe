@@ -12,7 +12,7 @@ import vibe
 
 
 def main() -> None:
-    vibe_version = metadata.version("mistral-vibe")
+    vibe_version = metadata.version("oh-my-vibe")
     installed_distributions = {
         distribution.metadata["Name"] for distribution in metadata.distributions()
     }
@@ -34,7 +34,7 @@ def main() -> None:
     if os.name != "nt" and not os.access(rust_cli_path, os.X_OK):
         raise RuntimeError("Rust CLI is not executable")
 
-    print(f"mistral-vibe {vibe_version}")
+    print(f"oh-my-vibe {vibe_version}")
     print(f"Harness extension: {native_path.name}")
     print(f"Rust CLI: {rust_cli_path.name}")
 

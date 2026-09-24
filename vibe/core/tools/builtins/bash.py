@@ -2,15 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
-from functools import lru_cache
 from pathlib import Path
 import shlex
 import subprocess
 from typing import ClassVar, Literal, final
 
 from pydantic import BaseModel, Field
-from tree_sitter import Language, Node, Parser
-import tree_sitter_bash as tsbash
 
 from vibe.core.plugins import discover_plugins
 from vibe.core.safety.policy import (
@@ -30,6 +27,14 @@ from vibe.core.tools.base import (
     ToolError,
     ToolPermission,
 )
+from vibe.core.tools.builtins._shell_command_policy import (
+    git_repository_identity,
+    has_option_guardrails,
+)
+from vibe.core.tools.builtins._shell_permission_analysis import (
+    ShellPermissionAnalysis,
+    analyze_shell_command,
+)
 from vibe.core.tools.io_port import ShellCommandRequest
 from vibe.core.tools.permissions import (
     PermissionContext,
@@ -37,7 +42,7 @@ from vibe.core.tools.permissions import (
     RequiredPermission,
 )
 from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
-from vibe.core.tools.utils import is_path_within_workdir
+from vibe.core.tools.utils import is_path_within_workdir, resolve_tool_path
 from vibe.core.types import ToolResultEvent, ToolStreamEvent
 from vibe.core.utils import is_windows, kill_async_subprocess
 from vibe.core.utils.shell import (
@@ -45,47 +50,9 @@ from vibe.core.utils.shell import (
     spawn_shell_command,
     uses_posix_shell,
 )
+from vibe.core.workspace import Workspace
 from vibe.utils.io import decode_safe
 from vibe.utils.tool_presentation import ToolEffectKind
-
-
-@lru_cache(maxsize=1)
-def _get_parser() -> Parser:
-    return Parser(Language(tsbash.language()))
-
-
-def _extract_commands(command: str) -> list[str]:
-    parser = _get_parser()
-    tree = parser.parse(command.encode("utf-8"))
-
-    commands: list[str] = []
-
-    def find_commands(node: Node) -> None:
-        if node.type == "command":
-            parts = []
-            for child in node.children:
-                if (
-                    child.type
-                    in {"command_name", "word", "string", "raw_string", "concatenation"}
-                    and child.text is not None
-                ):
-                    parts.append(child.text.decode("utf-8"))
-            # When a command has a heredoc (or other redirect), tree-sitter
-            # wraps it in a redirected_statement and the redirect is a sibling
-            # of the command node, not a child.  Without this check,
-            # `python3 << 'EOF'` is extracted as bare `python3` and
-            # incorrectly blocked by the standalone denylist.
-            if parts and node.parent and node.parent.type == "redirected_statement":
-                parts.append("<redirect>")
-            if parts:
-                commands.append(" ".join(parts))
-
-        for child in node.children:
-            find_commands(child)
-
-    find_commands(tree.root_node)
-    return commands
-
 
 _READ_ONLY_COMMANDS_WINDOWS = ["dir", "findstr", "more", "type", "ver", "where"]
 _READ_ONLY_COMMANDS_POSIX = [
@@ -220,6 +187,124 @@ def _normalize_bash_path_token(token: str) -> str:
     return f"{drive.upper()}:{suffix or '/'}"
 
 
+def _wrapped_guardrail_commands(command: str) -> list[str]:
+    tokens = _split_command_tokens(command)
+    if not tokens:
+        return []
+
+    if tokens[0] == "eval":
+        evaluated = " ".join(tokens[1:])
+        return list(analyze_shell_command(evaluated).command_parts) if evaluated else []
+    if tokens[0] != "exec":
+        return []
+
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            index += 1
+            break
+        if token == "-a":
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        break
+    return [" ".join(tokens[index:])] if index < len(tokens) else []
+
+
+def _expand_guardrail_commands(command_parts: list[str]) -> list[str]:
+    expanded: list[str] = []
+    pending = [(part, frozenset()) for part in command_parts]
+    while pending:
+        part, ancestors = pending.pop(0)
+        expanded.append(part)
+        if part in ancestors:
+            continue
+        next_ancestors = ancestors | {part}
+        pending.extend(
+            (wrapped, next_ancestors) for wrapped in _wrapped_guardrail_commands(part)
+        )
+    return expanded
+
+
+_WORKING_DIRECTORY_COMMANDS = {
+    "cd",
+    "chdir",
+    "pushd",
+    "push-location",
+    "set-location",
+    "sl",
+}
+_WORKING_DIRECTORY_POP_COMMANDS = {"popd", "pop-location"}
+_WORKING_DIRECTORY_TOKEN_COUNT = 2
+_SHELL_GLOB_CHARACTERS = frozenset("*?[")
+
+
+def _update_guardrail_cwds(tokens: list[str], possible_cwds: set[Path]) -> bool:
+    if not tokens:
+        return False
+    command = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    if command in _WORKING_DIRECTORY_POP_COMMANDS:
+        return len(tokens) != 1
+    if command not in _WORKING_DIRECTORY_COMMANDS:
+        return False
+    if command in {"pushd", "push-location"} and len(tokens) == 1:
+        return False
+    if (
+        len(tokens) != _WORKING_DIRECTORY_TOKEN_COUNT
+        or tokens[1].startswith("-")
+        or any(character in tokens[1] for character in _SHELL_GLOB_CHARACTERS)
+    ):
+        return True
+    possible_cwds.update(
+        resolve_tool_path(tokens[1], cwd) for cwd in tuple(possible_cwds)
+    )
+    return False
+
+
+def _git_repository_permission_pattern(
+    command: str, possible_cwds: set[Path], *, cwd_is_unknown: bool
+) -> str:
+    identities: set[str] = set()
+    for cwd in possible_cwds:
+        identity = git_repository_identity(cwd)
+        if identity is None:
+            try:
+                identity = f"directory:{cwd.resolve()}"
+            except OSError:
+                identity = f"directory:{cwd.absolute()}"
+        identities.add(identity)
+    if cwd_is_unknown:
+        identities.add("dynamic-directory")
+    return f"{command} [git repositories: {' | '.join(sorted(identities))}]"
+
+
+def command_session_pattern(tokens: list[str]) -> tuple[str, bool]:
+    if has_option_guardrails(tokens):
+        return " ".join(tokens), True
+    return build_session_pattern(tokens), False
+
+
+def scoped_command_parts(
+    analysis: ShellPermissionAnalysis, command_parts: list[str]
+) -> tuple[list[str], bool]:
+    if analysis.invalidates_scope:
+        return [], False
+    return command_parts, analysis.requires_approval
+
+
+def needs_exact_command_scope(
+    analysis: ShellPermissionAnalysis, required: list[RequiredPermission]
+) -> bool:
+    if analysis.invalidates_scope:
+        return True
+    return analysis.requires_approval and not any(
+        permission.scope is PermissionScope.COMMAND_PATTERN for permission in required
+    )
+
+
 def _collect_outside_dirs(
     command_parts: list[str],
     *,
@@ -242,13 +327,10 @@ def _collect_outside_dirs(
     accepts backslash-separated Windows paths.
     """
     resolved_cwd = (cwd or Path.cwd()).resolve()
+    workspace = Workspace.for_session(resolved_cwd, project_roots or ())
 
     def is_within_workdir(path: str) -> bool:
-        if project_roots is None:
-            return is_path_within_workdir(path)
-        return is_path_within_workdir(
-            path, cwd=resolved_cwd, project_roots=project_roots
-        )
+        return is_path_within_workdir(path, workspace=workspace)
 
     dirs: set[str] = set()
     for part in command_parts:
@@ -341,6 +423,7 @@ class BashResult(BaseModel):
     stdout: str
     stderr: str
     returncode: int
+    shell: str = ""
     sandboxed: bool = False
     execution_note: str | None = None
     policy_mode: str = "deterministic"
@@ -350,11 +433,27 @@ class BashResult(BaseModel):
     fallback_reason: str | None = None
 
 
+def _completed_bash_result(result: BashResult) -> BashResult:
+    if result.returncode != 0:
+        error_msg = f"Command failed: {result.command!r}\n"
+        error_msg += f"Return code: {result.returncode}"
+        if result.stderr:
+            error_msg += f"\nStderr: {result.stderr}"
+        if result.stdout:
+            error_msg += f"\nStdout: {result.stdout}"
+        raise ToolError(error_msg.strip())
+
+    return result
+
+
 class Bash(
     BaseTool[BashArgs, BashResult, BashToolConfig, BaseToolState],
     ToolUIData[BashArgs, BashResult],
 ):
     effect_kind = ToolEffectKind.SHELL
+    allowlist_scopes: ClassVar[frozenset[PermissionScope]] = frozenset({
+        PermissionScope.COMMAND_PATTERN
+    })
     shell_rollout: ClassVar[str | None] = "legacy"
 
     @classmethod
@@ -402,13 +501,18 @@ class Bash(
 
     @staticmethod
     def _build_command_required_permission(
-        invocation_pattern: str, session_pattern: str, label: str
+        invocation_pattern: str,
+        session_pattern: str,
+        label: str,
+        *,
+        literal: bool = False,
     ) -> RequiredPermission:
         return RequiredPermission(
             scope=PermissionScope.COMMAND_PATTERN,
             invocation_pattern=invocation_pattern,
             session_pattern=session_pattern,
             label=label,
+            literal=literal,
         )
 
     @staticmethod
@@ -473,7 +577,10 @@ class Bash(
             seen_find_execution.add(part)
             find_execution_required.append(
                 self._build_command_required_permission(
-                    invocation_pattern=part, session_pattern=part, label=part
+                    invocation_pattern=part,
+                    session_pattern=part,
+                    label=part,
+                    literal=True,
                 )
             )
 
@@ -497,7 +604,11 @@ class Bash(
         )
 
     def _build_required_permissions(
-        self, command_parts: list[str], outside_dirs: set[str]
+        self,
+        command_parts: list[str],
+        outside_dirs: set[str],
+        *,
+        include_allowlisted: bool = False,
     ) -> list[RequiredPermission]:
         required: list[RequiredPermission] = []
         seen_session: set[str] = set()
@@ -510,30 +621,38 @@ class Bash(
                 continue
 
             is_sensitive = self._is_sensitive(part)
-            if not is_sensitive and self._is_allowlisted(part):
+            if (
+                not is_sensitive
+                and not include_allowlisted
+                and self._is_allowlisted(part)
+            ):
                 continue
 
             if is_sensitive:
                 required.append(
                     self._build_command_required_permission(
-                        invocation_pattern=part, session_pattern=part, label=part
+                        invocation_pattern=part,
+                        session_pattern=part,
+                        label=part,
+                        literal=True,
                     )
                 )
                 continue
 
-            session_pat = build_session_pattern(tokens)
-            if session_pat in seen_session:
+            session_pattern, literal = command_session_pattern(tokens)
+            if session_pattern in seen_session:
                 continue
-            seen_session.add(session_pat)
+            seen_session.add(session_pattern)
             required.append(
                 self._build_command_required_permission(
                     invocation_pattern=part,
-                    session_pattern=session_pat,
-                    label=session_pat,
+                    session_pattern=session_pattern,
+                    label=session_pattern,
+                    literal=literal,
                 )
             )
 
-        for glob in sorted(str(Path(d) / "*") for d in outside_dirs):
+        for glob in sorted(str(Path(directory) / "*") for directory in outside_dirs):
             required.append(self._build_outside_directory_permission(glob))
 
         return required
@@ -565,62 +684,57 @@ class Bash(
             CommandDecision(Decision.ALLOW, "core guardrails passed", "core"), decisions
         )
 
-    def resolve_permission(self, args: BashArgs) -> PermissionContext | None:  # noqa: PLR0911
+    def resolve_permission(self, args: BashArgs) -> PermissionContext | None:
         if not uses_posix_shell():
             return None
 
-        command_parts = _extract_commands(args.command)
-        if not command_parts:
+        analysis = analyze_shell_command(args.command)
+        command_parts = list(analysis.command_parts)
+        if not command_parts and not analysis.requires_approval:
             return None
 
-        guardrail_permission = self._resolve_guardrail_permission(command_parts)
-        if (
-            guardrail_permission
-            and guardrail_permission.permission == ToolPermission.NEVER
-        ):
-            return guardrail_permission
-        advisory = self._advisory_decision(args.command)
-        if advisory is not None and advisory.outcome == Decision.DENY:
-            return PermissionContext(
-                permission=ToolPermission.NEVER, reason=advisory.reason
-            )
+        denial, guardrail_permission, advisory = self._resolve_permission_denials(
+            args.command, command_parts
+        )
+        if denial is not None:
+            return denial
+
         outside_dirs = _collect_outside_dirs(
             command_parts,
             cwd=self.cwd,
             project_roots=self.harness_files.project_roots,
             scratchpad_dir=self.scratchpad_dir,
         )
-        if (
-            self._is_unconditionally_allowed(command_parts, outside_dirs)
-            and not guardrail_permission
-            and not (advisory is not None and advisory.outcome == Decision.ASK)
-        ):
-            if (
-                self.config.safety.sandbox in {"auto", "required"}
-                and self._sandbox_backend() is None
-                and self.config.safety.fallback == "ask"
-            ):
-                return PermissionContext(
-                    permission=ToolPermission.ASK,
-                    required_permissions=[
-                        self._build_command_required_permission(
-                            invocation_pattern=args.command,
-                            session_pattern=args.command,
-                            label="sandbox unavailable; approve unsandboxed fallback",
-                        )
-                    ],
-                )
-            return PermissionContext(permission=ToolPermission.ALWAYS)
+        unconditional = self._resolve_unconditional_permission(
+            args, analysis, command_parts, outside_dirs, guardrail_permission, advisory
+        )
+        if unconditional is not None:
+            return unconditional
 
-        required = self._build_required_permissions(command_parts, outside_dirs)
+        scoped_parts, include_allowlisted = scoped_command_parts(
+            analysis, command_parts
+        )
+        required = self._build_required_permissions(
+            scoped_parts, outside_dirs, include_allowlisted=include_allowlisted
+        )
         if guardrail_permission:
             required.extend(guardrail_permission.required_permissions)
+        if needs_exact_command_scope(analysis, required):
+            required.append(
+                self._build_command_required_permission(
+                    invocation_pattern=args.command,
+                    session_pattern=args.command,
+                    label=analysis.approval_label,
+                    literal=True,
+                )
+            )
         if advisory is not None and advisory.outcome == Decision.ASK and not required:
             required.append(
                 self._build_command_required_permission(
                     invocation_pattern=args.command,
                     session_pattern=args.command,
                     label="advisory analyzer requests approval",
+                    literal=True,
                 )
             )
         if not required:
@@ -629,6 +743,64 @@ class Bash(
         return PermissionContext(
             permission=ToolPermission.ASK, required_permissions=required
         )
+
+    def _resolve_permission_denials(
+        self, command: str, command_parts: list[str]
+    ) -> tuple[
+        PermissionContext | None, PermissionContext | None, CommandDecision | None
+    ]:
+        guardrail_permission = self._resolve_guardrail_permission(command_parts)
+        if (
+            guardrail_permission is not None
+            and guardrail_permission.permission == ToolPermission.NEVER
+        ):
+            return guardrail_permission, guardrail_permission, None
+
+        advisory = self._advisory_decision(command)
+        if advisory is not None and advisory.outcome == Decision.DENY:
+            return (
+                PermissionContext(
+                    permission=ToolPermission.NEVER, reason=advisory.reason
+                ),
+                guardrail_permission,
+                advisory,
+            )
+        return None, guardrail_permission, advisory
+
+    def _resolve_unconditional_permission(
+        self,
+        args: BashArgs,
+        analysis: ShellPermissionAnalysis,
+        command_parts: list[str],
+        outside_dirs: set[str],
+        guardrail_permission: PermissionContext | None,
+        advisory: CommandDecision | None,
+    ) -> PermissionContext | None:
+        if (
+            not self._is_unconditionally_allowed(command_parts, outside_dirs)
+            or guardrail_permission is not None
+            or analysis.requires_approval
+            or (advisory is not None and advisory.outcome == Decision.ASK)
+        ):
+            return None
+
+        if (
+            self.config.safety.sandbox in {"auto", "required"}
+            and self._sandbox_backend() is None
+            and self.config.safety.fallback == "ask"
+        ):
+            return PermissionContext(
+                permission=ToolPermission.ASK,
+                required_permissions=[
+                    self._build_command_required_permission(
+                        invocation_pattern=args.command,
+                        session_pattern=args.command,
+                        label="sandbox unavailable; approve unsandboxed fallback",
+                        literal=True,
+                    )
+                ],
+            )
+        return PermissionContext(permission=ToolPermission.ALWAYS)
 
     @final
     def _build_timeout_error(self, command: str, timeout: int) -> ToolError:
@@ -649,27 +821,20 @@ class Bash(
         fallback_applied: bool = False,
         fallback_reason: str | None = None,
     ) -> BashResult:
-        if returncode != 0:
-            error_msg = f"Command failed: {command!r}\n"
-            error_msg += f"Return code: {returncode}"
-            if stderr:
-                error_msg += f"\nStderr: {stderr}"
-            if stdout:
-                error_msg += f"\nStdout: {stdout}"
-            raise ToolError(error_msg.strip())
-
-        return BashResult(
-            command=command,
-            stdout=stdout,
-            stderr=stderr,
-            returncode=returncode,
-            sandboxed=sandboxed,
-            execution_note=execution_note,
-            policy_mode=self.config.safety.policy,
-            evaluator=evaluator,
-            sandbox_backend=sandbox_backend,
-            fallback_applied=fallback_applied,
-            fallback_reason=fallback_reason,
+        return _completed_bash_result(
+            BashResult(
+                command=command,
+                stdout=stdout,
+                stderr=stderr,
+                returncode=returncode,
+                sandboxed=sandboxed,
+                execution_note=execution_note,
+                policy_mode=self.config.safety.policy,
+                evaluator=evaluator,
+                sandbox_backend=sandbox_backend,
+                fallback_applied=fallback_applied,
+                fallback_reason=fallback_reason,
+            )
         )
 
     async def run(  # noqa: PLR0912, PLR0914, PLR0915
@@ -775,16 +940,8 @@ class Bash(
                 await kill_async_subprocess(proc)
                 raise self._build_timeout_error(args.command, timeout)
 
-            stdout = (
-                decode_safe(stdout_bytes, from_subprocess=True).text[:max_bytes]
-                if stdout_bytes
-                else ""
-            )
-            stderr = (
-                decode_safe(stderr_bytes, from_subprocess=True).text[:max_bytes]
-                if stderr_bytes
-                else ""
-            )
+            stdout = decode_safe(stdout_bytes).text[:max_bytes] if stdout_bytes else ""
+            stderr = decode_safe(stderr_bytes).text[:max_bytes] if stderr_bytes else ""
 
             returncode = proc.returncode or 0
 

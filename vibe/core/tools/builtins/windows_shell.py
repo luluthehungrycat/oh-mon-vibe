@@ -20,9 +20,9 @@ from vibe.core.tools.base import (
     ToolPermission,
 )
 from vibe.core.tools.builtins.bash import (
+    BashResult,
     BashToolConfig,
-    CapturedShellResult,
-    completed_shell_result,
+    _completed_bash_result,
 )
 from vibe.core.tools.builtins.experimental_bash import (
     BashLogFile,
@@ -860,10 +860,8 @@ class WindowsShellPermissionMixin[ConfigT: BashToolConfig](
 
 class WindowsShell(
     WindowsShellPermissionMixin[WindowsShellToolConfig],
-    BaseTool[
-        WindowsShellArgs, CapturedShellResult, WindowsShellToolConfig, BaseToolState
-    ],
-    ToolUIData[WindowsShellArgs, CapturedShellResult],
+    BaseTool[WindowsShellArgs, BashResult, WindowsShellToolConfig, BaseToolState],
+    ToolUIData[WindowsShellArgs, BashResult],
 ):
     effect_kind = ToolEffectKind.SHELL
     description: ClassVar[str] = "Run a PowerShell command."
@@ -892,7 +890,7 @@ class WindowsShell(
 
     @classmethod
     def get_result_display(cls, event: ToolResultEvent) -> ToolResultDisplay:
-        if not isinstance(event.result, CapturedShellResult):
+        if not isinstance(event.result, BashResult):
             return ToolResultDisplay(
                 success=False, message=event.error or event.skip_reason or "No result"
             )
@@ -909,7 +907,7 @@ class WindowsShell(
 
     async def run(
         self, args: WindowsShellArgs, ctx: InvokeContext | None = None
-    ) -> AsyncGenerator[ToolStreamEvent | CapturedShellResult, None]:
+    ) -> AsyncGenerator[ToolStreamEvent | BashResult, None]:
         requested_timeout = (
             float(args.timeout) if args.timeout is not None else args.timeout_seconds
         )
@@ -943,12 +941,16 @@ class WindowsShell(
                     raise ToolError(
                         f"Command timed out after {timeout:g}s: {args.command!r}"
                     ) from None
-                yield completed_shell_result(
-                    command=args.command,
-                    shell=shell,
-                    stdout=result.stdout[:max_bytes],
-                    stderr=result.stderr[:max_bytes],
-                    exit_code=result.returncode,
+                yield _completed_bash_result(
+                    BashResult(
+                        command=args.command,
+                        shell=shell,
+                        stdout=result.stdout[:max_bytes],
+                        stderr=result.stderr[:max_bytes],
+                        returncode=result.returncode,
+                        policy_mode=self.config.safety.policy,
+                        evaluator="terminal-transport",
+                    )
                 )
                 return
 
@@ -972,12 +974,15 @@ class WindowsShell(
 
             stdout = _decode_limited(stdout_bytes, max_bytes)
             stderr = _decode_limited(stderr_bytes, max_bytes)
-            yield completed_shell_result(
-                command=args.command,
-                shell=shell,
-                stdout=stdout,
-                stderr=stderr,
-                exit_code=proc.returncode or 0,
+            yield _completed_bash_result(
+                BashResult(
+                    command=args.command,
+                    shell=shell,
+                    stdout=stdout,
+                    stderr=stderr,
+                    returncode=proc.returncode or 0,
+                    policy_mode=self.config.safety.policy,
+                )
             )
         except (ToolError, asyncio.CancelledError):
             raise

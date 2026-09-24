@@ -73,7 +73,7 @@ pip install oh-my-vibe
   - [Custom System Prompts](#custom-system-prompts)
   - [Custom Agent Configurations](#custom-agent-configurations)
   - [Tool Management](#tool-management)
-  - [Oh My Vibe Plugin Packages](#oh-my-vibe-plugin-packages)
+- [Agent Plugins](#agent-plugins)
   - [MCP Server Configuration](#mcp-server-configuration)
   - [Session Management](#session-management)
   - [Update Settings](#update-settings)
@@ -680,58 +680,26 @@ Notes:
 - MCP tool names use underscores, e.g., `serena_list` not `serena.list`.
 - Regex patterns are matched against the full tool name using fullmatch.
 
-### Oh My Vibe Plugin Packages
+### Agent Plugins
 
-Oh My Vibe uses a manifest-first package format. Install packages under
-`~/.omv/plugins/<name>/` or the project-local
-`.omv/plugins/<name>/`; each package must contain a regular `plugin.json`.
-Discovery validates manifests and fixed `skills/` and `mcp.json` components
-without importing plugin code.
+Oh My Vibe follows the upstream Agent Plugins 1.0 package format. A package
+has a root `plugin.json` using the published Agent Plugins schema, optional
+`skills/`, and an optional root `mcp.json` using the published MCP schema.
+User packages live under `~/.omv/plugins/<name>/`; project packages live under
+`.vibe/plugins/<name>/`.
 
-Installed packages are disabled by default. Enable them explicitly:
+Oh My Vibe does not define a competing root manifest or an `omv.plugin.v1`
+schema. Any future OMV-specific metadata belongs under the stable
+`extensions["com.ohmyvibe"]` namespace; that namespace currently grants no
+capabilities or authority.
 
-```toml
-[plugins]
-enabled = ["example"]
-sandbox = "off"          # off, auto, required
-sandbox_backend = "auto" # auto, bubblewrap, firejail
+The Oh My Vibe v1 claim is limited to Agent Plugins-compatible skills and MCP,
+plus upstream discovery and inspection. OMV-specific analyzers, native tool
+and hook adapters, and plugin sandbox enforcement are deferred. MCP servers
+continue to use Vibe's existing MCP configuration and permission behavior.
 
-[[plugins.permissions]]
-plugin = "example"
-capability = "tool"
-action = "read"
-command = "cat *"
-outcome = "always"       # always, ask, deny
-```
-
-The `plugin.json` manifest uses schema `omv.plugin.v1` and declares
-`name`, semantic `version`, `kind`, `capabilities`, a package-local
-`entrypoint`, manual activation, trust, and sandbox expectation. The current
-package loader accepts trusted in-process plugins; isolated-process packages
-are rejected until the versioned stdio runtime is available.
-
-Plugin permission decisions are host-owned. Safe read-only actions may be
-auto-allowed; side effects default to approval; explicit `always`, `ask`, and
-`deny` rules are matched by plugin, capability, action, and command. Core Bash
-guardrails and explicit human denials take precedence. Ambiguous rules and
-analyzer failures request approval.
-
-`sandbox = "auto"` or `"required"` opts plugins into host-selected Bubblewrap
-or Firejail isolation. A required plugin or required user policy fails closed
-when protocol, network, workdir, timeout, or cleanup evidence is incomplete;
-there is no silent unsandboxed fallback.
-
-When `sandbox = "auto"` cannot select a backend with complete evidence, the
-plugin is refused rather than run unsandboxed; use `sandbox = "off"` for
-trusted in-process plugins.
-
-Package `mcp.json` is parsed and validated during discovery, but packages that
-declare the `mcp` capability remain inactive until a policy-aware host adapter
-is available; MCP servers are never injected into the ordinary host tool
-configuration without plugin permission enforcement.
-
-Legacy Python entry-point plugins remain available through the internal
-registry and are never silently enabled as manifest packages.
+See [Oh My Vibe safety and plugins](docs/oh-my-vibe-safety-and-plugins.md) for
+the current boundary.
 
 ### MCP Server Configuration
 

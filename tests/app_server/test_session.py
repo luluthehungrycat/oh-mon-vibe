@@ -2519,7 +2519,7 @@ async def test_initialize_requires_initialized_notification() -> None:
         )
         assert response.model_dump(mode="json") == {
             "serverInfo": {
-                "name": "vibe-app-server",
+                "name": "omv-app-server",
                 "version": response.server_info.version,
             }
         }

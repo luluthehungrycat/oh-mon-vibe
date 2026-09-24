@@ -26,10 +26,10 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal, cast
 
-from mistralai_vibe_local_harness.protocol import RustRuntimeBuiltinToolName
-from mistralai_vibe_local_harness.vibe._permissions import PermissionOutcome
 from pydantic import BaseModel
 
+from mistralai_vibe_local_harness.protocol import RustRuntimeBuiltinToolName
+from mistralai_vibe_local_harness.vibe._permissions import PermissionOutcome
 from vibe.core.config import VibeConfigSchema
 from vibe.core.config.orchestrator import ConfigOrchestrator
 from vibe.core.tools.base import BaseTool

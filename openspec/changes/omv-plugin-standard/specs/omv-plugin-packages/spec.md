@@ -1,40 +1,33 @@
 ## ADDED Requirements
 
-### Requirement: Plugins use validated JSON manifests
+### Requirement: OMV uses the upstream Agent Plugins package resolver
 
-An OMV plugin package MUST contain a root `plugin.json` with schema version,
-name, semantic version, kind, capabilities, entry point, activation, trust,
-and sandbox expectation fields. The host MUST reject missing, malformed,
-unsupported, or contradictory fields before importing plugin code.
+Oh My Vibe MUST use the upstream Agent Plugins resolver as the sole package implementation. A supported package uses the published Agent Plugins 1.0 root `plugin.json`, the published MCP schema in root `mcp.json` with `mcpServers`, and the fixed `skills/` directory. OMV MUST NOT define a competing root manifest, package activation model, or custom package permission/sandbox contract.
 
-#### Scenario: Valid disabled plugin is installed
+#### Scenario: Canonical package is discovered
 
-- **WHEN** a package has a valid `plugin.json` but is absent from the enabled-plugin allowlist
-- **THEN** OMV SHALL record it as installed and SHALL NOT import, register, or execute its code
+- **WHEN** a package in a configured user or project plugin directory contains a valid Agent Plugins 1.0 `plugin.json`
+- **THEN** the upstream resolver MUST inspect the package using the published schema and its standard `skills/` and `mcp.json` components
 
-#### Scenario: Invalid manifest is discovered
+#### Scenario: Noncanonical OMV manifest is present
 
-- **WHEN** a package has an unknown capability, unsupported schema, duplicate identity, or invalid kind/capability combination
-- **THEN** OMV SHALL reject the package with structured diagnostics and SHALL continue discovering unrelated packages
+- **WHEN** a package uses `omv.plugin.v1` or OMV-only root fields instead of the published Agent Plugins schema
+- **THEN** OMV MUST NOT treat it as an alternate supported package format
 
-### Requirement: Plugin lifecycle is Hermes-inspired and failure-isolated
+### Requirement: OMV extension metadata is namespaced and inert
 
-OMV SHALL provide explicit discovery, validation, enablement, registration,
-activation, invocation, deactivation, and cleanup phases. Lifecycle callbacks
-MUST be bounded and a failure in one plugin MUST NOT prevent unrelated plugins
-or host shutdown from completing.
+OMV-specific metadata MUST be placed under `extensions["com.ohmyvibe"]`. Until an OMV extension schema and enforcement path are implemented, that entry MUST NOT grant executable capabilities, permissions, or sandbox guarantees.
 
-#### Scenario: Enabled plugin activates
+#### Scenario: Package declares OMV extension data
 
-- **WHEN** a validated plugin is explicitly enabled
-- **THEN** OMV SHALL register and activate it through a typed lifecycle context before invocation
+- **WHEN** a canonical package includes `extensions["com.ohmyvibe"]`
+- **THEN** the upstream resolver MUST leave that data inert and MUST NOT interpret it as authority
 
-#### Scenario: Plugin activation fails
+### Requirement: OMV plugin compatibility claims are scoped
 
-- **WHEN** an enabled plugin raises during registration or activation
-- **THEN** OMV SHALL record the phase and failure, disable that plugin for the session, and continue with built-ins and unrelated plugins
+The Oh My Vibe v1 package claim SHALL cover Agent Plugins-compatible skills/MCP and upstream discovery/inspection only. OMV-specific native analyzer, tool, and hook execution, and plugin-specific sandbox enforcement, SHALL remain deferred until invocation and permission behavior are implemented and tested.
 
-#### Scenario: Host shuts down with active plugins
+#### Scenario: Documentation describes plugin support
 
-- **WHEN** the session ends
-- **THEN** OMV SHALL invoke bounded cleanup for each active plugin and SHALL report cleanup failures without blocking host shutdown
+- **WHEN** Oh My Vibe documentation describes package support
+- **THEN** it MUST state the supported skills/MCP scope and MUST NOT claim OMV-native analyzer/tool/hook execution or plugin sandbox enforcement

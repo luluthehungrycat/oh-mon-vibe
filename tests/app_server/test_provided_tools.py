@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+import pytest
+
 from mistralai_vibe_local_harness.protocol import (
     JsonObject,
     JsonSchema,
@@ -13,8 +15,6 @@ from mistralai_vibe_local_harness.protocol import (
     RustToolFailedEvent,
     RustToolSucceededEvent,
 )
-import pytest
-
 from vibe.app_server._provided_tools import (
     TODO_TOOL_NAME,
     VIBE_PROVIDED_TOOL_MODES,

@@ -52,6 +52,8 @@ Oh My Vibe preserves vanilla Vibe CLI behavior and documentation where practical
 - Do not copy a global Hermes skill merely because it mentions Vibe; copy only skills directly specific to this repository/project.
 - If a Hermes global skill is copied, preserve its original behavior and record the source and portability rationale in the project documentation.
 - Bash safety changes must keep policy, evaluator, sandbox, and fallback state available in structured results; do not rely on parsing `execution_note` for UI or integrations.
+- Agent Plugin packages use the upstream Agent Plugins 1.0 resolver only: root `plugin.json`, standard root `mcp.json`, and fixed `skills/`. OMV metadata is reserved under `extensions["com.ohmyvibe"]` and remains inert; OMV-native analyzers, tools, hooks, and plugin-specific sandbox enforcement are deferred.
+- The `omv.plugins` Python entry-point registry is an internal Bash safety extension, not an Agent Plugins package loader or compatibility format.
 
 ## Project layout & module conventions
 

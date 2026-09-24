@@ -14,13 +14,17 @@ import sys
 from typing import TYPE_CHECKING
 
 from vibe import __version__
+from vibe._experimental_harness import (
+    add_experimental_harness_argument,
+    add_smart_approve_argument,
+)
 
 # Anything heavier than argparse is imported inside the functions below, after
 # argument parsing, so that --help/--version don't pay for the config stack
 # (pydantic, textual, rich) at import time.
 
 if TYPE_CHECKING:
-    from vibe.core.worktree import PreparedWorktree, WorktreeCleanupState
+    from vibe.core.git.worktree import PreparedWorktree, WorktreeCleanupState
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -114,6 +118,15 @@ def parse_arguments() -> argparse.Namespace:
         "'default_agent' config setting in both interactive and programmatic "
         "(-p/--prompt) mode.",
     )
+    harness_group = parser.add_mutually_exclusive_group()
+    add_experimental_harness_argument(parser, group=harness_group)
+    harness_group.add_argument(
+        "--legacy-harness",
+        action="store_true",
+        default=False,
+        help="Force the legacy Python harness, overriding the GrowthBook rollout.",
+    )
+    add_smart_approve_argument(parser)
     parser.add_argument(
         "--auto-approve",
         "--yolo",
@@ -134,10 +147,15 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--worktree",
+        nargs="?",
+        const=True,
+        default=None,
         metavar="NAME",
-        help="Create (or reuse) a git worktree under $OMV_HOME/worktrees on "
-        "a branch named NAME and run inside it. Implicitly trusted for the "
-        "session. Ignored with --setup and --check-upgrade.",
+        help="Run inside a git worktree under $OMV_HOME/worktrees. With NAME, "
+        "create (or reuse) a worktree and branch named NAME. Without NAME, "
+        "create a new one named after the prompt (or a random slug) on an "
+        "omv/<name> branch. Implicitly trusted for the session. Ignored with "
+        "--setup and --check-upgrade.",
     )
     parser.add_argument(
         "--add-dir",
@@ -175,7 +193,12 @@ def parse_arguments() -> argparse.Namespace:
         metavar="SESSION_ID",
         help="Resume a session. Without SESSION_ID, shows an interactive picker.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if getattr(args, "smart_approve", False):
+        args.experimental_harness = True
+        if args.agent is None:
+            args.agent = "smart-approve"
+    return args
 
 
 def _prompt_remove_worktree(
@@ -221,14 +244,10 @@ def _prompt_delete_attached_branch(worktree: PreparedWorktree) -> bool:
 def _cleanup_worktree_on_exit(worktree: PreparedWorktree) -> None:
     from rich import print as rprint
 
-    from vibe.core.worktree import (
-        WorktreeError,
-        inspect_worktree_for_cleanup,
-        remove_worktree,
-    )
+    from vibe.core.git.worktree import ManagedWorktree, WorktreeError
 
     try:
-        cleanup_state = inspect_worktree_for_cleanup(worktree)
+        cleanup_state = worktree.inspect_for_cleanup()
     except WorktreeError as e:
         rprint(
             f"[yellow]Could not inspect worktree for cleanup: {e}[/]", file=sys.stderr
@@ -242,10 +261,13 @@ def _cleanup_worktree_on_exit(worktree: PreparedWorktree) -> None:
         return
 
     delete_branch = worktree.branch_created or _prompt_delete_attached_branch(worktree)
-
+    managed = ManagedWorktree.at(worktree.root)
     try:
         rprint(f"[dim]Removing worktree: {worktree.root}[/]", file=sys.stderr)
-        remove_worktree(worktree, delete_branch=delete_branch)
+        worktree.leave_if_current_directory()
+        worktree.remove(delete_branch=delete_branch)
+        if managed is not None:
+            managed.forget()
     except WorktreeError as e:
         rprint(f"[yellow]Could not remove worktree: {e}[/]", file=sys.stderr)
         return
@@ -253,6 +275,21 @@ def _cleanup_worktree_on_exit(worktree: PreparedWorktree) -> None:
     rprint(f"[dim]Removed worktree: {worktree.root}[/]", file=sys.stderr)
     if not delete_branch:
         rprint(f"[dim]Kept branch: {worktree.branch}[/]", file=sys.stderr)
+
+
+def _suggest_worktree_name(prompt: str | None) -> str | None:
+    if not prompt:
+        return None
+
+    import asyncio
+
+    from vibe.core.config.harness_files import init_harness_files_manager
+    from vibe.core.config.vibe_schema import load_dotenv_values
+    from vibe.core.git.worktree.naming_model import suggest_worktree_name
+
+    load_dotenv_values()
+    init_harness_files_manager("user", "project")
+    return asyncio.run(suggest_worktree_name(prompt, cwd=Path.cwd()))
 
 
 def main() -> None:
@@ -291,11 +328,19 @@ def main() -> None:
     # Must run before `cwd` is read and before run_cli so that session lookups
     # (-c / --resume picker) scope to the worktree directory.
     if args.worktree and not (args.setup or args.check_upgrade):
-        from vibe.core.worktree import WorktreeError, prepare_worktree_session
+        from vibe.core.git.worktree import WorktreeError, WorktreeRepository
 
-        rprint(f"[dim]Preparing worktree {args.worktree!r}...[/]", file=sys.stderr)
+        requested = "" if args.worktree is True else f" {args.worktree!r}"
+        rprint(f"[dim]Preparing worktree{requested}...[/]", file=sys.stderr)
         try:
-            worktree_session = prepare_worktree_session(args.worktree, Path.cwd())
+            with WorktreeRepository.open(Path.cwd()) as repository:
+                if args.worktree is True:
+                    prompt = args.prompt or args.initial_prompt
+                    worktree_session = repository.prepare_auto(
+                        prompt=prompt, suggested_name=_suggest_worktree_name(prompt)
+                    )
+                else:
+                    worktree_session = repository.prepare(args.worktree)
         except WorktreeError as e:
             rprint(f"[red]Error: {e}[/]")
             sys.exit(1)

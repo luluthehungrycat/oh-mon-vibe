@@ -24,7 +24,7 @@ from vibe.app_server.models import (
     SkillEffectInput,
     validate_history_entry,
 )
-from vibe.core.tools.builtins.bash import Bash, BashArgs, CapturedShellResult
+from vibe.core.tools.builtins.bash import Bash, BashArgs, BashResult
 from vibe.core.tools.builtins.edit import Edit, EditResult
 from vibe.core.tools.builtins.experimental_bash import (
     ExperimentalBash,
@@ -154,7 +154,7 @@ def test_result_projection_uses_the_same_tool_owned_contract() -> None:
         ToolResultEvent(
             tool_name="bash",
             tool_class=Bash,
-            result=CapturedShellResult(command="pwd", stdout="ok", stderr=""),
+            result=BashResult(command="pwd", stdout="ok", stderr="", returncode=0),
             tool_call_id="call-1",
             presentation=ToolResultPresentation(
                 kind=ToolEffectKind.SHELL,
@@ -234,7 +234,7 @@ def test_non_shell_projection_leaves_an_unstreamed_effect_empty() -> None:
 
 
 def _project_shell_result(
-    tool_class, result: ExperimentalBashResult | CapturedShellResult
+    tool_class, result: ExperimentalBashResult | BashResult
 ) -> CompletedEffectState:
     event = ToolResultEvent(
         tool_name=tool_class.get_name(),
@@ -272,8 +272,11 @@ def test_managed_shell_variants_project_output_for_terminal_safe_rendering(
 
 @pytest.mark.parametrize("tool_class", [GitBash, WindowsShell])
 def test_fallback_shell_variants_project_both_captured_streams(tool_class) -> None:
-    result = CapturedShellResult(
-        command="status", stdout="\x1b[32mok\x1b[0m", stderr="\x1b[31mwarning\x1b[0m"
+    result = BashResult(
+        command="status",
+        stdout="\x1b[32mok\x1b[0m",
+        stderr="\x1b[31mwarning\x1b[0m",
+        returncode=0,
     )
 
     completed = _project_shell_result(tool_class, result)

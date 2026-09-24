@@ -175,13 +175,13 @@ class CommandRegistry:
             ),
             "plugins": Command(
                 aliases=frozenset(["/plugins"]),
-                description="Display the plugins this session is running",
+                description="Inspect Agent Plugin packages discovered for this session",
                 handler="_show_plugins",
                 is_available=lambda ctx: ctx.experimental_harness,
             ),
             "reload-plugins": Command(
                 aliases=frozenset(["/reload-plugins"]),
-                description="Re-pin this session's plugins and report what changed",
+                description="Refresh the package catalogue and report what changed",
                 handler="_reload_plugins",
                 is_available=lambda ctx: ctx.experimental_harness,
             ),

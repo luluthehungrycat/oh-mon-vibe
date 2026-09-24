@@ -161,8 +161,6 @@ __all__ = [
     "OtelRedactionMode",
     "OtelSpanExporterConfig",
     "PatchOp",
-    "PluginConfig",
-    "PluginPermissionConfig",
     "ProjectContextConfig",
     "ProviderConfig",
     "RawConfig",

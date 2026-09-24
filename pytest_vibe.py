@@ -5,6 +5,7 @@ import os
 import warnings
 
 import pytest
+from setproctitle import setproctitle
 
 _WORKER_COUNT_ENV_VAR = "PYTEST_XDIST_AUTO_NUM_WORKERS"
 _LOCAL_NICENESS = 10
@@ -34,19 +35,23 @@ def _is_ci() -> bool:
     )
 
 
+_IS_XDIST_WORKER = False
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_configure(config: pytest.Config) -> None:
-    if hasattr(config, "workerinput"):
-        for plugin in config.pluginmanager.get_plugins():
-            run_one_test = getattr(plugin, "run_one_test", None)
-            if run_one_test and "worker_title" in run_one_test.__globals__:
-                run_one_test.__globals__["worker_title"] = lambda _title: None
-                break
-        return
-    if _is_ci():
+    global _IS_XDIST_WORKER
+    _IS_XDIST_WORKER = hasattr(config, "workerinput")
+    if _IS_XDIST_WORKER or _is_ci():
         return
     if nice := getattr(os, "nice", None):
         nice(_LOCAL_NICENESS)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_logstart(nodeid: str, location: tuple[str, int | None, str]) -> None:
+    if _IS_XDIST_WORKER:
+        setproctitle("pytest-xdist worker")
 
 
 def _default_worker_count(cpu_count: int) -> int:

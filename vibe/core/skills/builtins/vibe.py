@@ -165,32 +165,17 @@ active_transcribe_model = "voxtral-realtime"
 active_tts_model = "voxtral-tts"
 ```
 
-### Oh My Vibe plugin packages
+### Agent Plugins
 
-Oh My Vibe discovers inert plugin packages from `~/.omv/plugins/` and the
-project-local `.omv/plugins/` directory. Each package has a `plugin.json`
-manifest and remains installed but disabled unless its name is listed under
-`plugins.enabled`. Discovery validates manifests and fixed `skills/` and
-`mcp.json` components without importing plugin code.
+Oh My Vibe follows the upstream Agent Plugins 1.0 package format: root
+`plugin.json`, optional `skills/`, and optional root `mcp.json`. User plugins
+are discovered under `~/.omv/plugins/`; project plugins use `.vibe/plugins/`.
+OMV-specific metadata, when defined, belongs under
+`extensions["com.ohmyvibe"]`; this namespace currently grants no authority.
 
-```toml
-[plugins]
-enabled = ["example"]
-sandbox = "off"          # off, auto, required
-sandbox_backend = "auto" # auto, bubblewrap, firejail
-
-[[plugins.permissions]]
-plugin = "example"
-capability = "tool"
-action = "read"
-command = "cat *"
-outcome = "always"       # always, ask, deny
-```
-
-Plugin analyzers are advisory. Host Bash guardrails deny dangerous commands,
-ambiguous results request approval, and plugin `always` rules cannot override a
-host denial. Required isolation fails closed when the host cannot produce
-complete protocol, network, workdir, timeout, and cleanup evidence.
+The Oh My Vibe v1 claim is limited to standard skills and MCP plus upstream
+discovery and inspection. OMV-specific analyzers, native tool and hook
+adapters, and plugin sandbox enforcement are deferred.
 
 ### Providers
 
@@ -948,7 +933,7 @@ LOAD when the user:
 - asks any meta question about your own behavior;
 - is unsure whether a command, flag, env var, or file is in scope — this skill is the source of truth.
 
-SCOPE: config under `~/.vibe/` and project-local `.vibe/`; `VIBE_*` and `LOG_*` env vars; models and providers; agents and subagents; skills; tools and their permission model; every slash command and CLI flag; hooks; MCP servers; connectors; trusted folders; `@`-file mentions; logs; themes; voice.""",
+SCOPE: config under `~/.vibe/` and project-local `.vibe/`; `VIBE_*` and `LOG_*` env vars; models and providers; agents and subagents; skills; tools and their permission model; every slash command and CLI flag; hooks; MCP servers; connectors; plugins; trusted folders; `@`-file mentions; logs; themes; voice.""",
     user_invocable=False,
     prompt=_PROMPT_TEMPLATE.replace("__VIBE_VERSION__", __version__),
     source=SkillSource.BUILTIN,

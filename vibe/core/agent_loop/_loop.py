@@ -86,14 +86,6 @@ from vibe.core.middleware import (
     make_plan_agent_reminder,
 )
 from vibe.core.plan_session import PlanSession
-from vibe.core.plugins.lifecycle import PluginLifecycle, PluginLifecyclePhase
-from vibe.core.plugins.package import (
-    PluginPackageRegistry,
-    add_legacy_entrypoint_diagnostics,
-    discover_legacy_entrypoint_names,
-    discover_package_plugins,
-)
-from vibe.core.plugins.runtime import PluginRuntimeManager
 from vibe.core.review import ReviewManager
 from vibe.core.rewind import RewindManager
 from vibe.core.scratchpad import cleanup_scratchpad, init_scratchpad
@@ -632,24 +624,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         )
         self.config.require_active_provider_api_key()
         config = self.config
-        self.plugin_package_registry: PluginPackageRegistry = discover_package_plugins(
-            set(config.plugins.enabled), project_root=self.cwd
-        )
-        add_legacy_entrypoint_diagnostics(
-            self.plugin_package_registry, discover_legacy_entrypoint_names()
-        )
-        self._active_plugin_skill_paths: tuple[Path, ...] = ()
-        self._plugin_config_snapshot = config.plugins.model_dump(mode="json")
-        self.plugin_lifecycle = PluginLifecycle()
-        self.plugin_runtime_manager = PluginRuntimeManager(
-            self.plugin_package_registry,
-            self.plugin_lifecycle,
-            config.plugins.permission_policy(),
-            sandbox_policy=config.plugins.sandbox,
-            sandbox_backend=config.plugins.sandbox_backend,
-        )
-        self._plugins_activated = False
-        self._plugin_activation_lock = asyncio.Lock()
         self.experiment_manager = ExperimentManager(
             client=RemoteEvalClient.from_settings(
                 api_host=config.experiments.api_host,
@@ -846,70 +820,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             self.messages.update_system_prompt(self._build_system_prompt())
         except Exception as exc:
             self._init_error = exc
-
-    def _activate_plugin_components(self) -> None:
-        active = {
-            name
-            for name, runtime in self.plugin_lifecycle.runtimes.items()
-            if runtime.phase is PluginLifecyclePhase.ACTIVATE
-        }
-        active_skill_paths = tuple(
-            components.skills
-            for name, components in self.plugin_package_registry.components.items()
-            if name in active and components.skills is not None
-        )
-        skill_manager = SkillManager(
-            lambda: self.config,
-            harness_files=self.harness_files,
-            extra_search_paths=active_skill_paths,
-        )
-        self._active_plugin_skill_paths = active_skill_paths
-        self.skill_manager = skill_manager
-        self.messages.update_system_prompt(self._build_system_prompt())
-
-    async def _reconcile_plugins(self, target_config: VibeConfigSchema) -> bool:
-        snapshot = target_config.plugins.model_dump(mode="json")
-        if snapshot == self._plugin_config_snapshot:
-            return False
-        async with self._plugin_activation_lock:
-            if snapshot == self._plugin_config_snapshot:
-                return False
-            old_lifecycle = self.plugin_lifecycle
-            await self.plugin_runtime_manager.shutdown()
-            old_failure_diagnostics = tuple(
-                issue
-                for issue in old_lifecycle.diagnostics
-                if issue.event in {"deactivation_failed", "cleanup_failed"}
-            )
-            registry = discover_package_plugins(
-                set(target_config.plugins.enabled), project_root=self.cwd
-            )
-            add_legacy_entrypoint_diagnostics(
-                registry, discover_legacy_entrypoint_names()
-            )
-            lifecycle = PluginLifecycle()
-            lifecycle.diagnostics.extend(old_failure_diagnostics)
-            runtime_manager = PluginRuntimeManager(
-                registry,
-                lifecycle,
-                target_config.plugins.permission_policy(),
-                sandbox_policy=target_config.plugins.sandbox,
-                sandbox_backend=target_config.plugins.sandbox_backend,
-            )
-            await runtime_manager.activate_enabled()
-            self.plugin_package_registry = registry
-            self.plugin_lifecycle = lifecycle
-            self.plugin_runtime_manager = runtime_manager
-            self._active_plugin_skill_paths = tuple(
-                components.skills
-                for name, components in registry.components.items()
-                if name in lifecycle.runtimes
-                and lifecycle.runtimes[name].phase is PluginLifecyclePhase.ACTIVATE
-                and components.skills is not None
-            )
-            self._plugin_config_snapshot = snapshot
-            self._plugins_activated = True
-            return True
 
     async def wait_until_ready(self) -> None:
         """Await deferred initialization (MCP + experiments) from an async context."""
@@ -1177,12 +1087,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
     async def refresh_config(self) -> None:
         await self._config_orchestrator.reload()
         self._ensure_remote_registries()
-        plugin_config_changed = (
-            self.config.plugins.model_dump(mode="json") != self._plugin_config_snapshot
-        )
-        await self._reconcile_plugins(self.config)
-        if plugin_config_changed:
-            self._activate_plugin_components()
         if self.mcp_registry is not None:
             self.mcp_registry.sync_active_servers(self.config.mcp_servers)
 
@@ -3946,10 +3850,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             if switch_to_agent is not None
             else self.config
         )
-        plugin_config_changed = (
-            target_config.plugins.model_dump(mode="json")
-            != self._plugin_config_snapshot
-        )
 
         # Off-loop: skill discovery and system prompt I/O. reload() is awaited within a
         # turn, so that turn is suspended here -- nothing mutates the shared state this
@@ -3961,15 +3861,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         # A newer reload superseded us; let it own the commit.
         if generation != self._reload_generation:
             return
-        if plugin_config_changed:
-            await self._reconcile_plugins(target_config)
-            if generation != self._reload_generation:
-                return
-            prepared = await asyncio.to_thread(
-                self._prepare_reload, target_config, reload_hooks
-            )
-            if generation != self._reload_generation:
-                return
 
         # Synchronous swap: no await, so an in-flight turn can't observe a partial
         # update. Keep it that way -- don't make it async or move it off-thread.
@@ -3992,9 +3883,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             terminal_runtime=self.tool_manager.terminal_runtime,
         )
         skill_manager = SkillManager(
-            config_source.get,
-            harness_files=self.harness_files,
-            extra_search_paths=self._active_plugin_skill_paths,
+            config_source.get, harness_files=self.harness_files
         )
         system_prompt = self._render_system_prompt(
             skill_manager, target_config, tool_manager

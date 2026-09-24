@@ -1,126 +1,40 @@
 ## Context
 
-Oh My Vibe has an internal Python entry-point registry, advisory command
-analyzers, and host-owned Bash permissions. Those pieces do not yet define a
-user-facing package format, disabled activation lifecycle, plugin permission
-rules, or a plugin sandbox protocol. Hermes Agent's portable Agent Plugins v1
-is a useful package-shape reference, but its documented format does not define
-trust, permissions, provenance, or sandboxing. OpenCode's native modules are
-also not a manifest or trust standard.
+Upstream Mistral Vibe v2.25.7 contains the canonical Agent Plugins 1.0 resolver. Oh My Vibe's earlier `omv.plugin.v1` implementation duplicated package discovery and claimed permissions and sandbox guarantees without enforcing them across actual plugin invocation. Keeping both implementations would make manifest interpretation and authority ambiguous.
 
 ## Goals / Non-Goals
 
 **Goals:**
 
-- Define an OMV-owned JSON plugin package contract derived from portable Agent
-  Plugins v1 without claiming Hermes or OpenCode compatibility.
-- Keep installed plugins inert until explicit user enablement.
-- Prefer Hermes-style lifecycle boundaries: discovery, validation, registration,
-  activation, failure isolation, and shutdown cleanup.
-- Make command analysis smart by default: deterministic destructive denial,
-  automatic approval for clearly safe work, and user approval for ambiguity.
-- Preserve granular user `always`, `ask`, and `deny` rules for plugin actions.
-- Define optional and required plugin sandbox expectations with host-owned
-  selection and fail-closed behavior.
+- Use the upstream resolver for Agent Plugins package discovery.
+- Preserve the published root `plugin.json`, root `mcp.json`, and fixed `skills/` package structure.
+- Keep OMV metadata in a stable reverse-domain `extensions` entry without granting it executable authority.
+- Preserve the existing Bash safety policy and internal Python analyzer extension separately from Agent Plugins packages.
+- State the supported and deferred capability boundary accurately.
 
 **Non-Goals:**
 
-- Native Hermes or OpenCode plugin compatibility.
-- A plugin marketplace, remote installer, or dynamic untrusted installation.
-- Running arbitrary plugin code in-process without manifest validation and
-  explicit enablement.
-- Treating thread timeouts or metadata as process isolation.
-- Implementing a standalone SDK in this change.
+- Defining a custom OMV root manifest or a second package resolver.
+- Claiming native Agent Plugin analyzers, tools, or hooks as OMV features.
+- Claiming plugin-specific process isolation or sandbox enforcement.
+- Extracting an SDK or claiming native Hermes/OpenCode compatibility.
 
 ## Decisions
 
-### JSON manifest and fixed package layout
+### One package resolver
 
-Use `plugin.json` rather than YAML. JSON matches the portable Agent Plugins v1
-shape, has deterministic standard-library parsing, and avoids adding YAML parser
-behavior to the trust boundary. A package contains a root `plugin.json`, an
-OMV entry point, and optional fixed `skills/` and `mcp.json` components. The
-manifest includes `schema`, `name`, semantic `version`, `kind`, `capabilities`,
-`entrypoint`, `activation`, `trust`, `sandbox`, and lifecycle metadata. Unknown
-fields are retained as metadata but never grant authority.
+The upstream `PluginResolver` is the sole resolver for package files. It recognizes the published Agent Plugins 1.0 `$schema` in root `plugin.json`, the corresponding MCP schema and `mcpServers` object in root `mcp.json`, and the fixed `skills/` directory. The OMV-only `omv.plugin.v1` root schema, enablement config, package lifecycle, and plugin sandbox APIs are removed.
 
-Discovery scans `$OMV_HOME/plugins/` and the project `.omv/plugins/` directory
-without importing plugin code. The enabled-plugin configuration is an explicit
-allowlist. Project plugins cannot silently shadow a global plugin with the same
-name; duplicate identities are diagnosed and skipped.
+### OMV extension namespace
 
-### Hermes-style lifecycle
+Future OMV-specific package metadata belongs under `extensions["com.ohmyvibe"]`. The namespace currently has no defined fields; the upstream resolver ignores it, so it grants no permission, execution capability, or sandbox status. Standard Agent Plugins fields remain interpreted only according to upstream semantics.
 
-The lifecycle is `discover -> parse -> validate -> enable -> register ->
-activate -> invoke -> deactivate`. Discovery and validation are cheap and
-manifest-only. Registration and activation happen only for enabled plugins.
-Each plugin has a bounded lifecycle context, and registration/activation
-failures are isolated. Shutdown invokes cleanup for activated plugins and
-records failures without blocking other cleanup or host shutdown.
+### Scoped v1 claims
 
-### Host-owned smart command policy
-
-Plugin analyzers return typed advisory classifications: `allow`, `ask`, or
-`deny`, plus a reason and optional sandbox eligibility. The host applies this
-precedence:
-
-1. deterministic dangerous-command denial;
-2. explicit user `deny` rule;
-3. required path/permission checks and sandbox requirements;
-4. plugin advisory `deny` or `ask`;
-5. explicit user `always` rule when no core safeguard is violated;
-6. advisory `allow` for clearly safe work;
-7. human approval for remaining ambiguity.
-
-A deterministic denial cannot be overridden by a plugin or an `always` rule.
-Users may define granular plugin/action/command rules with `always`, `ask`, or
-`deny`; the default is `ask` for side-effecting plugin actions. The policy
-reuses the existing typed permission model rather than adding a surface-local
-approval path.
-
-### Plugin sandbox expectations
-
-The manifest declares `sandbox: optional | required`; omission means
-`optional`. The user config declares `plugins.sandbox: off | auto | required`.
-
-- `off` runs only plugins that do not require isolation; a required plugin is
-  refused before activation.
-- `auto` sandboxes optional and required plugins when a compatible backend and
-  process adapter exist; this initial host refuses optional plugins when the
-  backend or complete capability evidence is unavailable, and always refuses
-  required plugins.
-- `required` refuses plugins that cannot provide an isolatable process contract.
-
-In-process plugins are trusted code and cannot claim sandboxed execution. A
-sandboxed plugin must expose a versioned stdio protocol and run in a separate
-process through a backend that reports availability, network isolation,
-writable-workdir scope, timeout, and cleanup. No plugin backend is selected by
-plugin code; the host owns the decision and argv construction.
-
-### Trust, failure, and diagnostics
-
-Manifest trust is explicit: `trusted_in_process` or `isolated_process`. The
-host accepts the former only for the initial implementation. It rejects the
-latter until the process protocol, resource limits, cancellation, cleanup, and
-capability evidence are implemented. Diagnostics identify plugin, lifecycle
-phase, decision, trust, isolation, timeout, and failure reason.
-
-### Migration
-
-Existing `omv.plugins` Python entry points remain an internal compatibility
-path while packages migrate. Public package activation requires `plugin.json`
-validation and explicit enablement. The registry must not execute a package
-entry point merely because it is installed.
+Oh My Vibe claims compatibility for standard Agent Plugins skills/MCP and upstream discovery/inspection. Native analyzers, tools, and hooks are not an OMV extension contract. The existing Python analyzer entry-point registry is an internal Bash safety extension and does not load Agent Plugins packages. Plugin-specific real sandbox enforcement is deferred; existing Bash sandbox behavior is a distinct host feature.
 
 ## Risks / Trade-offs
 
-- **JSON is less comment-friendly than YAML** → deterministic parsing and no
-  new parser in the trust boundary are more important.
-- **Smart analysis can be wrong** → deterministic denials and user rules remain
-  authoritative; ambiguity becomes approval.
-- **Optional sandboxing adds startup cost** → users control the default policy;
-  required plugins never silently fall back.
-- **Separate plugin processes require a protocol** → this is deliberately
-  specified before implementation rather than faking isolation.
-- **Portable Agent Plugins v1 remains incomplete for OMV safety** → reuse its
-  package shape only; do not claim format compatibility.
+- **Upstream resolver behavior can evolve** → retain the upstream versioned schema and tests; do not fork its manifest contract.
+- **The extension namespace is reserved but currently inert** → document that it grants no authority until a schema and host enforcement are implemented.
+- **The supported claim is narrower than the prior proposal** → avoid implying that manifest metadata itself provides permission or isolation guarantees.

@@ -1,53 +1,21 @@
 ## Why
 
-Oh My Vibe currently has an internal Python entry-point registry, but it does not
-provide a user-facing plugin package, disabled-install lifecycle, granular
-plugin permission policy, or a defined plugin sandbox decision. Hermes Agent's
-portable Agent Plugins v1 provides a useful package shape, while its native
-plugin contract does not provide the trust and safety semantics Oh My Vibe
-needs. Define an OMV-owned `plugin.json` standard now instead of forcing
-compatibility with a host contract that cannot express these guarantees.
+Oh My Vibe inherited a second, OMV-specific `plugin.json` contract beside the upstream Agent Plugins resolver. That contract claimed native analyzers, tools, hooks, permissions, and plugin sandboxing without a single end-to-end runtime enforcement path. Upstream Mistral Vibe v2.25.7 already provides an Agent Plugins 1.0 resolver for canonical `plugin.json`, `mcp.json`, and `skills/` packages. Oh My Vibe must keep that as the only package architecture.
 
 ## What Changes
 
-- Add an OMV-owned `plugin.json` manifest based on the portable Agent Plugins v1
-  package shape, with explicit schema version, identity, capabilities, entry
-  point, trust, lifecycle, permission, and sandbox expectations.
-- Discover installed plugins without importing or executing them until the user
-  explicitly enables them.
-- Use a Hermes-inspired lifecycle: validate metadata, discover fixed package
-  components, register callbacks, activate enabled plugins, isolate failures,
-  and clean up on shutdown.
-- Add host-owned smart command policy for plugin analyzers:
-  - deterministic dangerous-command denial remains authoritative;
-  - clearly safe commands can be auto-allowed;
-  - ambiguity requests user approval;
-  - users can override the policy with granular `always`, `ask`, and `deny`
-    rules, matching vanilla Vibe/OpenCode expectations.
-- Define an OMV plugin sandbox decision with three plugin-declared expectations:
-  `never`, `optional`, and `required`, plus user policy controlling whether
-  optional plugins run sandboxed.
-- Refuse a plugin when its required sandbox or trust contract cannot be met;
-  never reinterpret `required` as unsandboxed execution.
-- Preserve host authority over permissions, denial, sandbox selection, result
-  validation, diagnostics, and lifecycle cleanup.
-- Add conformance fixtures for package validation, disabled activation,
-  permission precedence, dangerous-command denial, ambiguity approval,
-  sandbox decisions, failures, timeouts, and shutdown.
-- Keep Hermes Agent and OpenCode adapters as optional future mappings; do not
-  claim compatibility or extract an SDK from this change.
+- Reconcile the branch with upstream Mistral Vibe v2.25.7 using a preserved merge commit.
+- Use the published Agent Plugins 1.0 root `plugin.json` and MCP `mcp.json` schema through the upstream resolver.
+- Remove the competing `omv.plugin.v1` manifest, its package lifecycle, permission and sandbox models, and their configuration surface.
+- Reserve `extensions["com.ohmyvibe"]` for future OMV-specific metadata; it remains inert until an extension schema and enforcement are implemented.
+- Limit the Oh My Vibe plugin-package claim to standard skills/MCP and upstream discovery/inspection. Defer OMV-specific analyzers, native tool/hook adapters, and plugin sandbox enforcement.
+- Keep the existing internal Python analyzer registry distinct from Agent Plugins packages; it is not a package loader or compatibility claim.
 
 ## Capabilities
 
 ### New Capabilities
 
-- `omv-plugin-packages`: Defines the `plugin.json` manifest, package discovery,
-  explicit enablement, fixed component layout, and Hermes-inspired lifecycle.
-- `omv-plugin-permissions`: Defines host-authoritative smart command analysis,
-  dangerous-command denial, ambiguity approval, and granular always/ask/deny
-  overrides.
-- `omv-plugin-sandboxing`: Defines plugin trust, optional/required sandbox
-  expectations, user policy, capability evidence, and fail-closed refusal.
+- `omv-plugin-packages`: Defines the upstream Agent Plugins package shape and the limited Oh My Vibe compatibility boundary.
 
 ### Modified Capabilities
 
@@ -55,8 +23,4 @@ compatibility with a host contract that cannot express these guarantees.
 
 ## Impact
 
-This is an OMV-owned plugin contract and safety policy, not a compatibility
-layer for native Hermes or OpenCode plugins. It affects plugin discovery,
-configuration, command policy, sandbox selection, diagnostics, and lifecycle
-management. Existing internal entry-point plugins require migration into the
-new manifest contract before they can use the public package lifecycle.
+This change uses the upstream resolver as the sole Agent Plugins package implementation. Existing Vibe MCP authorization and tool-permission behavior remain the enforcement path for MCP tools. The existing internal Python analyzer registry remains separate and does not load `plugin.json` packages. OMV-specific native analyzer/tool/hook execution and plugin-specific sandbox enforcement are explicitly deferred.

@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 import time
-from unittest.mock import ANY, AsyncMock, MagicMock, call
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, call
 from weakref import WeakKeyDictionary
 
 import pytest
@@ -54,14 +55,8 @@ async def _block_agent_job(app: VibeApp, pilot) -> _BlockingBackend:
     chat_input = app.query_one(ChatInputContainer)
     chat_input.post_message(ChatInputContainer.Submitted("block queue"))
     assert await wait_until(pilot, backend.started.is_set)
-    # Wait until the client has handled TurnStarted, not just until the session
-    # projection reports the turn active (that flag flips earlier, often before
-    # backend.started returns). Only once TurnStarted is processed is the blocking
-    # turn cleared from the optimistic len(app._queue), so a later follow-up count
-    # is accurate instead of being inflated by the still-pending running turn.
-    assert await wait_until(
-        pilot, lambda: not app._pending_turn and len(app._queue) == 0
-    )
+    # The queue controller drops the optimistic prompt once the turn starts.
+    assert await wait_until(pilot, lambda: len(app._queue) == 0)
     return backend
 
 
@@ -237,18 +232,16 @@ async def test_idle_skill_fires_telemetry(
 
 @pytest.mark.asyncio
 async def test_prompt_fires_at_mention_telemetry_when_its_turn_starts(
-    vibe_app_with_skills: VibeApp, monkeypatch: pytest.MonkeyPatch
+    vibe_app_with_skills: VibeApp,
+    monkeypatch: pytest.MonkeyPatch,
+    telemetry_events: list[dict[str, Any]],
 ) -> None:
     """*Prepare*: Prompt preparation reports one Python file mention.
     *Do*: Submit the prompt and wait for its queued Turn to start.
     *Assert*: The existing mention event is recorded with its message identity.
     """
-    record = MagicMock()
     async with vibe_app_with_skills.run_test() as pilot:
         # Prepare
-        monkeypatch.setattr(
-            vibe_app_with_skills.app_server.resources.telemetry, "record", record
-        )
         monkeypatch.setattr(
             vibe_app_with_skills,
             "_prepare_prompt_or_abort",
@@ -268,29 +261,23 @@ async def test_prompt_fires_at_mention_telemetry_when_its_turn_starts(
         try:
             chat_input = vibe_app_with_skills.query_one(ChatInputContainer)
             chat_input.post_message(ChatInputContainer.Submitted("read @example.py"))
-            await wait_until(
-                pilot,
-                lambda: any(
-                    recorded.args and recorded.args[0] == "vibe.at_mention_inserted"
-                    for recorded in record.call_args_list
-                ),
-            )
+            assert await wait_until(pilot, backend.started.is_set)
         finally:
             backend.release.set()
 
         # Assert
-        assert (
-            call(
-                "vibe.at_mention_inserted",
-                {
-                    "nb_mentions": 1,
-                    "context_types": {"file": 1},
-                    "file_extensions": {".py": 1},
-                    "message_id": ANY,
-                },
-            )
-            in record.call_args_list
-        )
+        mention_events = [
+            event
+            for event in telemetry_events
+            if event["event_name"] == "vibe.at_mention_inserted"
+        ]
+        assert len(mention_events) == 1
+        properties = mention_events[0]["properties"]
+        assert isinstance(properties, dict)
+        assert properties["nb_mentions"] == 1
+        assert properties["context_types"] == {"file": 1}
+        assert properties["file_extensions"] == {".py": 1}
+        assert isinstance(properties["message_id"], str)
 
 
 @pytest.mark.asyncio
@@ -307,8 +294,8 @@ async def test_popped_queued_skill_does_not_fire_telemetry(
         backend = await _block_agent_job(vibe_app_with_skills, pilot)
         try:
             chat_input.post_message(ChatInputContainer.Submitted("/my-skill"))
-            assert await _wait_until(
-                pilot, lambda: len(vibe_app_with_skills._input_queue) == 1
+            assert await wait_until(
+                pilot, lambda: len(vibe_app_with_skills._queue) == 1
             )
 
             await pilot.press("ctrl+c")
@@ -335,8 +322,8 @@ async def test_queued_head_skill_injects_skill_tool_message(
         try:
             chat_input.post_message(ChatInputContainer.Submitted("/my-skill"))
             chat_input.post_message(ChatInputContainer.Submitted("follow-up prompt"))
-            assert await _wait_until(
-                pilot, lambda: len(vibe_app_with_skills._input_queue) == 2
+            assert await wait_until(
+                pilot, lambda: len(vibe_app_with_skills._queue) == 2
             )
         finally:
             await _release_agent_job(vibe_app_with_skills, pilot, backend)
@@ -371,8 +358,12 @@ async def test_skill_prompt_runs_after_following_bash_is_rejected(
         try:
             chat_input.post_message(ChatInputContainer.Submitted("/my-skill"))
             chat_input.post_message(ChatInputContainer.Submitted("!echo queued"))
-            assert await _wait_until(
-                pilot, lambda: len(vibe_app_with_skills._input_queue) == 2
+            assert await wait_until(
+                pilot,
+                lambda: (
+                    len(vibe_app_with_skills._queue) == 1
+                    and chat_input.value == "!echo queued"
+                ),
             )
         finally:
             await _release_agent_job(vibe_app_with_skills, pilot, backend)

@@ -134,13 +134,14 @@ class AudioRecorder:
 
             gen = self._capture_generator()
             next(gen)  # prime the generator
-            self._stream = ma.CaptureDevice(
+            stream = ma.CaptureDevice(
                 input_format=ma.SampleFormat.SIGNED16,
                 nchannels=channels,
                 sample_rate=sample_rate,
                 buffersize_msec=DEFAULT_BUFFER_MS,
             )
-            self._stream.start(gen)
+            self._stream = stream
+            stream.start(gen)
             self._recording = True
 
             self._on_expire = on_expire

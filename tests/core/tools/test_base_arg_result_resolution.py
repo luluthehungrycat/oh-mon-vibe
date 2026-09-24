@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from vibe.core.tools.builtins.bash import CapturedShellResult
+from vibe.core.tools.builtins.bash import BashResult
 from vibe.core.tools.builtins.experimental_bash import (
     ExperimentalBashArgs,
     ExperimentalBashResult,
@@ -30,4 +30,4 @@ def test_inherited_run_annotation_resolves_against_the_defining_module(tool_clas
     [(GitBash, GitBashArgs), (WindowsShell, WindowsShellArgs)],
 )
 def test_fallback_shells_declare_their_own_result_model(tool_class, args_model):
-    assert tool_class._get_tool_args_results() == (args_model, CapturedShellResult)
+    assert tool_class._get_tool_args_results() == (args_model, BashResult)

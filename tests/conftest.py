@@ -52,6 +52,8 @@ from vibe.utils import keyring as keyring_utils
 from vibe.utils.platform import resolve_windows_shell
 
 _TESTS_ROOT = Path(__file__).parent
+pytest_plugins = ["pytest_vibe"]
+
 _LOCAL_XDIST_GROUPS = {
     Path("core/test_history_properties.py"): "history_properties",
     Path("core/test_system_prompt.py"): "git_processes",

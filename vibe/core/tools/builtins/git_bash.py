@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from vibe import VIBE_ROOT
 from vibe.core.tools.base import BaseTool, BaseToolState, InvokeContext, ToolError
-from vibe.core.tools.builtins.bash import CapturedShellResult, completed_shell_result
+from vibe.core.tools.builtins.bash import BashResult, _completed_bash_result
 from vibe.core.tools.builtins.experimental_bash import (
     BashLogFile,
     BashLogFileArgs,
@@ -171,8 +171,8 @@ def _build_git_bash_context_permissions(
 
 class GitBash(
     _BashPermissionMixin[GitBashToolConfig],
-    BaseTool[GitBashArgs, CapturedShellResult, GitBashToolConfig, BaseToolState],
-    ToolUIData[GitBashArgs, CapturedShellResult],
+    BaseTool[GitBashArgs, BashResult, GitBashToolConfig, BaseToolState],
+    ToolUIData[GitBashArgs, BashResult],
 ):
     effect_kind = ToolEffectKind.SHELL
     description: ClassVar[str] = "Run a Git Bash command."
@@ -198,7 +198,7 @@ class GitBash(
 
     @classmethod
     def get_result_display(cls, event: ToolResultEvent) -> ToolResultDisplay:
-        if not isinstance(event.result, CapturedShellResult):
+        if not isinstance(event.result, BashResult):
             return ToolResultDisplay(
                 success=False, message=event.error or event.skip_reason or "No result"
             )
@@ -219,7 +219,7 @@ class GitBash(
 
     async def run(
         self, args: GitBashArgs, ctx: InvokeContext | None = None
-    ) -> AsyncGenerator[ToolStreamEvent | CapturedShellResult, None]:
+    ) -> AsyncGenerator[ToolStreamEvent | BashResult, None]:
         requested_timeout = (
             float(args.timeout) if args.timeout is not None else args.timeout_seconds
         )
@@ -253,12 +253,16 @@ class GitBash(
                     raise ToolError(
                         f"Command timed out after {timeout:g}s: {args.command!r}"
                     ) from None
-                yield completed_shell_result(
-                    command=args.command,
-                    shell=shell,
-                    stdout=result.stdout[:max_bytes],
-                    stderr=result.stderr[:max_bytes],
-                    exit_code=result.returncode,
+                yield _completed_bash_result(
+                    BashResult(
+                        command=args.command,
+                        shell=shell,
+                        stdout=result.stdout[:max_bytes],
+                        stderr=result.stderr[:max_bytes],
+                        returncode=result.returncode,
+                        policy_mode=self.config.safety.policy,
+                        evaluator="terminal-transport",
+                    )
                 )
                 return
 
@@ -282,12 +286,15 @@ class GitBash(
 
             stdout = _decode_limited(stdout_bytes, max_bytes)
             stderr = _decode_limited(stderr_bytes, max_bytes)
-            yield completed_shell_result(
-                command=args.command,
-                shell=shell,
-                stdout=stdout,
-                stderr=stderr,
-                exit_code=proc.returncode or 0,
+            yield _completed_bash_result(
+                BashResult(
+                    command=args.command,
+                    shell=shell,
+                    stdout=stdout,
+                    stderr=stderr,
+                    returncode=proc.returncode or 0,
+                    policy_mode=self.config.safety.policy,
+                )
             )
         except (ToolError, asyncio.CancelledError):
             raise

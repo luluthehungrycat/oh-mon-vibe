@@ -51,7 +51,7 @@ _COMPONENT_LABELS = {
 class PluginsApp(Container):
     can_focus_children = True
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("escape", "close", "Close", show=False),
+        Binding("escape", "close", "Close", show=False, priority=True),
         Binding("backspace", "back", "Back", show=False),
         Binding("slash", "filter", "Search", show=False),
         Binding("r", "reload", "Reload", show=False),

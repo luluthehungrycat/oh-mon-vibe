@@ -560,23 +560,6 @@ def project_diagnostics(agent_loop: AgentLoop) -> tuple[list[ConfigIssue], int]:
     issues = [
         *(_project_issue(issue) for issue in agent_loop.hook_config_issues),
         *(_project_issue(issue) for issue in agent_loop.skill_manager.config_issues),
-        *(
-            _project_plugin_issue(issue)
-            for issue in agent_loop.plugin_package_registry.diagnostics
-        ),
-        *(
-            _project_plugin_lifecycle_issue(issue)
-            for issue in agent_loop.plugin_lifecycle.diagnostics
-            if issue.event
-            in {
-                "registration_failed",
-                "activation_failed",
-                "invocation_failed",
-                "deactivation_failed",
-                "cleanup_failed",
-                "sandbox_required",
-            }
-        ),
     ]
     return issues, agent_loop.hooks_count
 
@@ -874,19 +857,6 @@ def project_agent_summary(profile: AgentProfile) -> AgentSummary:
 
 def _project_issue(issue: _ConfigIssue) -> ConfigIssue:
     return ConfigIssue(file=str(issue.file), message=issue.message)
-
-
-def _project_plugin_issue(issue: PluginPackageDiagnostic) -> ConfigIssue:
-    return ConfigIssue(
-        file=f"plugin:{issue.package}", message=f"{issue.event}: {issue.reason}"
-    )
-
-
-def _project_plugin_lifecycle_issue(issue: PluginLifecycleDiagnostic) -> ConfigIssue:
-    return ConfigIssue(
-        file=f"plugin:{issue.plugin}",
-        message=f"{issue.event} ({issue.phase}): {issue.reason}",
-    )
 
 
 class _HistoryFields(TypedDict):

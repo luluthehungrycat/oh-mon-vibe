@@ -70,6 +70,8 @@ from vibe.core.skills.models import SkillInfo, SkillScope
 from vibe.core.tools.models import ToolPermission
 
 if TYPE_CHECKING:
+    from pydantic import JsonValue
+
     from mistralai_vibe_local_harness.protocol import (
         RustAgentTypeDefinition,
         RustKnowledgeFolderDefinition,
@@ -87,8 +89,6 @@ if TYPE_CHECKING:
         RestoredPlugins,
         SessionPluginProjection,
     )
-    from pydantic import JsonValue
-
     from vibe.app_server._plugin_mcp import PluginMCPCatalog
     from vibe.core.config.models import MCPServer
     from vibe.core.tools.connectors.connector_registry import ConnectorRegistry
@@ -1019,7 +1019,6 @@ def declared_agent_profiles(
     # first is a widening, since the policy ceiling grants exactly one completion, and
     # the second gates nothing today.
     from mistralai_vibe_local_harness.vibe.plugins import DeclaredAgentTypeProfile
-
     from vibe.app_server._runtime import rust_agent_tool_ceiling
 
     profiles: list[DeclaredAgentTypeProfile] = []

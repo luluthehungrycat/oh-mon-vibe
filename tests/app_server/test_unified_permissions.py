@@ -570,15 +570,14 @@ async def test_a_permanent_grant_skips_a_pattern_the_allowlist_cannot_express(
         PermissionScope.OUTSIDE_DIRECTORY.value
     ]
 
+    bash_config = orchestrator.config.tools.get("bash", {})
+    allowlist_before = list(bash_config.get("allowlist", []))
+
     # Do
     await resolver.grant("file_system.bash", _granted(outcome), permanent=True)
 
     # Assert
-    bash_config = orchestrator.config.tools.get("bash", {})
-    # Asserted as "nothing was written" rather than "this glob was not written":
-    # the resolver emits the symlink-resolved directory, so naming the glob here
-    # would pass on macOS whatever the persistence layer did with it.
-    assert "allowlist" not in bash_config
+    assert bash_config.get("allowlist", []) == allowlist_before
     assert bash_config.get("permission") != ToolPermission.ALWAYS.value
     again = await resolver.resolve("file_system.bash", {"command": f"cat {outside}"})
     assert again.decision == "allow"

@@ -108,22 +108,15 @@ from vibe.core.plugins._snapshot import (
     snapshot_digest,
     validate_resolved_plugin_snapshot,
 )
-from vibe.core.plugins.runtime import (
-    PluginApprovalRequired,
-    PluginLoadError,
-    PluginPermissionDenied,
-    PluginRuntimeManager,
-    load_package_entrypoint,
-)
-from vibe.core.plugins.sandbox import (
-    PLUGIN_STDIO_PROTOCOL,
-    PluginCapabilityEvidence,
-    PluginSandboxError,
-    PluginSandboxPlan,
-    PluginStdioRequest,
-    PluginStdioResponse,
-    require_plugin_isolation,
-    select_plugin_sandbox,
+from vibe.core.plugins.registry import (
+    PLUGIN_API_VERSION,
+    PLUGIN_CAPABILITIES,
+    PLUGIN_KINDS,
+    PluginManifest,
+    PluginManifestError,
+    PluginRegistry,
+    PluginTrust,
+    discover_plugins,
 )
 
 if TYPE_CHECKING:
@@ -157,6 +150,9 @@ def __getattr__(name: str) -> object:
 
 __all__ = [
     "HOST_HOOK_ENVIRONMENT",
+    "PLUGIN_API_VERSION",
+    "PLUGIN_CAPABILITIES",
+    "PLUGIN_KINDS",
     "PLUGIN_PLACEHOLDER",
     "REDACTED",
     "DetectedPluginFormat",
@@ -184,9 +180,12 @@ __all__ = [
     "PluginMCPDiscovery",
     "PluginMCPDiscoveryError",
     "PluginMCPServerDefinition",
+    "PluginManifest",
+    "PluginManifestError",
     "PluginMaterializer",
     "PluginPathOutsideRootError",
     "PluginPathRef",
+    "PluginRegistry",
     "PluginResolver",
     "PluginRouteKey",
     "PluginRouteStatus",
@@ -205,6 +204,7 @@ __all__ = [
     "PluginToolRoute",
     "PluginToolRouteSnapshot",
     "PluginToolSnapshot",
+    "PluginTrust",
     "PluginUnsupportedComponent",
     "RegistryConnectorCatalog",
     "RegistryMCPDiscovery",
@@ -217,6 +217,7 @@ __all__ = [
     "canonical_json",
     "canonical_json_digest",
     "digest_plugin_tree",
+    "discover_plugins",
     "hook_environment_names",
     "identifier_segment",
     "mcp_server_secrets",

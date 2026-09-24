@@ -54,10 +54,12 @@ _MAX_DISCOVERED_TOOLS = 1_000
 
 
 def _vibe_distribution_version() -> str:
-    try:
-        return importlib.metadata.version("mistral-vibe")
-    except importlib.metadata.PackageNotFoundError:
-        return importlib.metadata.version("mistralai-vibe-local-harness")
+    for distribution_name in ("mistral-vibe", "oh-my-vibe"):
+        try:
+            return importlib.metadata.version(distribution_name)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    raise importlib.metadata.PackageNotFoundError("oh-my-vibe")
 
 
 _VIBE_CLI_USER_AGENT = f"MistralAI-VibeCLI/{_vibe_distribution_version()}"
