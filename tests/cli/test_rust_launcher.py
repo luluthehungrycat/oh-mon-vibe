@@ -56,7 +56,8 @@ def test_upgrade_commands_use_python_with_rust_selected(
     def _entrypoint() -> None:
         parsed = vibe.cli.entrypoint.parse_arguments()
         if args[0] == "update":
-            assert parsed.initial_prompt == "update"
+            assert parsed.check_upgrade
+            assert parsed.initial_prompt is None
         else:
             assert parsed.check_upgrade
         raise SystemExit(0)

@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 pub fn vibe_home() -> Option<PathBuf> {
-    vibe_home_from(
-        std::env::var_os("VIBE_HOME"),
+    omv_home_from(
+        std::env::var_os("OMV_HOME"),
         std::env::var_os("HOME"),
         std::env::var_os("USERPROFILE"),
     )
@@ -68,15 +68,15 @@ pub fn user_home_from(
         .map(PathBuf::from)
 }
 
-fn vibe_home_from(
-    vibe_home: Option<std::ffi::OsString>,
+fn omv_home_from(
+    omv_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
     user_profile: Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
-    if let Some(path) = vibe_home.filter(|path| !path.is_empty()) {
+    if let Some(path) = omv_home.filter(|path| !path.is_empty()) {
         return Some(PathBuf::from(path));
     }
-    user_home_from(home, user_profile).map(|path| path.join(".vibe"))
+    user_home_from(home, user_profile).map(|path| path.join(".omv"))
 }
 
 /// Expand `~` in a path, since canonicalize does not.
@@ -119,6 +119,25 @@ pub fn resolve_add_dirs(paths: &[PathBuf]) -> Result<Vec<String>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn omv_home_uses_explicit_override() {
+        assert_eq!(
+            omv_home_from(
+                Some("/tmp/omv-home".into()),
+                Some("/home/tester".into()),
+                None,
+            ),
+            Some(PathBuf::from("/tmp/omv-home"))
+        );
+    }
+
+    #[test]
+    fn omv_home_defaults_to_the_isolated_directory() {
+        assert_eq!(
+            omv_home_from(None, Some("/home/tester".into()), None),
+            Some(PathBuf::from("/home/tester/.omv"))
+        );
+    }
     #[test]
     fn dangerous_directories_are_named_by_location() {
         let home = Path::new("/Users/tester");

@@ -24,7 +24,12 @@ from vibe._experimental_harness import (
 # (pydantic, textual, rich) at import time.
 
 if TYPE_CHECKING:
-    from vibe.core.git.worktree import PreparedWorktree, WorktreeCleanupState
+    from vibe.core.git.worktree import (
+        ManagedWorktree,
+        PendingSessionHold,
+        PreparedWorktree,
+        WorktreeCleanupState,
+    )
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -193,7 +198,10 @@ def parse_arguments() -> argparse.Namespace:
         metavar="SESSION_ID",
         help="Resume a session. Without SESSION_ID, shows an interactive picker.",
     )
-    args = parser.parse_args()
+    argv = sys.argv[1:]
+    if argv[:1] == ["update"]:
+        argv[0] = "--check-upgrade"
+    args = parser.parse_args(argv)
     if getattr(args, "smart_approve", False):
         args.experimental_harness = True
         if args.agent is None:
@@ -241,10 +249,37 @@ def _prompt_delete_attached_branch(worktree: PreparedWorktree) -> bool:
     return answer in {"y", "yes", "delete"}
 
 
-def _cleanup_worktree_on_exit(worktree: PreparedWorktree) -> None:
+def _has_other_worktree_holders(
+    managed: ManagedWorktree, cli_hold: PendingSessionHold | None
+) -> bool:
+    holders = managed.holders()
+    if cli_hold is not None:
+        holders -= {cli_hold.holder_id}
+    return bool(holders)
+
+
+def _cleanup_worktree_on_exit(
+    worktree: PreparedWorktree, cli_hold: PendingSessionHold | None
+) -> None:
     from rich import print as rprint
 
     from vibe.core.git.worktree import ManagedWorktree, WorktreeError
+    from vibe.core.git.worktree.record import worktree_prune_lock
+
+    managed = ManagedWorktree.at(worktree.root)
+    if managed is None:
+        rprint(
+            f"[yellow]Could not find the managed worktree record for {worktree.root}; "
+            "keeping it.[/]",
+            file=sys.stderr,
+        )
+        return
+    if _has_other_worktree_holders(managed, cli_hold):
+        rprint(
+            f"[dim]Keeping worktree: another session is using {worktree.root}[/]",
+            file=sys.stderr,
+        )
+        return
 
     try:
         cleanup_state = worktree.inspect_for_cleanup()
@@ -261,12 +296,17 @@ def _cleanup_worktree_on_exit(worktree: PreparedWorktree) -> None:
         return
 
     delete_branch = worktree.branch_created or _prompt_delete_attached_branch(worktree)
-    managed = ManagedWorktree.at(worktree.root)
     try:
-        rprint(f"[dim]Removing worktree: {worktree.root}[/]", file=sys.stderr)
-        worktree.leave_if_current_directory()
-        worktree.remove(delete_branch=delete_branch)
-        if managed is not None:
+        with worktree_prune_lock():
+            if _has_other_worktree_holders(managed, cli_hold):
+                rprint(
+                    f"[dim]Keeping worktree: another session is using {worktree.root}[/]",
+                    file=sys.stderr,
+                )
+                return
+            rprint(f"[dim]Removing worktree: {worktree.root}[/]", file=sys.stderr)
+            worktree.leave_if_current_directory()
+            worktree.remove(delete_branch=delete_branch)
             managed.forget()
     except WorktreeError as e:
         rprint(f"[yellow]Could not remove worktree: {e}[/]", file=sys.stderr)
@@ -381,6 +421,15 @@ def _run_cli_with_worktree_cleanup(
 ) -> None:
     from vibe.cli.cli import run_cli
 
+    cli_hold: PendingSessionHold | None = None
+    if worktree_session is not None:
+        from vibe.core.git.worktree import ManagedWorktree
+
+        cli_hold = worktree_session.pending_hold
+        managed = ManagedWorktree.at(worktree_session.root)
+        if cli_hold is None and managed is not None:
+            cli_hold = managed.hold_for_attachment()
+
     session_started = False
     try:
         run_cli(args)
@@ -389,16 +438,20 @@ def _run_cli_with_worktree_cleanup(
         session_started = e.code in {0, None}
         raise
     finally:
-        # Only auto-clean worktrees Vibe created this run, and only once a
-        # session actually ran — a startup failure (bad config, --continue with
-        # no sessions) must not delete a reused worktree or its branch.
-        if (
-            worktree_session is not None
-            and worktree_session.created
-            and args.prompt is None
-            and session_started
-        ):
-            _cleanup_worktree_on_exit(worktree_session)
+        try:
+            # Only auto-clean worktrees Vibe created this run, and only once a
+            # session actually ran — a startup failure (bad config, --continue with
+            # no sessions) must not delete a reused worktree or its branch.
+            if (
+                worktree_session is not None
+                and worktree_session.created
+                and args.prompt is None
+                and session_started
+            ):
+                _cleanup_worktree_on_exit(worktree_session, cli_hold)
+        finally:
+            if cli_hold is not None:
+                cli_hold.release()
 
 
 if __name__ == "__main__":

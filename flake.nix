@@ -75,6 +75,21 @@
               ];
           });
 
+        # The combined wheel builds the Rust CLI inside Nix's network-isolated
+        # builder, so provide the locked crates and toolchain explicitly.
+        oh-my-vibe = prev.oh-my-vibe.overrideAttrs (old: {
+          cargoDeps = pkgs.rustPlatform.importCargoLock {
+            lockFile = ./vibe/cli-rust/Cargo.lock;
+          };
+          nativeBuildInputs = (old.nativeBuildInputs or []) ++ [
+            pkgs.rustPlatform.cargoSetupHook
+            pkgs.cargo
+            pkgs.rustc
+          ];
+          # Match Linux wheels, which disable the ALSA-backed voice feature.
+          env = (old.env or {}) // {CARGO_BUILD_FLAGS = "--no-default-features";};
+        });
+
         # The Rust terminal build fetches crates from the network, which is
         # forbidden in the Nix build sandbox. Skip that optional executable;
         # the required Harness extension is still built by Maturin.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 from pathlib import Path
@@ -7,9 +8,15 @@ from pathlib import Path
 from git import Repo
 import pytest
 
+import vibe.cli.entrypoint as entrypoint
 from vibe.core.config.models import SessionLoggingConfig
 from vibe.core.git.errors import GitError
-from vibe.core.git.worktree import PreparedWorktree, WorktreeError, WorktreeRepository
+from vibe.core.git.worktree import (
+    ManagedWorktree,
+    PreparedWorktree,
+    WorktreeError,
+    WorktreeRepository,
+)
 from vibe.core.paths import VIBE_HOME
 from vibe.core.session.session_loader import SessionLoader
 
@@ -305,3 +312,29 @@ def test_worktree_continue_scopes_to_worktree(tmp_path: Path) -> None:
         SessionLoader.find_latest_session(config, working_directory=repo_root)
         is not None
     )
+
+
+def test_cli_cleanup_keeps_worktree_held_by_another_session(
+    git_repo: Repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worktree = _prepare("feature", tmp_path)
+    managed = ManagedWorktree.at(worktree.root)
+    assert managed is not None
+
+    def run_cli(_args: argparse.Namespace) -> None:
+        assert len(managed.holders()) == 1
+        assert ManagedWorktree.prune(limit=0) == 0
+        managed.hold("other-session")
+
+    monkeypatch.setattr("vibe.cli.cli.run_cli", run_cli)
+
+    try:
+        entrypoint._run_cli_with_worktree_cleanup(
+            argparse.Namespace(prompt=None), worktree
+        )
+
+        assert worktree.root.is_dir()
+        assert "feature" in (h.name for h in git_repo.heads)
+        assert managed.holders() == frozenset({"other-session"})
+    finally:
+        managed.release_holder("other-session")
