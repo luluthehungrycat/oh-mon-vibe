@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Callable, Sequence
-from contextlib import AbstractAsyncContextManager, nullcontext
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from contextlib import AbstractAsyncContextManager, aclosing, nullcontext
+import functools
 import json
 import types
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
@@ -11,14 +12,19 @@ import httpx
 from vibe.core.llm.backend._image import to_data_uri as _to_data_uri
 from vibe.core.llm.backend.anthropic import AnthropicAdapter
 from vibe.core.llm.backend.base import (
+    MODEL_HTTP_KEEPALIVE_EXPIRY_SECONDS,
     APIAdapter,
+    ParsedStreamChunk,
     PreparedRequest,
     build_chat_payload,
     finalize_chat_request,
 )
-from vibe.core.llm.backend.openai_responses import OpenAIResponsesAdapter
+from vibe.core.llm.backend.openai_responses import (
+    OpenAIResponsesAdapter,
+    OpenAIResponsesStreamError,
+)
 from vibe.core.llm.backend.reasoning_adapter import ReasoningAdapter
-from vibe.core.llm.exceptions import BackendErrorBuilder
+from vibe.core.llm.exceptions import BackendErrorBuilder, ModelCall
 from vibe.core.tracing import (
     model_call_span,
     set_model_call_http_status,
@@ -31,17 +37,26 @@ from vibe.core.types import (
     LLMMessage,
     LLMUsage,
     Role,
+    StopInfo,
     StrToolChoice,
 )
-from vibe.core.utils import RetryObserver, async_generator_retry, async_retry
+from vibe.core.utils import (
+    AdaptivePacer,
+    RetryCategory,
+    RetryObserver,
+    RetryReason,
+    async_generator_retry,
+    async_retry,
+)
 from vibe.core.utils.sse import iter_sse_lines
-from vibe.utils.api_keys import resolve_api_key
+from vibe.utils.api_keys import resolve_api_key_with_origin
 from vibe.utils.http import VibeAsyncHTTPClient, build_ssl_context
 
 if TYPE_CHECKING:
     from opentelemetry import trace
 
     from vibe.core.config import ModelConfig, ProviderConfig
+    from vibe.utils.api_keys import ApiKeyOrigin
 
 
 class OpenAIAdapter(APIAdapter):
@@ -89,7 +104,7 @@ class OpenAIAdapter(APIAdapter):
                         exclude={
                             "message_id": True,
                             "reasoning_message_id": True,
-                            "reasoning_state": True,
+                            "reasoning_payloads": True,
                             "injected": True,
                             "images": True,
                             "tool_result": True,
@@ -97,6 +112,7 @@ class OpenAIAdapter(APIAdapter):
                             "input_text": True,
                             "resources": True,
                             "manual_shell": True,
+                            "context_boundary": True,
                             "tool_calls": {"__all__": {"presentation"}},
                         },
                     ),
@@ -185,14 +201,29 @@ class OpenAIAdapter(APIAdapter):
             completion_tokens=usage_data.get("completion_tokens", 0),
             cached_tokens=prompt_details.get("cached_tokens", 0),
         )
+        choices = data.get("choices") or []
+        finish_reason = choices[0].get("finish_reason") if choices else None
+        stop = (
+            StopInfo(reason=str(finish_reason)) if finish_reason is not None else None
+        )
 
-        return LLMChunk(message=message, usage=usage)
+        return LLMChunk(message=message, usage=usage, stop=stop)
 
 
-_ADAPTERS: dict[str, APIAdapter] = {
-    "openai": OpenAIAdapter(),
-    "anthropic": AnthropicAdapter(),
-    "reasoning": ReasoningAdapter(),
+def _vertex_anthropic_adapter() -> APIAdapter:
+    # Imported on use because the Vertex adapter pulls in google.auth, which is
+    # heavy enough to be noticeable at CLI startup.
+    from vibe.core.llm.backend.vertex import VertexAnthropicAdapter
+
+    return VertexAnthropicAdapter()
+
+
+_ADAPTERS: dict[str, Callable[[], APIAdapter]] = {
+    "openai": OpenAIAdapter,
+    "reasoning": ReasoningAdapter,
+    "anthropic": AnthropicAdapter,
+    "openai-responses": OpenAIResponsesAdapter,
+    "vertex-anthropic": _vertex_anthropic_adapter,
 }
 
 
@@ -209,17 +240,13 @@ def _reports_usage(response_data: dict[str, Any]) -> bool:
 
 
 def _get_adapter(api_style: str) -> APIAdapter:
-    """Load the adapter for the given API style."""
-    if api_style == "openai-responses":
-        return OpenAIResponsesAdapter()
-    if api_style not in _ADAPTERS:
-        if api_style == "vertex-anthropic":
-            from vibe.core.llm.backend.vertex import VertexAnthropicAdapter
+    """Build the adapter for the given API style.
 
-            _ADAPTERS["vertex-anthropic"] = VertexAnthropicAdapter()
-        else:
-            raise KeyError(api_style)
-    return _ADAPTERS[api_style]
+    Adapters are built per request: several of them buffer state while parsing a
+    streamed response, and a shared instance would let concurrent sessions observe
+    each other's partial state.
+    """
+    return _ADAPTERS[api_style]()
 
 
 class GenericBackend:
@@ -229,30 +256,97 @@ class GenericBackend:
         client: VibeAsyncHTTPClient | None = None,
         provider: ProviderConfig,
         timeout: float = 720.0,
+        retry_max_elapsed_time: float = 300.0,
         on_retry: RetryObserver | None = None,
+        pacer: AdaptivePacer | None = None,
         enable_otel: bool = False,
     ) -> None:
         """Initialize the backend.
 
         Args:
             client: Optional Vibe HTTP client to use. If not provided, one will be created.
+            retry_max_elapsed_time: Total wall-clock budget for retrying retryable
+                failures (429, 5xx, network/timeout errors). Retries continue for as
+                long as the budget allows, matching the Mistral backend's behavior.
             on_retry: Notified before each retry backoff.
+            pacer: Adaptive call pacing. Defaults to a fresh `AdaptivePacer`, which
+                is a no-op until the first rate limit and then spaces subsequent
+                calls out, recovering once a quiet window passes. Inject a custom
+                one to tune the schedule or to stub timing in tests.
         """
         self._client = client
         self._owns_client = client is None
         self._provider = provider
         self._timeout = timeout
-        self._make_request = async_retry(tries=3, on_retry=on_retry)(self._send_request)
-        self._make_streaming_request = async_generator_retry(
-            tries=3, on_retry=on_retry
-        )(self._send_streaming_request)
+        self._retry_max_elapsed_time = retry_max_elapsed_time
+        self._pacer = pacer if pacer is not None else AdaptivePacer()
+        self._user_on_retry = on_retry
+
+        async def paced_on_retry(reason: RetryReason) -> None:
+            if reason.category is RetryCategory.RATE_LIMITED:
+                self._pacer.on_rate_limited()
+            if self._user_on_retry is not None:
+                await self._user_on_retry(reason)
+
+        # Budget-bounded retry: retry for as long as `retry_max_elapsed_time`
+        # allows rather than for a fixed attempt count, so a transient 429 or
+        # outage is waited out the same way the Mistral SDK backend does.
+        retried = async_retry(
+            tries=None, max_elapsed_time=retry_max_elapsed_time, on_retry=paced_on_retry
+        )(self._send_request)
+        self._make_request = self._pace(retried)
+        retried_stream = async_generator_retry(
+            tries=None, max_elapsed_time=retry_max_elapsed_time, on_retry=paced_on_retry
+        )(self._send_parsed_streaming_request)
+        self._make_streaming_request = self._pace_stream(retried_stream)
         self._enable_otel = enable_otel
+
+    def _pace(self, fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+        @functools.wraps(fn)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            await self._pacer.acquire()
+            succeeded = False
+            try:
+                result = await fn(*args, **kwargs)
+                succeeded = True
+                return result
+            finally:
+                if succeeded:
+                    self._pacer.on_success()
+                else:
+                    self._pacer.on_failure()
+
+        return wrapper
+
+    def _pace_stream(
+        self, fn: Callable[..., AsyncGenerator[Any]]
+    ) -> Callable[..., AsyncGenerator[Any]]:
+        @functools.wraps(fn)
+        async def wrapper(*args: Any, **kwargs: Any) -> AsyncGenerator[Any]:
+            await self._pacer.acquire()
+            succeeded = False
+            try:
+                async with aclosing(fn(*args, **kwargs)) as stream:
+                    async for item in stream:
+                        yield item
+                    succeeded = True
+            finally:
+                if succeeded:
+                    self._pacer.on_success()
+                else:
+                    self._pacer.on_failure()
+
+        return wrapper
 
     async def __aenter__(self) -> GenericBackend:
         if self._client is None:
             self._client = VibeAsyncHTTPClient(
                 timeout=httpx.Timeout(self._timeout),
-                limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+                limits=httpx.Limits(
+                    max_keepalive_connections=5,
+                    max_connections=10,
+                    keepalive_expiry=MODEL_HTTP_KEEPALIVE_EXPIRY_SECONDS,
+                ),
                 verify=build_ssl_context(),
             )
         return self
@@ -271,11 +365,32 @@ class GenericBackend:
         if self._client is None:
             self._client = VibeAsyncHTTPClient(
                 timeout=httpx.Timeout(self._timeout),
-                limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+                limits=httpx.Limits(
+                    max_keepalive_connections=5,
+                    max_connections=10,
+                    keepalive_expiry=MODEL_HTTP_KEEPALIVE_EXPIRY_SECONDS,
+                ),
                 verify=build_ssl_context(),
             )
             self._owns_client = True
         return self._client
+
+    def _resolve_credential(
+        self, api_style: str
+    ) -> tuple[str | None, ApiKeyOrigin | None]:
+        """The key this call will send, and the origin that describes it.
+
+        One lookup, so the reported origin always belongs to the credential the
+        provider refused. Vertex mints a Google ADC token and never sends the
+        configured key, so it has no origin a user could act on.
+        """
+        resolved = resolve_api_key_with_origin(self._provider.api_key_env_var)
+        if resolved is None:
+            return None, None
+        api_key, origin = resolved
+        if api_style == "vertex-anthropic":
+            return api_key, None
+        return api_key, origin
 
     async def complete(
         self,
@@ -289,9 +404,8 @@ class GenericBackend:
         extra_headers: dict[str, str] | None = None,
         metadata: dict[str, str] | None = None,
     ) -> LLMChunk:
-        api_key = resolve_api_key(self._provider.api_key_env_var)
-
         api_style = getattr(self._provider, "api_style", "openai")
+        api_key, api_key_origin = self._resolve_credential(api_style)
         adapter = _get_adapter(api_style)
 
         req = adapter.prepare_request(
@@ -313,6 +427,16 @@ class GenericBackend:
 
         base = req.base_url or self._provider.api_base
         url = f"{base}{req.endpoint}"
+        call = ModelCall(
+            provider=self._provider.name,
+            endpoint=url,
+            model=model.name,
+            messages=messages,
+            temperature=temperature,
+            has_tools=bool(tools),
+            tool_choice=tool_choice,
+            api_key_origin=api_key_origin,
+        )
 
         async with self._model_call_span(
             model=model,
@@ -334,27 +458,10 @@ class GenericBackend:
             except httpx.HTTPStatusError as e:
                 set_model_call_http_status(span, e.response.status_code)
                 raise BackendErrorBuilder.build_http_error(
-                    provider=self._provider.name,
-                    endpoint=url,
-                    error=e,
-                    response=e.response,
-                    model=model.name,
-                    messages=messages,
-                    temperature=temperature,
-                    has_tools=bool(tools),
-                    tool_choice=tool_choice,
+                    call, error=e, response=e.response
                 ) from e
             except httpx.RequestError as e:
-                raise BackendErrorBuilder.build_request_error(
-                    provider=self._provider.name,
-                    endpoint=url,
-                    error=e,
-                    model=model.name,
-                    messages=messages,
-                    temperature=temperature,
-                    has_tools=bool(tools),
-                    tool_choice=tool_choice,
-                ) from e
+                raise BackendErrorBuilder.build_request_error(call, error=e) from e
 
             set_model_call_http_status(span, response.status_code)
             set_model_call_response_metadata(span, response.data)
@@ -379,9 +486,8 @@ class GenericBackend:
         extra_headers: dict[str, str] | None = None,
         metadata: dict[str, str] | None = None,
     ) -> AsyncGenerator[LLMChunk, None]:
-        api_key = resolve_api_key(self._provider.api_key_env_var)
-
         api_style = getattr(self._provider, "api_style", "openai")
+        api_key, api_key_origin = self._resolve_credential(api_style)
         adapter = _get_adapter(api_style)
 
         req = adapter.prepare_request(
@@ -403,6 +509,16 @@ class GenericBackend:
 
         base = req.base_url or self._provider.api_base
         url = f"{base}{req.endpoint}"
+        call = ModelCall(
+            provider=self._provider.name,
+            endpoint=url,
+            model=model.name,
+            messages=messages,
+            temperature=temperature,
+            has_tools=bool(tools),
+            tool_choice=tool_choice,
+            api_key_origin=api_key_origin,
+        )
 
         async with self._model_call_span(
             model=model,
@@ -420,39 +536,38 @@ class GenericBackend:
                 set_model_call_http_status(span, status_code)
 
             try:
-                async for stream_chunk in self._make_streaming_request(
-                    url, req.body, headers, on_response_status=record_response_status
-                ):
-                    set_model_call_response_metadata(span, stream_chunk.data)
-                    chunk = adapter.parse_response(stream_chunk.data, self._provider)
-                    if chunk.usage is not None and _reports_usage(stream_chunk.data):
-                        has_usage = True
-                        usage += chunk.usage
-                    yield chunk
+                async with aclosing(
+                    self._make_streaming_request(
+                        url,
+                        req.body,
+                        headers,
+                        adapter,
+                        on_response_status=record_response_status,
+                    )
+                ) as stream:
+                    async for stream_chunk in stream:
+                        set_model_call_response_metadata(span, stream_chunk.data)
+                        chunk = stream_chunk.chunk
+                        if chunk.usage is not None and _reports_usage(
+                            stream_chunk.data
+                        ):
+                            has_usage = True
+                            usage += chunk.usage
+                        yield chunk
+            except OpenAIResponsesStreamError as e:
+                raise BackendErrorBuilder.build_stream_error(
+                    call,
+                    status=e.status,
+                    error_type=e.error_type,
+                    error_message=e.message,
+                ) from e
             except httpx.HTTPStatusError as e:
                 set_model_call_http_status(span, e.response.status_code)
                 raise BackendErrorBuilder.build_http_error(
-                    provider=self._provider.name,
-                    endpoint=url,
-                    error=e,
-                    response=e.response,
-                    model=model.name,
-                    messages=messages,
-                    temperature=temperature,
-                    has_tools=bool(tools),
-                    tool_choice=tool_choice,
+                    call, error=e, response=e.response
                 ) from e
             except httpx.RequestError as e:
-                raise BackendErrorBuilder.build_request_error(
-                    provider=self._provider.name,
-                    endpoint=url,
-                    error=e,
-                    model=model.name,
-                    messages=messages,
-                    temperature=temperature,
-                    has_tools=bool(tools),
-                    tool_choice=tool_choice,
-                ) from e
+                raise BackendErrorBuilder.build_request_error(call, error=e) from e
             if has_usage:
                 set_model_call_usage(
                     span,
@@ -507,6 +622,24 @@ class GenericBackend:
 
         response_body = response.json()
         return self.HTTPResponse(response_body, response.status_code)
+
+    async def _send_parsed_streaming_request(
+        self,
+        url: str,
+        data: bytes,
+        headers: dict[str, str],
+        adapter: APIAdapter,
+        on_response_status: Callable[[int], None] | None = None,
+    ) -> AsyncGenerator[ParsedStreamChunk]:
+        async with aclosing(
+            self._send_streaming_request(url, data, headers, on_response_status)
+        ) as response_stream:
+            responses = (stream_chunk.data async for stream_chunk in response_stream)
+            async with aclosing(
+                adapter.parse_stream(responses, self._provider)
+            ) as parsed_stream:
+                async for parsed in parsed_stream:
+                    yield parsed
 
     async def _send_streaming_request(
         self,

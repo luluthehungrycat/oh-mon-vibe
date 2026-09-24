@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 from pydantic import ValidationError
 import pytest
@@ -13,6 +15,7 @@ from vibe.app_server._account import (
     AccountGatewayUnavailable,
     HttpAccountGateway,
     WhoAmIResult,
+    reconcile_tenant_domains,
 )
 from vibe.app_server.models import (
     AccountActionKind,
@@ -21,8 +24,12 @@ from vibe.app_server.models import (
     AccountView,
 )
 from vibe.app_server.protocol import AccountReadParams
+from vibe.core.config import ModelConfig, ProviderConfig
 from vibe.core.config.layers.overrides import OverridesLayer
+from vibe.core.experiments.active import ExperimentSurface
+from vibe.core.experiments.models import ExperimentAttributes
 from vibe.core.types import Backend
+from vibe.setup.auth.whoami import load_cached_whoami, store_cached_whoami
 
 
 @pytest.mark.asyncio
@@ -37,7 +44,7 @@ from vibe.core.types import Backend
         "teleport_eligible",
     ),
     [
-        (AccountPlanKind.CHAT, "FREE", "Free", "Free", True, False, False),
+        (AccountPlanKind.CHAT, "FREE", "Free", "Free", True, False, True),
         (
             AccountPlanKind.CHAT,
             "INDIVIDUAL",
@@ -65,7 +72,7 @@ from vibe.core.types import Backend
             False,
             True,
         ),
-        (AccountPlanKind.API, "FREE", "Free API", "Free", True, True, False),
+        (AccountPlanKind.API, "FREE", "Free API", "Free", True, True, True),
         (
             AccountPlanKind.API,
             "PAY_AS_YOU_GO",
@@ -73,7 +80,7 @@ from vibe.core.types import Backend
             "[API] Scale plan",
             True,
             True,
-            False,
+            True,
         ),
         (
             AccountPlanKind.MISTRAL_CODE,
@@ -127,16 +134,22 @@ async def test_account_controller_projects_plan_semantics(
 
 
 @pytest.mark.asyncio
-async def test_account_controller_projects_switch_key_action(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("plan_type", "plan_name"),
+    [
+        (AccountPlanKind.CHAT, "INDIVIDUAL"),
+        (AccountPlanKind.API, "FREE"),
+        (AccountPlanKind.API, "PAY_AS_YOU_GO"),
+    ],
+)
+async def test_account_controller_allows_teleport_without_switching_key(
+    monkeypatch: pytest.MonkeyPatch, plan_type: AccountPlanKind, plan_name: str
 ) -> None:
     monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
     agent_loop = build_test_agent_loop()
     gateway = FakeAccountGateway(
         WhoAmIResult(
-            plan_type=AccountPlanKind.CHAT,
-            plan_name="INDIVIDUAL",
-            prompt_switching_to_pro_plan=True,
+            plan_type=plan_type, plan_name=plan_name, prompt_switching_to_pro_plan=True
         )
     )
 
@@ -147,9 +160,8 @@ async def test_account_controller_projects_switch_key_action(
 
     assert account.plan_offer is not None
     assert account.plan_offer.kind is AccountActionKind.SWITCH_API_KEY
-    assert account.teleport_action is not None
-    assert account.teleport_action.kind is AccountActionKind.SWITCH_API_KEY
-    assert not account.teleport_eligible
+    assert account.teleport_action is None
+    assert account.teleport_eligible
 
 
 @pytest.mark.asyncio
@@ -173,9 +185,13 @@ async def test_account_controller_does_not_call_gateway_without_key(
 
 
 @pytest.mark.asyncio
-async def test_account_controller_skips_non_mistral_active_model(
+async def test_account_controller_no_plan_data_when_no_mistral_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Non-Mistral active model AND no Mistral provider configured at all — not
+    # our user. No whoami call, no account UI, and the NO_PLAN_DATA sentinel
+    # (not the stale value, not null) so telemetry tells this apart from a
+    # failed fetch.
     monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
     base_config = build_test_vibe_config()
     provider = base_config.get_active_provider().model_copy(
@@ -194,8 +210,279 @@ async def test_account_controller_skips_non_mistral_active_model(
         await agent_loop.aclose()
 
     assert account.status is AccountStatus.UNAVAILABLE
+    assert account.plan is None
     assert gateway.calls == []
+    assert agent_loop.user_plan == "NO_PLAN_DATA"
+
+
+@pytest.mark.asyncio
+async def test_account_controller_fetches_plan_for_non_mistral_active_with_mistral_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Core of the change: the active model is a third-party backend, but a
+    # Mistral provider with a key is still configured. We MUST call whoami and
+    # capture the real plan for telemetry / GrowthBook — while suppressing the
+    # account UI (no plan shown) because the active model is not Mistral.
+    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    base_config = build_test_vibe_config()
+    active = base_config.get_active_provider()
+    generic = active.model_copy(update={"backend": Backend.GENERIC})
+    mistral = active.model_copy(
+        update={"name": "mistral-extra", "backend": Backend.MISTRAL}
+    )
+    config = base_config.model_copy(update={"providers": [generic, mistral]})
+    agent_loop = build_test_agent_loop(config=config)
+    gateway = FakeAccountGateway(
+        WhoAmIResult(plan_type=AccountPlanKind.CHAT, plan_name="INDIVIDUAL")
+    )
+
+    try:
+        account = await AccountController(agent_loop, gateway).read()
+    finally:
+        await agent_loop.aclose()
+
+    # UI suppressed for the non-Mistral active model ...
+    assert account.status is AccountStatus.UNAVAILABLE
+    assert account.plan is None
+    # ... but whoami WAS called and telemetry captured the real plan.
+    assert len(gateway.calls) == 1
+    assert agent_loop.user_plan == "Pro"
+
+
+@pytest.mark.asyncio
+async def test_account_reconcile_keeps_request_provider_when_active_model_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    base_config = build_test_vibe_config()
+    mistral_provider = base_config.get_active_provider().model_copy(
+        update={"api_base": "https://old.mistral.example/v1"}
+    )
+    anthropic_provider = ProviderConfig(
+        name="foundry-anthropic",
+        api_base="https://foundry.example/anthropic",
+        api_key_env_var="ANTHROPIC_API_KEY",
+        api_style="anthropic",
+        extra_headers={"x-user": "test-user"},
+    )
+    anthropic_model = ModelConfig(
+        name="claude-sonnet", provider=anthropic_provider.name, alias="sonnet"
+    )
+    config = build_test_vibe_config(
+        active_model=base_config.get_active_model().alias,
+        providers=[mistral_provider, anthropic_provider],
+        models=[base_config.get_active_model(), anthropic_model],
+    )
+    agent_loop = build_test_agent_loop(config=config)
+    request_started = asyncio.Event()
+    release_response = asyncio.Event()
+
+    class DelayedGateway:
+        async def read(
+            self, *, base_url: str, api_key: str, timeout: float | None = None
+        ) -> WhoAmIResult:
+            request_started.set()
+            await release_response.wait()
+            return WhoAmIResult(
+                plan_type=AccountPlanKind.CHAT,
+                plan_name="TEAM",
+                api_base="https://api.mistral.ai",
+            )
+
+    persisted_providers: list[ProviderConfig] = []
+
+    async def capture_provider(
+        _orchestrator, provider: ProviderConfig, *, reason: str
+    ) -> bool:
+        persisted_providers.append(provider)
+        return True
+
+    monkeypatch.setattr(
+        "vibe.app_server._account.apply_provider_to_config", capture_provider
+    )
+    read_task = asyncio.create_task(
+        AccountController(agent_loop, DelayedGateway()).read()
+    )
+
+    try:
+        await request_started.wait()
+        await agent_loop.config_orchestrator.set_field(
+            "/active_model", "sonnet", target_layer=OverridesLayer.NAME
+        )
+        release_response.set()
+        account = await read_task
+    finally:
+        release_response.set()
+        if not read_task.done():
+            read_task.cancel()
+        await agent_loop.aclose()
+
+    assert account.status is AccountStatus.UNAVAILABLE
+    assert len(persisted_providers) == 1
+    assert persisted_providers[0].name == mistral_provider.name
+    assert persisted_providers[0].api_base == "https://api.mistral.ai/v1"
+    assert agent_loop.config.get_active_provider() == anthropic_provider
+
+
+@pytest.mark.asyncio
+async def test_account_read_warms_cross_session_whoami_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A successful live account fetch writes through to the user-scoped on-disk
+    # cache so the next session's experiments path can read it without another
+    # round-trip.
+    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    agent_loop = build_test_agent_loop()
+    result = WhoAmIResult(plan_type=AccountPlanKind.CHAT, plan_name="INDIVIDUAL")
+    gateway = FakeAccountGateway(result)
+
+    try:
+        await AccountController(agent_loop, gateway).read()
+    finally:
+        await agent_loop.aclose()
+
+    assert load_cached_whoami("server-secret") == result
+
+
+@pytest.mark.asyncio
+async def test_account_read_reconciles_manager_attributes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The experiments path may have stamped the manager snapshot from a stale
+    # disk-cache hit (plan=FREE). The account controller's live fetch must
+    # reconcile the whoami-derived fields (plan/customer/org-kind) AND user_plan
+    # so they never diverge — while preserving identity-derived fields.
+    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    agent_loop = build_test_agent_loop()
+    agent_loop.experiment_manager.set_attributes(
+        ExperimentAttributes(
+            userId="u1",
+            organizationId="org-1",
+            entrypoint="cli",
+            harness=ExperimentSurface.LEGACY,
+            agent_version="0",
+            os="darwin",
+            planType="chat",
+            planName="FREE",
+        )
+    )
+    gateway = FakeAccountGateway(
+        WhoAmIResult(
+            plan_type=AccountPlanKind.API,
+            plan_name="PAY_AS_YOU_GO",
+            customer_id="cust-1",
+            organization_kind="C",
+        )
+    )
+
+    try:
+        await AccountController(agent_loop, gateway).read()
+    finally:
+        await agent_loop.aclose()
+
+    attrs = agent_loop.experiment_manager.attributes()
+    assert attrs is not None
+    # whoami-derived fields updated to the live result ...
+    assert attrs.planType == "api"
+    assert attrs.planName == "PAY_AS_YOU_GO"
+    assert attrs.customerId == "cust-1"
+    assert attrs.organizationKind == "C"
+    # ... identity-derived fields preserved.
+    assert attrs.organizationId == "org-1"
+    assert attrs.userId == "u1"
+    assert agent_loop.user_plan == "PAYG API"
+
+
+@pytest.mark.asyncio
+async def test_apply_account_whoami_wins_over_in_flight_experiments() -> None:
+    # Race guard (Bugbot): a background experiments/plan resolve that finishes
+    # with a stale value must not clobber the account's live reconcile.
+    # apply_account_whoami awaits the in-flight task first, then writes last.
+    agent_loop = build_test_agent_loop()
+
+    async def stale_experiments() -> None:
+        # Simulates the experiments path committing a snapshot from a stale hit.
+        agent_loop.experiment_manager.set_attributes(
+            ExperimentAttributes(
+                userId="u1",
+                organizationId="org-1",
+                entrypoint="cli",
+                harness=ExperimentSurface.LEGACY,
+                agent_version="0",
+                os="darwin",
+                planType="chat",
+                planName="FREE",
+            )
+        )
+        agent_loop.set_user_plan("Free")
+
+    agent_loop._experiments_task = asyncio.create_task(stale_experiments())
+    try:
+        await agent_loop.apply_account_whoami(
+            console_base_url="https://console.test",
+            api_key="server-secret",
+            whoami=WhoAmIResult(
+                plan_type=AccountPlanKind.API,
+                plan_name="PAY_AS_YOU_GO",
+                customer_id="cust-1",
+                organization_kind="C",
+            ),
+        )
+    finally:
+        await agent_loop.aclose()
+
+    attrs = agent_loop.experiment_manager.attributes()
+    assert attrs is not None
+    # The account's live values won, despite the stale task finishing first.
+    assert attrs.planType == "api"
+    assert attrs.planName == "PAY_AS_YOU_GO"
+    assert attrs.organizationId == "org-1"  # identity preserved from the snapshot
+    assert agent_loop.user_plan == "PAYG API"
+
+
+@pytest.mark.asyncio
+async def test_account_read_unauthorized_clears_stale_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A rejected credential (401/403) must drop any cached plan: user_plan -> None,
+    # manager plan fields -> None, and the disk cache entry removed — otherwise a
+    # stale plan keeps flowing for the TTL, contradicting null=lookup-failed.
+    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    agent_loop = build_test_agent_loop()
+    agent_loop.experiment_manager.set_attributes(
+        ExperimentAttributes(
+            userId="u1",
+            organizationId="org-1",
+            entrypoint="cli",
+            harness=ExperimentSurface.LEGACY,
+            agent_version="0",
+            os="darwin",
+            planType="chat",
+            planName="INDIVIDUAL",
+        )
+    )
+    agent_loop.set_user_plan("Pro")
+    store_cached_whoami(
+        "server-secret",
+        WhoAmIResult(plan_type=AccountPlanKind.CHAT, plan_name="INDIVIDUAL"),
+    )
+    gateway = FakeAccountGateway(unauthorized=True)
+
+    try:
+        account = await AccountController(agent_loop, gateway).read()
+    finally:
+        await agent_loop.aclose()
+
+    assert account.status is AccountStatus.UNAUTHORIZED
+    # Plan telemetry cleared to the failure signal ...
     assert agent_loop.user_plan is None
+    attrs = agent_loop.experiment_manager.attributes()
+    assert attrs is not None
+    assert attrs.planName is None
+    assert attrs.planType is None
+    assert attrs.organizationId == "org-1"  # identity-derived fields preserved
+    # ... and the stale disk cache entry is gone.
+    assert load_cached_whoami("server-secret") is None
 
 
 @pytest.mark.asyncio
@@ -258,7 +545,6 @@ async def test_account_read_uses_latest_server_config_and_key(
             [runtime_provider.model_copy(update={"api_key_env_var": "SECOND_KEY"})],
             target_layer=OverridesLayer.NAME,
         )
-        agent_loop.agent_manager.invalidate_config()
         account = await controller.read()
     finally:
         await agent_loop.aclose()
@@ -387,3 +673,186 @@ def test_account_wire_models_reject_extra_fields() -> None:
             "sessionId": "session",
             "apiKey": "client-secret",
         })
+
+
+class _ReconcileSpies:
+    """Records what reconcile_tenant_domains asks the persistence layer to do."""
+
+    def __init__(self) -> None:
+        self.provider_calls: list[str] = []  # captured api_base per call
+        self.vibe_calls: list[str] = []
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from vibe.app_server import _account as account_module
+
+        async def _fake_apply_provider_to_config(
+            _orchestrator, provider, *, reason: str
+        ) -> bool:
+            self.provider_calls.append(provider.api_base)
+            return True
+
+        async def _fake_apply_vibe_base_url(
+            _orchestrator, vibe_base_url, *, reason: str
+        ) -> bool:
+            self.vibe_calls.append(vibe_base_url)
+            return True
+
+        monkeypatch.setattr(
+            account_module, "apply_provider_to_config", _fake_apply_provider_to_config
+        )
+        monkeypatch.setattr(
+            account_module, "apply_vibe_base_url", _fake_apply_vibe_base_url
+        )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_tenant_domains_noop_when_domains_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spies = _ReconcileSpies()
+    spies.install(monkeypatch)
+    agent_loop = build_test_agent_loop()
+    try:
+        await reconcile_tenant_domains(
+            agent_loop.config_orchestrator,
+            WhoAmIResult(plan_type=AccountPlanKind.API, plan_name="FREE"),
+            provider_name=agent_loop.config.get_active_provider().name,
+        )
+    finally:
+        await agent_loop.aclose()
+
+    assert spies.provider_calls == []
+    assert spies.vibe_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_tenant_domains_noop_when_values_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spies = _ReconcileSpies()
+    spies.install(monkeypatch)
+
+    from vibe.core.config import DEFAULT_PROVIDERS
+
+    provider = DEFAULT_PROVIDERS[0].model_copy(
+        update={"api_base": "https://api.tenant.corp/v1"}
+    )
+    config = build_test_vibe_config(
+        vibe_base_url="https://chat.tenant.corp", providers=[provider]
+    )
+    agent_loop = build_test_agent_loop(config=config)
+    try:
+        await reconcile_tenant_domains(
+            agent_loop.config_orchestrator,
+            WhoAmIResult(
+                plan_type=AccountPlanKind.API,
+                plan_name="FREE",
+                api_base="https://api.tenant.corp",
+                vibe_base="https://chat.tenant.corp",
+            ),
+            provider_name=agent_loop.config.get_active_provider().name,
+        )
+    finally:
+        await agent_loop.aclose()
+
+    assert spies.provider_calls == []
+    assert spies.vibe_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_tenant_domains_patches_api_base_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spies = _ReconcileSpies()
+    spies.install(monkeypatch)
+    agent_loop = build_test_agent_loop()
+    try:
+        await reconcile_tenant_domains(
+            agent_loop.config_orchestrator,
+            WhoAmIResult(
+                plan_type=AccountPlanKind.API,
+                plan_name="FREE",
+                api_base="https://api.tenant.corp",
+            ),
+            provider_name=agent_loop.config.get_active_provider().name,
+        )
+    finally:
+        await agent_loop.aclose()
+
+    assert spies.provider_calls == ["https://api.tenant.corp/v1"]
+    assert spies.vibe_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_tenant_domains_patches_chat_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spies = _ReconcileSpies()
+    spies.install(monkeypatch)
+    agent_loop = build_test_agent_loop()
+    try:
+        await reconcile_tenant_domains(
+            agent_loop.config_orchestrator,
+            WhoAmIResult(
+                plan_type=AccountPlanKind.API,
+                plan_name="FREE",
+                vibe_base="https://chat.tenant.corp",
+            ),
+            provider_name=agent_loop.config.get_active_provider().name,
+        )
+    finally:
+        await agent_loop.aclose()
+
+    assert spies.provider_calls == []
+    assert spies.vibe_calls == ["https://chat.tenant.corp"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_tenant_domains_still_reconciles_chat_when_provider_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spies = _ReconcileSpies()
+    spies.install(monkeypatch)
+    agent_loop = build_test_agent_loop()
+    try:
+        await reconcile_tenant_domains(
+            agent_loop.config_orchestrator,
+            WhoAmIResult(
+                plan_type=AccountPlanKind.API,
+                plan_name="FREE",
+                api_base="https://api.tenant.corp",
+                vibe_base="https://chat.tenant.corp",
+            ),
+            provider_name="removed-provider",
+        )
+    finally:
+        await agent_loop.aclose()
+
+    assert spies.provider_calls == []  # api branch skipped
+    assert spies.vibe_calls == ["https://chat.tenant.corp"]  # chat still ran
+
+
+@pytest.mark.asyncio
+async def test_reconcile_tenant_domains_rejects_non_https_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-HTTPS or path-traversal URLs from /whoami must not be persisted."""
+    spies = _ReconcileSpies()
+    spies.install(monkeypatch)
+    agent_loop = build_test_agent_loop()
+    try:
+        await reconcile_tenant_domains(
+            agent_loop.config_orchestrator,
+            WhoAmIResult(
+                plan_type=AccountPlanKind.API,
+                plan_name="FREE",
+                api_base="http://api.tenant.corp",
+                vibe_base="http://chat.tenant.corp",
+            ),
+            provider_name=agent_loop.config.get_active_provider().name,
+        )
+    finally:
+        await agent_loop.aclose()
+
+    assert spies.provider_calls == []
+    assert spies.vibe_calls == []

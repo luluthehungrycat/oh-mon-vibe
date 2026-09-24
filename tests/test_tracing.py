@@ -303,7 +303,7 @@ class TestSpanHierarchy:
 
 class TestGenericModelCallSpan:
     BASE_URL = "https://api.fireworks.ai"
-    MODEL_NAME = "accounts/fireworks/models/glm-4p5"
+    MODEL_NAME = "accounts/fireworks/models/mistral-test"
 
     @staticmethod
     def _provider(base_url: str = BASE_URL) -> ProviderConfig:
@@ -319,7 +319,7 @@ class TestGenericModelCallSpan:
         return ModelConfig(
             name=TestGenericModelCallSpan.MODEL_NAME,
             provider="fireworks",
-            alias="glm-4p5",
+            alias="mistral-test",
         )
 
     @staticmethod
@@ -327,8 +327,17 @@ class TestGenericModelCallSpan:
         return [LLMMessage(role=Role.user, content="Just say hi")]
 
     @classmethod
-    def _backend(cls) -> tuple[GenericBackend, ModelConfig]:
-        return GenericBackend(provider=cls._provider(), enable_otel=True), cls._model()
+    def _backend(
+        cls, *, retry_max_elapsed_time: float = 300.0
+    ) -> tuple[GenericBackend, ModelConfig]:
+        return (
+            GenericBackend(
+                provider=cls._provider(),
+                enable_otel=True,
+                retry_max_elapsed_time=retry_max_elapsed_time,
+            ),
+            cls._model(),
+        )
 
     @staticmethod
     def _chat_response(
@@ -608,7 +617,7 @@ class TestGenericModelCallSpan:
     async def test_generic_streaming_http_error_records_http_status(
         self, _otel_provider: _CollectingExporter
     ) -> None:
-        backend, model = self._backend()
+        backend, model = self._backend(retry_max_elapsed_time=0.0)
 
         with respx.mock(base_url=self.BASE_URL) as mock_api:
             mock_api.post(CHAT_COMPLETIONS_PATH).mock(
@@ -634,9 +643,16 @@ class TestGenericModelCallSpan:
 
     @pytest.mark.asyncio
     async def test_generic_streaming_request_error_omits_retried_http_status(
-        self, _otel_provider: _CollectingExporter
+        self, _otel_provider: _CollectingExporter, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        backend, model = self._backend()
+        now = [0.0]
+        monkeypatch.setattr("vibe.core.utils.retry.time.monotonic", lambda: now[0])
+
+        async def advance_clock(seconds: float) -> None:
+            now[0] += seconds
+
+        monkeypatch.setattr("vibe.core.utils.retry.asyncio.sleep", advance_clock)
+        backend, model = self._backend(retry_max_elapsed_time=1.0)
 
         with respx.mock(base_url=self.BASE_URL) as mock_api:
             mock_api.post(CHAT_COMPLETIONS_PATH).mock(

@@ -22,6 +22,10 @@ PR #1 established an internal plugin registry and safety-aware analyzer boundary
 
 - None.
 
-## Impact
-
-This is primarily a specification, contract-test, and documentation change around `vibe/core/plugins`, safety analyzers, sandbox interfaces, and future adapter boundaries. It must not weaken the merged deterministic safety precedence or claim process isolation until an isolating runtime exists.
+This is primarily a specification, contract-test, and documentation change
+around `vibe/core/plugins`, safety analyzers, sandbox interfaces, and future
+adapter boundaries. Adapter mappings, fixture requirements, review evidence,
+and SDK exit criteria live in the change artifacts; owner review remains
+required before any SDK implementation proposal. It must not weaken the
+merged deterministic safety precedence or claim process isolation until an
+isolating runtime exists.

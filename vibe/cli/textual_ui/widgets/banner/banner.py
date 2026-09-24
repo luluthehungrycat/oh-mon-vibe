@@ -28,10 +28,11 @@ class BannerState:
     mcp_servers_enabled: int = 0
     mcp_servers_total: int = 0
     connectors_connected: int = 0
-    connectors_total: int = 0
+    connectors_total: int | None = None
     skills_count: int = 0
     hooks_count: int = 0
     plan_description: str | None = None
+    experimental_harness: bool = False
 
 
 class Banner(Static):
@@ -39,13 +40,17 @@ class Banner(Static):
 
     def __init__(
         self,
-        config: ConfigView,
+        config: ConfigView | None,
         skills_count: int,
         mcp: MCPState | None = None,
+        *,
+        mcp_servers_total: int = 0,
+        mcp_servers_enabled: int = 0,
         connectors_connected: int = 0,
-        connectors_total: int = 0,
+        connectors_total: int | None = None,
         hooks_count: int = 0,
         model_pending: bool = False,
+        experimental_harness: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -54,13 +59,16 @@ class Banner(Static):
             config=config,
             skills_count=skills_count,
             mcp=mcp,
+            mcp_servers_total=mcp_servers_total,
+            mcp_servers_enabled=mcp_servers_enabled,
             connectors_connected=connectors_connected,
             connectors_total=connectors_total,
             hooks_count=hooks_count,
             plan_description=None,
             model_pending=model_pending,
+            experimental_harness=experimental_harness,
         )
-        self._animated = not config.disable_welcome_banner_animation
+        self._animated = not (config is None or config.disable_welcome_banner_animation)
 
     def compose(self) -> ComposeResult:
         with VerticalGroup(id="banner-container"):
@@ -100,77 +108,98 @@ class Banner(Static):
         if self._animated:
             self.query_one(LeLynx).freeze_animation()
 
-    def set_state(
+    def set_state(  # noqa: PLR0913
         self,
-        config: ConfigView,
+        config: ConfigView | None,
         skills_count: int,
         mcp: MCPState | None = None,
+        *,
+        mcp_servers_total: int = 0,
+        mcp_servers_enabled: int = 0,
         connectors_connected: int = 0,
-        connectors_total: int = 0,
+        connectors_total: int | None = None,
         hooks_count: int = 0,
         plan_description: str | None = None,
         model_pending: bool = False,
+        experimental_harness: bool = False,
     ) -> None:
         self.state = self._build_state(
             config=config,
             skills_count=skills_count,
             mcp=mcp,
+            mcp_servers_total=mcp_servers_total,
+            mcp_servers_enabled=mcp_servers_enabled,
             connectors_connected=connectors_connected,
             connectors_total=connectors_total,
             hooks_count=hooks_count,
             plan_description=plan_description,
             model_pending=model_pending,
+            experimental_harness=experimental_harness,
         )
 
     @staticmethod
-    def _build_state(
-        config: ConfigView,
+    def _build_state(  # noqa: PLR0913
+        config: ConfigView | None,
         skills_count: int,
         mcp: MCPState | None = None,
+        *,
+        mcp_servers_total: int = 0,
+        mcp_servers_enabled: int = 0,
         connectors_connected: int = 0,
-        connectors_total: int = 0,
+        connectors_total: int | None = None,
         hooks_count: int = 0,
         plan_description: str | None = None,
         model_pending: bool = False,
+        experimental_harness: bool = False,
     ) -> BannerState:
-        servers = (
-            []
-            if mcp is None
-            else [
+        if config is None:
+            return BannerState()
+        if mcp is not None:
+            servers = [
                 source for source in mcp.sources if source.kind is MCPSourceKind.SERVER
             ]
-        )
-        enabled_servers = [
-            source
-            for source in servers
-            if source.status is not MCPSourceStatus.DISABLED
-        ]
+            enabled_servers = [
+                source
+                for source in servers
+                if source.status is not MCPSourceStatus.DISABLED
+            ]
+            mcp_enabled = len(enabled_servers)
+            mcp_total = len(servers)
+        else:
+            mcp_enabled = mcp_servers_enabled
+            mcp_total = mcp_servers_total
         active_model = config.active_model
+        suffix = " · unified harness" if experimental_harness else ""
         return BannerState(
-            active_model=f"{active_model.alias}[{active_model.thinking}]",
+            active_model=f"{active_model.display_name}[{active_model.thinking}]{suffix}",
             model_pending=model_pending,
             models_count=len(config.models),
-            mcp_servers_enabled=len(enabled_servers),
-            mcp_servers_total=len(servers),
+            mcp_servers_enabled=mcp_enabled,
+            mcp_servers_total=mcp_total,
             connectors_connected=connectors_connected,
             connectors_total=connectors_total,
             skills_count=skills_count,
             hooks_count=hooks_count,
             plan_description=plan_description,
+            experimental_harness=experimental_harness,
         )
 
     def _format_meta_counts(self) -> str:
+        if self.state.models_count == 0:
+            return ""
         parts = [_pluralize(self.state.models_count, "model")]
-        # Format as x/y for MCP servers and connectors (only when enabled != total)
-        if self.state.connectors_total > 0:
-            if self.state.connectors_connected != self.state.connectors_total:
-                connector_str = (
-                    f"{self.state.connectors_connected}/{self.state.connectors_total} connector"
-                    + ("s" if self.state.connectors_total != 1 else "")
-                )
-            else:
-                connector_str = _pluralize(self.state.connectors_connected, "connector")
+        # `None` means the total is unknown (pre-session cold path); `0` is a
+        # real zero-connector session and must not be shown as unknown.
+        if self.state.connectors_total is None:
+            parts.append(f"{self.state.connectors_connected}/? connector")
+        elif self.state.connectors_connected != self.state.connectors_total:
+            connector_str = (
+                f"{self.state.connectors_connected}/{self.state.connectors_total} connector"
+                + ("s" if self.state.connectors_total != 1 else "")
+            )
             parts.append(connector_str)
+        else:
+            parts.append(_pluralize(self.state.connectors_connected, "connector"))
         # Always show MCP servers count (even if 0/0)
         if self.state.mcp_servers_enabled != self.state.mcp_servers_total:
             mcp_str = (

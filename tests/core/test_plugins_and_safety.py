@@ -3,11 +3,17 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 import time
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
-from vibe.core.plugins import PluginManifest, PluginRegistry
+from vibe.core.plugins import (
+    PLUGIN_CAPABILITIES,
+    PluginManifest,
+    PluginRegistry,
+    discover_plugins,
+)
+import vibe.core.plugins.registry as plugin_registry
 from vibe.core.safety.llm import LLMAnalyzer
 from vibe.core.safety.policy import (
     CommandDecision,
@@ -21,11 +27,18 @@ from vibe.core.tools.base import BaseToolState, ToolPermission
 from vibe.core.tools.builtins.bash import Bash, BashArgs, BashToolConfig
 
 
-def test_plugin_manifest_requires_supported_api() -> None:
+def test_plugin_manifest_requires_supported_contract() -> None:
     manifest = PluginManifest("demo", "1.0", "1", "analyzer")
     manifest.validate()
     with pytest.raises(ValueError, match="unsupported plugin API"):
         replace(manifest, api_version="999").validate()
+    with pytest.raises(ValueError, match="unsupported plugin capabilities"):
+        replace(manifest, capabilities=frozenset({"network"})).validate()
+    with pytest.raises(ValueError, match="not valid for plugin kind"):
+        replace(manifest, capabilities=frozenset({"sandbox_backend"})).validate()
+    with pytest.raises(ValueError, match="process-isolated plugins are unsupported"):
+        replace(manifest, trust="process_isolated").validate()
+    assert PLUGIN_CAPABILITIES == frozenset({"analyzer", "sandbox_backend"})
 
 
 def test_registry_rejects_duplicate_plugins() -> None:
@@ -40,6 +53,62 @@ def test_registry_rejects_duplicate_plugins() -> None:
     registry.register_plugin(Plugin())
     with pytest.raises(ValueError, match="duplicate plugin"):
         registry.register_plugin(Plugin())
+
+
+def test_plugin_discovery_records_registration_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenEntryPoint:
+        name = "broken"
+
+        def load(self) -> object:
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        plugin_registry, "entry_points", lambda **kwargs: [BrokenEntryPoint()]
+    )
+
+    registry = discover_plugins({"broken"})
+
+    assert registry.manifests == {}
+    assert len(registry.diagnostics) == 1
+    diagnostic = registry.diagnostics[0]
+    assert diagnostic.plugin == "broken"
+    assert diagnostic.event == "registration_failed"
+    assert diagnostic.reason == "boom"
+    assert diagnostic.trust == "trusted_in_process"
+    assert diagnostic.isolation == "in_process"
+
+
+def test_plugin_discovery_records_manifest_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InvalidPlugin:
+        manifest = PluginManifest(
+            "invalid", "1.0", "1", "analyzer", frozenset({"sandbox_backend"})
+        )
+
+        def register(self, registry: PluginRegistry) -> None:
+            raise AssertionError("invalid plugin must not register")
+
+    class InvalidEntryPoint:
+        name = "invalid"
+
+        def load(self) -> object:
+            return InvalidPlugin()
+
+    monkeypatch.setattr(
+        plugin_registry, "entry_points", lambda **kwargs: [InvalidEntryPoint()]
+    )
+
+    registry = discover_plugins({"invalid"})
+
+    assert registry.manifests == {}
+    assert len(registry.diagnostics) == 1
+    diagnostic = registry.diagnostics[0]
+    assert diagnostic.plugin == "invalid"
+    assert diagnostic.event == "manifest_rejected"
+    assert "not valid for plugin kind" in diagnostic.reason
 
 
 def test_advisory_analyzer_cannot_override_core_deny() -> None:
@@ -145,6 +214,23 @@ def test_firejail_argv_is_not_shell_interpolated() -> None:
     assert argv[-4:] == ["--", "/bin/sh", "-lc", "printf '%s' 'hello; touch /tmp/nope'"]
 
 
+@pytest.mark.parametrize(
+    ("network", "network_flag", "network_isolation"),
+    [("none", "--net=none", True), ("host", None, False)],
+)
+def test_firejail_argv_applies_network_policy(
+    network: Literal["none", "host"], network_flag: str | None, network_isolation: bool
+) -> None:
+    backend = FirejailBackend("/usr/bin/firejail", network=network)
+    argv = backend.build_argv("printf hello", Path("/repo"))
+
+    if network_flag is None:
+        assert "--net=none" not in argv
+    else:
+        assert argv[4] == network_flag
+    assert backend.capabilities().network_isolation is network_isolation
+
+
 def test_bubblewrap_argv_mounts_only_writable_worktree() -> None:
     backend = BubblewrapBackend("/usr/bin/bwrap")
     argv = backend.build_argv("printf '%s' 'hello'", Path("/repo"))
@@ -171,6 +257,23 @@ def test_bubblewrap_argv_mounts_only_writable_worktree() -> None:
     assert argv[-4:] == ["--", "/bin/sh", "-lc", "printf '%s' 'hello'"]
 
 
+@pytest.mark.parametrize(
+    ("network", "network_flag", "network_isolation"),
+    [("none", "--unshare-net", True), ("host", None, False)],
+)
+def test_bubblewrap_argv_applies_network_policy(
+    network: Literal["none", "host"], network_flag: str | None, network_isolation: bool
+) -> None:
+    backend = BubblewrapBackend("/usr/bin/bwrap", network=network)
+    argv = backend.build_argv("printf hello", Path("/repo"))
+
+    if network_flag is None:
+        assert "--unshare-net" not in argv
+    else:
+        assert argv[20] == network_flag
+    assert backend.capabilities().network_isolation is network_isolation
+
+
 def test_auto_prefers_bubblewrap_when_available() -> None:
     config = BashToolConfig.model_validate({"safety": {"sandbox": "auto"}})
     tool = Bash(config_getter=lambda: config, state=BaseToolState())
@@ -187,6 +290,8 @@ def test_safety_config_round_trips_and_validates() -> None:
     assert config.safety.fallback == "unsandboxed"
     with pytest.raises(ValueError):
         BashToolConfig.model_validate({"safety": {"sandbox": "unsafe"}})
+    with pytest.raises(ValueError):
+        BashToolConfig.model_validate({"safety": {"network": "project"}})
 
 
 def test_unavailable_sandbox_requires_approval_by_default() -> None:

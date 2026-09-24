@@ -19,7 +19,13 @@ from vibe.core.tools.base import (
 from vibe.core.tools.io_port import ToolIOPort
 from vibe.core.tools.permissions import PermissionContext
 from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
-from vibe.core.tools.utils import resolve_file_tool_permission
+from vibe.core.tools.utils import (
+    DEFAULT_SENSITIVE_PATTERNS,
+    ToolPath,
+    display_file_path,
+    resolve_file_tool_permission,
+    resolve_tool_path,
+)
 from vibe.core.types import ToolResultEvent, ToolStreamEvent
 from vibe.utils.io import (
     ReadSafeResult,
@@ -32,7 +38,7 @@ from vibe.utils.tool_presentation import ToolEffectKind
 
 
 class EditArgs(BaseModel):
-    file_path: str = Field(description="The absolute path to the file to modify")
+    file_path: ToolPath = Field(description="The absolute path to the file to modify")
     old_string: str = Field(description="The text to replace")
     new_string: str = Field(
         description="The text to replace it with (must be different from old_string)"
@@ -68,7 +74,7 @@ class EditResult(BaseModel):
 class EditConfig(BaseToolConfig):
     permission: ToolPermission = ToolPermission.ASK
     sensitive_patterns: list[str] = Field(
-        default=["**/.env", "**/.env.*"],
+        default_factory=lambda: list(DEFAULT_SENSITIVE_PATTERNS),
         description="File patterns that trigger ASK even when permission is ALWAYS.",
     )
 
@@ -87,8 +93,7 @@ class Edit(
             denylist=self.config.denylist,
             config_permission=self.config.permission,
             sensitive_patterns=self.config.sensitive_patterns,
-            cwd=self.cwd,
-            project_roots=self.harness_files.project_roots,
+            workspace=self.workspace,
             scratchpad_dir=self.scratchpad_dir,
         )
 
@@ -98,14 +103,15 @@ class Edit(
     @classmethod
     def format_call_display(cls, args: EditArgs) -> ToolCallDisplay:
         suffix = "(scratchpad)" if is_scratchpad_display_path(args.file_path) else ""
+        shown = display_file_path(args.file_path)
         return ToolCallDisplay(
-            summary=f"Editing {Path(args.file_path).name}",
+            summary=f"Editing {shown}",
             content=f"old_string: {args.old_string!r}\nnew_string: {args.new_string!r}",
             suffix=suffix,
             verb="Editing",
-            message=Path(args.file_path).name,
+            message=shown,
             settled_verb="Edited",
-            settled_message=Path(args.file_path).name,
+            settled_message=shown,
         )
 
     @classmethod
@@ -117,7 +123,7 @@ class Edit(
             return ToolResultDisplay(
                 success=True,
                 verb="Edited",
-                message=Path(event.result.file).name,
+                message=display_file_path(event.result.file),
                 suffix=suffix,
             )
         return ToolResultDisplay(
@@ -250,10 +256,7 @@ class Edit(
                 "No changes to make — old_string and new_string are identical"
             )
 
-        file_path = Path(file_path_str).expanduser()
-        if not file_path.is_absolute():
-            file_path = self.cwd / file_path
-        file_path = file_path.resolve()
+        file_path = resolve_tool_path(file_path_str, self.cwd)
 
         if not file_path.exists():
             raise ToolError(f"File does not exist: {file_path}")

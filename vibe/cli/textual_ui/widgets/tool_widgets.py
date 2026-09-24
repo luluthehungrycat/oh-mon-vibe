@@ -4,18 +4,21 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 import re
-from typing import ClassVar
+from typing import Annotated, Any, ClassVar
 
-from pydantic import BaseModel, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.content import Content
+from textual.message import Message
 from textual.widget import Widget
-from textual.widgets import Markdown, Static
+from textual.widgets import Static
+from textual.worker import Worker
 
 from vibe.app_server.models import (
     EffectDetail,
-    FileEditEffectInput as FileEditInput,
+    FileEditEffectBatchInput as FileEditBatchInput,
+    FileEditEffectInput as SingleFileEditInput,
     FileEditEffectOutput as FileEditOutput,
     FileReadEffectInput as FileReadInput,
     FileReadEffectOutput as FileReadOutput,
@@ -36,9 +39,10 @@ from vibe.app_server.models import (
 from vibe.cli.textual_ui.widgets.diff_rendering import (
     DiffOccurrence,
     DiffView,
+    edit_diff_batch_inputs,
     edit_diff_inputs,
     language_for_path,
-    render_edit_diff,
+    render_edit_diff_async,
 )
 from vibe.cli.textual_ui.widgets.links import LinkStatic, link_content
 from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
@@ -57,7 +61,7 @@ _ANSI_ESCAPE = re.compile(
 _CONTROL_BYTES = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
-def _clean_output(content: str) -> str:
+def clean_output(content: str) -> str:
     """Sanitize captured command output for terminal-safe display.
 
     Command output (e.g. uv's in-place progress bars) carries ANSI escapes,
@@ -65,13 +69,17 @@ def _clean_output(content: str) -> str:
     straight to the terminal (it does not strip ESC), corrupting the display,
     and scrolling emits a different slice so the glitches shift. Collapse each
     ``\\r``-redrawn line to its final state and strip escape/control bytes.
+
+    Mirrors the webview's ``collapseCarriageReturns``: a trailing ``\\r`` only
+    parks the cursor at column 0, so the line it sits on stands until something
+    overwrites it.
     """
-    content = content.replace("\r\n", "\n")
     cleaned: list[str] = []
-    for line in content.split("\n"):
-        if "\r" in line:
-            line = line.rsplit("\r", 1)[-1]
-        cleaned.append(_CONTROL_BYTES.sub("", _ANSI_ESCAPE.sub("", line)))
+    for line in content.replace("\r\n", "\n").split("\n"):
+        written = line.rstrip("\r")
+        cleaned.append(
+            _CONTROL_BYTES.sub("", _ANSI_ESCAPE.sub("", written.rsplit("\r", 1)[-1]))
+        )
     return "\n".join(cleaned)
 
 
@@ -125,6 +133,15 @@ class ToolApprovalWidget[TArgs: BaseModel](Vertical):
 
 
 class ToolResultWidget[TResult: BaseModel](Static):
+    class BorderColorsChanged(Message):
+        def __init__(self, result_widget: ToolResultWidget[Any]) -> None:
+            self.result_widget = result_widget
+            super().__init__()
+
+        @property
+        def control(self) -> ToolResultWidget[Any]:
+            return self.result_widget
+
     # When True the whole result collapses into a one-line header; when False it
     # is always rendered in full (used by diff-style results like edit/write).
     COLLAPSIBLE: ClassVar[bool] = True
@@ -135,12 +152,14 @@ class ToolResultWidget[TResult: BaseModel](Static):
         success: bool,
         message: str,
         warnings: list[str] | None = None,
+        approval_note: str | None = None,
     ) -> None:
         super().__init__()
         self.result = result
         self.success = success
         self.message = message
         self.warnings = warnings or []
+        self.approval_note = approval_note
         self.border_row_colors: dict[int, str] = {}
         self.add_class("tool-result-widget")
 
@@ -148,18 +167,37 @@ class ToolResultWidget[TResult: BaseModel](Static):
         if extra:
             yield NoMarkupStatic(extra, classes="tool-result-hint")
 
+    def _advisories(self) -> list[tuple[str, str]]:
+        # Shown at the top of the unfolded body, as (text, css class). The
+        # approval note says the call was allowed to run, so it must not carry
+        # the warning glyph.
+        advisories: list[tuple[str, str]] = []
+        if self.approval_note:
+            advisories.append((self.approval_note, "tool-result-approval-note"))
+        advisories.extend(
+            (f"⚠ {warning}", "tool-result-warning") for warning in self.warnings
+        )
+        return advisories
+
+    def _yield_advisories(self) -> Iterable[Widget]:
+        for text, classes in self._advisories():
+            yield NoMarkupStatic(text, classes=classes)
+
     def _yield_text(
         self, content: str, *, classes: str = "tool-result-detail"
     ) -> Iterable[Widget]:
-        cleaned = _clean_output(content.strip("\n"))
+        cleaned = clean_output(content.strip("\n"))
         if cleaned:
             yield NoMarkupStatic(cleaned, classes=classes)
 
     def _yield_markdown(self, content: str, *, ext: str) -> Iterable[Widget]:
         if content:
+            from textual.widgets import Markdown
+
             yield Markdown(_fenced_code_block(content.strip("\n"), ext))
 
     def compose(self) -> ComposeResult:
+        yield from self._yield_advisories()
         if self.result:
             lines = [
                 f"{field_name}: {value}"
@@ -174,6 +212,7 @@ class ToolResultWidget[TResult: BaseModel](Static):
 
 class GenericToolResultWidget(ToolResultWidget[GenericToolData]):
     def compose(self) -> ComposeResult:
+        yield from self._yield_advisories()
         if self.result and (text := _format_generic_result(self.result.data)):
             yield from self._yield_text(text)
         yield from self._footer()
@@ -195,23 +234,112 @@ def _format_generic_value(value: JsonValue) -> str:
     return str(value)
 
 
+class ProcessToolOutput(BaseModel):
+    """Typed output extracted from the process tool result envelope."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    tool_name: str
+    process_id: Annotated[str | None, Field(default=None, alias="processId")]
+    status: str | None = None
+    exit_code: Annotated[int | None, Field(default=None, alias="exitCode")]
+    output: str | None = None
+    bytes_available: Annotated[int | None, Field(default=None, alias="bytesAvailable")]
+    has_more: Annotated[bool, Field(default=False, alias="hasMore")]
+    truncated_before: Annotated[bool, Field(default=False, alias="truncatedBefore")]
+    processes: list[dict[str, Any]] | None = None
+    bytes_written: Annotated[int | None, Field(default=None, alias="bytesWritten")]
+
+
+_SHORT_PID_LEN = 8
+
+
+def _short_pid(process_id: str) -> str:
+    return (
+        process_id[-_SHORT_PID_LEN:] if len(process_id) > _SHORT_PID_LEN else process_id
+    )
+
+
+class ProcessResultWidget(ToolResultWidget[ProcessToolOutput]):
+    def compose(self) -> ComposeResult:
+        if not self.result:
+            yield from self._footer()
+            return
+        r = self.result
+        if r.tool_name in {"process.start", "process.stop"}:
+            yield from self._compose_start_stop(r)
+        elif r.tool_name == "process.output":
+            yield from self._compose_output(r)
+        elif r.tool_name == "process.list":
+            yield from self._compose_list(r)
+        elif r.tool_name == "process.write":
+            yield from self._compose_write(r)
+        else:
+            yield from self._footer()
+
+    def _compose_start_stop(self, r: ProcessToolOutput) -> ComposeResult:
+        lines: list[str] = []
+        if r.process_id:
+            lines.append(f"processId: {r.process_id}")
+        if r.status:
+            lines.append(f"status: {r.status}")
+        if r.exit_code is not None:
+            lines.append(f"exitCode: {r.exit_code}")
+        if lines:
+            yield from self._yield_text("\n".join(lines))
+        yield from self._footer()
+
+    def _compose_output(self, r: ProcessToolOutput) -> ComposeResult:
+        if r.output and r.output.strip():
+            yield from self._yield_text(r.output)
+        else:
+            yield NoMarkupStatic("(no output)", classes="tool-result-detail")
+        hints: list[str] = []
+        if r.bytes_available is not None and r.bytes_available > 0:
+            hints.append(f"{r.bytes_available} bytes available")
+        if r.has_more:
+            hints.append("more output pending")
+        if r.truncated_before:
+            hints.append("earlier output truncated")
+        yield from self._footer(" | ".join(hints) if hints else None)
+
+    def _compose_list(self, r: ProcessToolOutput) -> ComposeResult:
+        if r.processes:
+            lines = [
+                f"{_short_pid(p.get('processId', ''))}  {p.get('status', '?')}  {p.get('command', '?')}"
+                for p in r.processes
+            ]
+            yield from self._yield_text("\n".join(lines))
+        else:
+            yield NoMarkupStatic(
+                "(no background processes)", classes="tool-result-detail"
+            )
+        yield from self._footer()
+
+    def _compose_write(self, r: ProcessToolOutput) -> ComposeResult:
+        lines: list[str] = []
+        if r.bytes_written is not None:
+            lines.append(f"bytesWritten: {r.bytes_written}")
+        if r.status:
+            lines.append(f"status: {r.status}")
+        if lines:
+            yield from self._yield_text("\n".join(lines))
+        yield from self._footer()
+
+
 class BashApprovalWidget(ToolApprovalWidget[ShellInput]):
     def compose(self) -> ComposeResult:
+        from textual.widgets import Markdown
+
         yield Markdown(_fenced_code_block(self.args.command, "bash"))
 
 
 class BashResultWidget(ToolResultWidget[ShellOutput]):
     def _collapsed_output(self) -> str:
-        if not self.result:
-            return ""
-        parts: list[str] = []
-        if self.result.stdout:
-            parts.append(self.result.stdout.strip("\n"))
-        if self.result.stderr:
-            parts.append(self.result.stderr.strip("\n"))
-        return "\n".join(parts)
+        return self.result.transcript.strip("\n") if self.result else ""
 
     def compose(self) -> ComposeResult:
+        yield from self._yield_advisories()
         if not self.result:
             yield from self._footer()
             return
@@ -225,6 +353,8 @@ class BashResultWidget(ToolResultWidget[ShellOutput]):
 
 class WriteFileApprovalWidget(ToolApprovalWidget[FileWriteInput]):
     def compose(self) -> ComposeResult:
+        from textual.widgets import Markdown
+
         yield NoMarkupStatic(
             f"File: {self.args.file_path}", classes="approval-description"
         )
@@ -240,6 +370,7 @@ class WriteFileResultWidget(ToolResultWidget[FileWriteOutput]):
     COLLAPSIBLE = False
 
     def compose(self) -> ComposeResult:
+        yield from self._yield_advisories()
         if not self.result:
             yield from self._footer()
             return
@@ -250,72 +381,168 @@ class WriteFileResultWidget(ToolResultWidget[FileWriteOutput]):
         yield from self._footer()
 
 
+type FileEditInput = SingleFileEditInput | FileEditBatchInput
+
+
 class EditApprovalWidget(ToolApprovalWidget[FileEditInput]):
-    _diff_container: Vertical
+    def __init__(self, args: FileEditInput) -> None:
+        super().__init__(args)
+        self._diff_view = DiffView([], ansi=False, dark=True)
+        self._occurrences: list[DiffOccurrence] | None = None
+        self._requested_render_theme: tuple[bool, bool] | None = None
+        self._render_worker: Worker[None] | None = None
 
     def compose(self) -> ComposeResult:
         yield NoMarkupStatic(
             f"File: {self.args.file_path}", classes="approval-description"
         )
         yield NoMarkupStatic("")
-        self._diff_container = Vertical(classes="diff-scroll")
-        yield self._diff_container
+        yield Vertical(self._diff_view, classes="diff-scroll")
 
-        if self.args.replace_all:
+        if isinstance(self.args, SingleFileEditInput) and self.args.replace_all:
             yield NoMarkupStatic("(replace_all)", classes="approval-description")
+        elif isinstance(self.args, FileEditBatchInput):
+            yield NoMarkupStatic(
+                f"({len(self.args.changes)} ordered changes)",
+                classes="approval-description",
+            )
 
     async def on_mount(self) -> None:
         # Approximate: queued edits ahead of this one may shift the real lines.
-        occurrences = await edit_diff_inputs(
-            self.args.file_path,
-            self.args.old_string,
-            self.args.new_string,
-            replace_all=self.args.replace_all,
-        )
-        ansi = self.app.native_ansi_color
-        dark = self.app.current_theme.dark
-        lines = render_edit_diff(
-            occurrences, language_for_path(self.args.file_path), ansi=ansi, dark=dark
-        )
-        await self._diff_container.mount(DiffView(lines, ansi=ansi, dark=dark))
+        if isinstance(self.args, FileEditBatchInput):
+            self._occurrences = await edit_diff_batch_inputs(
+                self.args.file_path,
+                [
+                    (change.old_string, change.new_string, change.replace_all)
+                    for change in self.args.changes
+                ],
+            )
+        else:
+            self._occurrences = await edit_diff_inputs(
+                self.args.file_path,
+                self.args.old_string,
+                self.args.new_string,
+                replace_all=self.args.replace_all,
+            )
+        if self.is_attached:
+            ansi, dark = self._requested_render_theme or (
+                self.app.native_ansi_color,
+                self.app.current_theme.dark,
+            )
+            self.request_diff_render(ansi=ansi, dark=dark)
+
+    def request_diff_render(self, *, ansi: bool, dark: bool) -> Worker[None] | None:
+        self._diff_view.set_render_mode(ansi=ansi, dark=dark)
+        self._requested_render_theme = (ansi, dark)
+        if self._occurrences is None:
+            return None
+        if self._render_worker is None or self._render_worker.is_finished:
+            self._render_worker = self.run_worker(
+                self._drain_diff_renders(), group="edit-diff-render"
+            )
+        return self._render_worker
+
+    async def _drain_diff_renders(self) -> None:
+        rendered_theme: tuple[bool, bool] | None = None
+        while self.is_attached and rendered_theme != self._requested_render_theme:
+            rendered_theme = self._requested_render_theme
+            if rendered_theme is None or self._occurrences is None:
+                return
+            ansi, dark = rendered_theme
+            lines = await render_edit_diff_async(
+                self._occurrences,
+                language_for_path(self.args.file_path),
+                ansi=ansi,
+                dark=dark,
+            )
+            if rendered_theme != self._requested_render_theme:
+                continue
+            self._diff_view.set_render_data(lines, ansi=ansi, dark=dark)
 
 
 class EditResultWidget(ToolResultWidget[FileEditOutput]):
     COLLAPSIBLE = False
 
+    def __init__(
+        self,
+        result: FileEditOutput | None,
+        success: bool,
+        message: str,
+        warnings: list[str] | None = None,
+        approval_note: str | None = None,
+    ) -> None:
+        super().__init__(result, success, message, warnings, approval_note)
+        self._diff_view = DiffView([], ansi=False, dark=True)
+        self._requested_render_theme: tuple[bool, bool] | None = None
+        self._render_worker: Worker[None] | None = None
+        if result is None:
+            self._occurrences = []
+        elif result.occurrences:
+            self._occurrences = [
+                DiffOccurrence(item.start_line, item.old_text, item.new_text)
+                for item in result.occurrences
+            ]
+        elif result.old_string is not None and result.new_string is not None:
+            self._occurrences = [
+                DiffOccurrence(None, result.old_string, result.new_string)
+            ]
+        else:
+            self._occurrences = []
+
     def compose(self) -> ComposeResult:
         if not self.result:
             yield from self._footer()
             return
-        warnings = [
-            NoMarkupStatic(f"⚠ {w}", classes="tool-result-warning")
-            for w in self.warnings
-        ]
-        occurrences = [
-            DiffOccurrence(item.start_line, item.old_text, item.new_text)
-            for item in self.result.occurrences
-        ] or [DiffOccurrence(None, self.result.old_string, self.result.new_string)]
-        ansi = self.app.native_ansi_color
-        dark = self.app.current_theme.dark
-        diff = DiffView(
-            render_edit_diff(
-                occurrences, language_for_path(self.result.file), ansi=ansi, dark=dark
-            ),
-            ansi=ansi,
-            dark=dark,
-        )
-        # Border rows sit below the warning lines, so shift the diff's own row
-        # colors down by the number of warnings.
-        self.border_row_colors = {
-            len(warnings) + row: color for row, color in diff.border_row_colors.items()
-        }
         # Wrap the diff in a horizontal-scroll container so wide lines can be
         # scrolled instead of clipped (overflow-x is `auto`, so the scrollbar
         # only shows when a line overruns the width). For a diff taller than the
         # viewport the bar sits at the bottom -- the same trade-off write_file's
         # code fence makes -- but that beats silently truncating long lines.
-        yield Vertical(*warnings, diff, classes="diff-scroll")
+        yield Vertical(
+            *self._yield_advisories(), self._diff_view, classes="diff-scroll"
+        )
         yield from self._footer()
+
+    def on_mount(self) -> None:
+        self.request_diff_render(
+            ansi=self.app.native_ansi_color, dark=self.app.current_theme.dark
+        )
+
+    def request_diff_render(self, *, ansi: bool, dark: bool) -> Worker[None] | None:
+        self._diff_view.set_render_mode(ansi=ansi, dark=dark)
+        self._requested_render_theme = (ansi, dark)
+        if not self.result:
+            return None
+        if self._render_worker is None or self._render_worker.is_finished:
+            self._render_worker = self.run_worker(
+                self._drain_diff_renders(), group="edit-diff-render"
+            )
+        return self._render_worker
+
+    async def _drain_diff_renders(self) -> None:
+        rendered_theme: tuple[bool, bool] | None = None
+        while self.is_attached and rendered_theme != self._requested_render_theme:
+            rendered_theme = self._requested_render_theme
+            if rendered_theme is None or not self.result:
+                return
+            ansi, dark = rendered_theme
+            lines = await render_edit_diff_async(
+                self._occurrences,
+                language_for_path(self.result.file),
+                ansi=ansi,
+                dark=dark,
+            )
+            if rendered_theme != self._requested_render_theme:
+                continue
+            self._diff_view.set_render_data(lines, ansi=ansi, dark=dark)
+            # Border rows sit below the advisory lines, so shift the diff's own
+            # row colors down by however many were rendered.
+            advisory_count = len(self._advisories())
+            self.border_row_colors = {
+                advisory_count + row: color
+                for row, color in self._diff_view.border_row_colors.items()
+            }
+            self.post_message(self.BorderColorsChanged(self))
 
 
 class TodoApprovalWidget(ToolApprovalWidget[TodoInput]):
@@ -380,8 +607,7 @@ class ReadResultWidget(ToolResultWidget[FileReadOutput]):
         if not self.result:
             yield from self._footer()
             return
-        for warning in self.warnings:
-            yield NoMarkupStatic(f"⚠ {warning}", classes="tool-result-warning")
+        yield from self._yield_advisories()
         if self.result.content:
             ext = Path(self.result.file_path).suffix.lstrip(".") or "text"
             yield from self._yield_markdown(
@@ -404,8 +630,7 @@ class GrepApprovalWidget(ToolApprovalWidget[FileSearchInput]):
 
 class GrepResultWidget(ToolResultWidget[FileSearchOutput]):
     def compose(self) -> ComposeResult:
-        for warning in self.warnings:
-            yield NoMarkupStatic(f"⚠ {warning}", classes="tool-result-warning")
+        yield from self._yield_advisories()
         if not self.result or not self.result.matches:
             yield from self._footer()
             return
@@ -498,6 +723,9 @@ EFFECT_WIDGETS: dict[ToolEffectKind, EffectWidgets] = {
     ToolEffectKind.WEB_FETCH: EffectWidgets(
         output_model=WebFetchOutput, result=WebFetchResultWidget, linkify_result=True
     ),
+    ToolEffectKind.PROCESS: EffectWidgets(
+        output_model=ProcessToolOutput, result=ProcessResultWidget
+    ),
 }
 
 
@@ -517,6 +745,7 @@ def get_result_widget(
     success: bool,
     message: str,
     warnings: list[str] | None = None,
+    approval_note: str | None = None,
 ) -> ToolResultWidget:
     widgets = EFFECT_WIDGETS.get(detail.kind, EffectWidgets())
     if result is None:
@@ -525,7 +754,7 @@ def get_result_widget(
         parsed = widgets.output_model.model_validate(result)
     else:
         parsed = GenericToolData(data=result)
-    return widgets.result(parsed, success, message, warnings)
+    return widgets.result(parsed, success, message, warnings, approval_note)
 
 
 def linkify_effect_result(detail: EffectDetail) -> bool:

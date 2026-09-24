@@ -4,14 +4,18 @@ from datetime import UTC, datetime, timedelta
 from typing import cast
 
 import pytest
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal
 from textual.content import Content
 from textual.widgets import OptionList
+from textual.widgets.option_list import Option
 
-from vibe.app_server.models import SavedSessionSummary
+from vibe.app_server.models import IdleSessionStatus, PublicSession, SavedSessionSummary
 from vibe.cli.textual_ui.widgets.session_picker import (
     SessionPickerApp,
     _format_relative_time,
 )
+from vibe.cli.textual_ui.widgets.spinner_text import SpinnerText
 
 
 @pytest.fixture
@@ -47,10 +51,35 @@ def sample_latest_messages() -> dict[str, str]:
     }
 
 
+def public_session(session_id: str, updated_at: int) -> PublicSession:
+    return PublicSession(
+        id=session_id,
+        status=IdleSessionStatus(),
+        created_at=updated_at,
+        updated_at=updated_at,
+        cwd="/test",
+    )
+
+
 def assert_delete_state(picker: SessionPickerApp, *, kind: str, option_id: str) -> None:
     assert picker._delete_state is not None
     assert picker._delete_state.kind == kind
     assert picker._delete_state.option_id == option_id
+
+
+class _SessionPickerTestApp(App[None]):
+    def __init__(self, picker: SessionPickerApp) -> None:
+        super().__init__()
+        self._picker = picker
+        self.highlighted_session_ids: list[str | None] = []
+
+    def compose(self) -> ComposeResult:
+        yield self._picker
+
+    def on_session_picker_app_session_highlighted(
+        self, event: SessionPickerApp.SessionHighlighted
+    ) -> None:
+        self.highlighted_session_ids.append(event.session_id)
 
 
 class TestFormatRelativeTime:
@@ -135,6 +164,49 @@ class TestSessionPickerAppInit:
 
         empty_picker = SessionPickerApp(sessions=[], latest_messages={})
         assert empty_picker.has_sessions is False
+
+    @pytest.mark.asyncio
+    async def test_loading_spinner_stops_when_sessions_arrive(self) -> None:
+        picker = SessionPickerApp(sessions=[], latest_messages={}, loading=True)
+        session = public_session("loaded-session", 1_000)
+
+        async with _SessionPickerTestApp(picker).run_test() as pilot:
+            loading = picker.query_one("#sessionpicker-loading", Horizontal)
+            spinner = loading.query_one(SpinnerText)
+            assert loading.display is True
+            assert spinner._timer is not None
+
+            picker.load_sessions([session], {session.id: "Loaded session"})
+            await pilot.pause()
+
+            assert loading.display is False
+            assert spinner._timer is None
+            assert picker.has_sessions is True
+
+    @pytest.mark.asyncio
+    async def test_rapid_navigation_previews_only_the_final_session(
+        self,
+        sample_sessions: list[SavedSessionSummary],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "vibe.cli.textual_ui.widgets.session_picker._PREVIEW_DEBOUNCE_SECONDS", 0.5
+        )
+        picker = SessionPickerApp(
+            sessions=sample_sessions, latest_messages={}, current_session_id="session-a"
+        )
+        app = _SessionPickerTestApp(picker)
+
+        async with app.run_test() as pilot:
+            await pilot.pause(0.15)
+            app.highlighted_session_ids.clear()
+
+            await pilot.press("down", "down")
+            await pilot.pause(0.05)
+            assert app.highlighted_session_ids == []
+
+            await pilot.pause(0.5)
+            assert app.highlighted_session_ids == ["session-c"]
 
 
 class TestSessionPickerMessages:
@@ -350,6 +422,7 @@ class TestSessionPickerSessionRemoval:
         )
         option_list = FakeOptionList(highlighted_option_id="session-a")
         monkeypatch.setattr(picker, "query_one", lambda _selector: option_list)
+        monkeypatch.setattr(picker, "_schedule_preview", lambda _session_id: None)
         picker.action_request_delete()
 
         picker.on_option_list_option_highlighted(
@@ -373,6 +446,7 @@ class TestSessionPickerSessionRemoval:
         )
         option_list = FakeOptionList(highlighted_option_id="session-c")
         monkeypatch.setattr(picker, "query_one", lambda _selector: option_list)
+        monkeypatch.setattr(picker, "_schedule_preview", lambda _session_id: None)
         picker.action_request_delete()
 
         picker.on_option_list_option_highlighted(
@@ -449,15 +523,18 @@ class TestSessionPickerSessionRemoval:
         )
         option_list = FakeOptionList(highlighted_option_id="session-a")
         monkeypatch.setattr(picker, "query_one", lambda _selector: option_list)
+        monkeypatch.setattr(picker, "_schedule_preview", lambda _session_id: None)
         picker.action_request_delete()
         assert_delete_state(picker, kind="confirmation", option_id="session-a")
 
         assert picker.remove_session("session-a") is True
 
-        assert [session.option_id for session in picker._sessions] == [
-            "session-b",
-            "session-c",
-        ]
+        assert [
+            session.session_id
+            if isinstance(session, SavedSessionSummary)
+            else session.id
+            for session in picker._sessions
+        ] == ["session-b", "session-c"]
         assert "session-a" not in picker._latest_messages
         assert picker._delete_state is None
         assert option_list.removed_option_ids == ["session-a"]
@@ -479,6 +556,105 @@ class TestSessionPickerSessionRemoval:
         assert picker._sessions == sample_sessions
         assert picker._latest_messages == sample_latest_messages
         assert option_list.removed_option_ids == []
+
+
+class TestSessionPickerPublicSessions:
+    def test_public_session_renders_selects_and_deletes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        session = public_session(
+            "public-session-id",
+            int((datetime.now(UTC) - timedelta(minutes=5)).timestamp() * 1000),
+        )
+        picker = SessionPickerApp(
+            sessions=[session], latest_messages={session.id: "Public session message"}
+        )
+        option_list = FakeOptionList(highlighted_option_id=session.id)
+        posted_messages: list[object] = []
+        monkeypatch.setattr(picker, "query_one", lambda _selector: option_list)
+        monkeypatch.setattr(picker, "post_message", posted_messages.append)
+        monkeypatch.setattr(picker, "_schedule_preview", lambda _session_id: None)
+
+        prompt = picker._normal_option_text(session)
+        assert "5m ago" in prompt.plain
+        assert "public-s" in prompt.plain
+        assert "Public session message" in prompt.plain
+
+        picker.on_option_list_option_selected(
+            cast(OptionList.OptionSelected, FakeOptionEvent(session.id))
+        )
+        picker.action_request_delete()
+        picker.action_request_delete()
+
+        selected, delete_requested = posted_messages
+        assert isinstance(selected, SessionPickerApp.SessionSelected)
+        assert selected.session_id == session.id
+        assert isinstance(delete_requested, SessionPickerApp.SessionDeleteRequested)
+        assert delete_requested.session_id == session.id
+        assert picker.remove_session(session.id) is True
+        assert picker.has_sessions is False
+        assert option_list.removed_option_ids == [session.id]
+
+    def test_add_sessions_deduplicates_sorts_and_preserves_highlight(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        now = datetime.now(UTC)
+        existing = public_session(
+            "existing-session", int((now - timedelta(hours=1)).timestamp() * 1000)
+        )
+        newer = public_session("new-session", int(now.timestamp() * 1000))
+        duplicate = public_session(
+            existing.id, int((now - timedelta(minutes=30)).timestamp() * 1000)
+        )
+        picker = SessionPickerApp(
+            sessions=[existing], latest_messages={existing.id: "Existing message"}
+        )
+        option_list = FakeOptionList(highlighted_option_id=existing.id)
+        monkeypatch.setattr(picker, "query_one", lambda _selector: option_list)
+        monkeypatch.setattr(picker, "_refresh_header", lambda: None)
+
+        picker.add_sessions(
+            [duplicate, newer],
+            {existing.id: "Updated existing message", newer.id: "New message"},
+        )
+
+        assert all(isinstance(session, PublicSession) for session in picker._sessions)
+        assert [cast(PublicSession, session).id for session in picker._sessions] == [
+            newer.id,
+            existing.id,
+        ]
+        assert picker._latest_messages == {
+            existing.id: "Updated existing message",
+            newer.id: "New message",
+        }
+        assert option_list.clear_count == 1
+        assert option_list.added_option_ids == [newer.id, existing.id]
+        assert option_list.highlighted == 1
+
+
+class TestUnmountedPickerGuard:
+    """load_sessions and add_sessions must be no-ops when the picker has been
+    removed from the DOM (e.g. the user closed it while sessions were still
+    loading asynchronously).  Previously these methods called query_one(OptionList)
+    on the unmounted widget and crashed with NoMatches.
+    """
+
+    def test_load_sessions_noop_when_unmounted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        session = public_session("unmounted-load", 1_000)
+        picker = SessionPickerApp(sessions=[], latest_messages={})
+        assert not picker.is_mounted
+
+        def _boom(_selector: object) -> OptionList:
+            raise AssertionError("query_one must not run on an unmounted picker")
+
+        monkeypatch.setattr(picker, "query_one", _boom)
+
+        # Should not raise; the OptionList is never queried.
+        picker.load_sessions([session], {session.id: "msg"})
+
+        assert picker._sessions == []
 
 
 class FakeOption:
@@ -504,11 +680,20 @@ class FakeOptionList:
             if highlighted_option_id is not None
             else None
         )
+        self.highlighted: int | None = None
         self.removed_option_ids: list[str] = []
         self.replaced_prompts: list[ReplacedPrompt] = []
+        self.clear_count = 0
+        self.added_option_ids: list[str] = []
 
     def remove_option(self, option_id: str) -> None:
         self.removed_option_ids.append(option_id)
 
     def replace_option_prompt(self, option_id: str, prompt: Content) -> None:
         self.replaced_prompts.append(ReplacedPrompt(option_id, prompt))
+
+    def clear_options(self) -> None:
+        self.clear_count += 1
+
+    def add_options(self, options: list[Option]) -> None:
+        self.added_option_ids.extend(str(option.id) for option in options)
