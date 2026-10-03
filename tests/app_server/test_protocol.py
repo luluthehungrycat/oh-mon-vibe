@@ -2,27 +2,37 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
 
 from pydantic import ValidationError
 import pytest
 
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
-from tests.stubs.app_server import build_test_app_server
+from tests.stubs.app_server import build_test_app_server, legacy_backend
+from vibe.app_server._dispatch import DispatchResult
+from vibe.app_server._session_backend_port import (
+    SessionBackendError,
+    SessionBackendResult,
+)
 from vibe.app_server.client import AppServerClient, AppServerConnectionClosed
+from vibe.app_server.models import PublicTurn, PublicTurnStatus
 from vibe.app_server.protocol import (
     AppServerResponseError,
     CallbackCallResponse,
     ClientCapabilities,
     ClientInfo,
     JsonPatchOperation,
+    JsonRpcErrorResponse,
     JsonRpcProtocolError,
-    JsonRpcSuccessResponse,
+    ProtocolError,
     ProtocolErrorCode,
+    ServerRequest,
     SessionUpdatedParams,
+    TurnStartResponse,
     validate_json_rpc_envelope,
 )
-from vibe.app_server.server import CallbackDelivery
+from vibe.app_server.server import CallbackDelivery, InitializationState
 from vibe.app_server.transport import memory_transport_pair
 from vibe.core.config import SessionLoggingConfig
 
@@ -58,15 +68,7 @@ async def test_client_rejects_snake_case_response_fields() -> None:
     await peer_transport.send({
         "jsonrpc": "2.0",
         "id": request["id"],
-        "result": {
-            "server_info": {"name": "test-server", "version": "1"},
-            "protocol_version": "1",
-            "capabilities": {
-                "methods": [],
-                "callback_kinds": [],
-                "transports": ["in_process"],
-            },
-        },
+        "result": {"server_info": {"name": "test-server", "version": "1"}},
     })
 
     with pytest.raises(ValidationError):
@@ -123,6 +125,52 @@ async def test_client_accepts_late_response_to_cancelled_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_response_boundary_is_ordered_without_blocking_nested_requests() -> None:
+    client_transport, peer_transport = memory_transport_pair()
+    client = AppServerClient(client_transport)
+    observed: list[str] = []
+
+    async def consume() -> None:
+        incoming = client.incoming()
+        before = await anext(incoming)
+        observed.append(before.method)
+        assert await client.request("test/resync") == {"resynced": True}
+        observed.append("resynced")
+        after = await anext(incoming)
+        observed.append(after.method)
+        await incoming.aclose()
+
+    consumer = asyncio.create_task(consume())
+    request = asyncio.create_task(
+        client.request(
+            "test/resume", response_boundary=lambda _result: observed.append("adopted")
+        )
+    )
+    resume_request = await anext(peer_transport.messages())
+    await peer_transport.send({"jsonrpc": "2.0", "method": "test/before", "params": {}})
+    await peer_transport.send({
+        "jsonrpc": "2.0",
+        "id": resume_request["id"],
+        "result": {"resumed": True},
+    })
+
+    nested_request = await asyncio.wait_for(anext(peer_transport.messages()), timeout=1)
+    assert nested_request["method"] == "test/resync"
+    await peer_transport.send({
+        "jsonrpc": "2.0",
+        "id": nested_request["id"],
+        "result": {"resynced": True},
+    })
+    await peer_transport.send({"jsonrpc": "2.0", "method": "test/after", "params": {}})
+
+    assert await asyncio.wait_for(request, timeout=1) == {"resumed": True}
+    await asyncio.wait_for(consumer, timeout=1)
+    assert observed == ["test/before", "resynced", "adopted", "test/after"]
+    await client.close()
+    await peer_transport.close()
+
+
+@pytest.mark.asyncio
 async def test_server_rejects_unknown_response_id() -> None:
     client_transport, server_transport = memory_transport_pair()
     agent_loop = build_test_agent_loop()
@@ -142,24 +190,178 @@ async def test_server_rejects_unknown_response_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_late_callback_delivery_ack_is_valid_after_semantic_answer() -> None:
+async def test_late_callback_delivery_error_is_ignored_after_semantic_answer() -> None:
     client_transport, server_transport = memory_transport_pair()
     agent_loop = build_test_agent_loop()
     server = build_test_app_server(agent_loop, server_transport)
     server._callback_requests[7] = CallbackDelivery(
-        session_id=agent_loop.session_id, callback_id="callback-1", answered=True
+        session_id=agent_loop.session_id, callback_id="callback-1"
     )
 
+    await server._after_response(
+        ServerRequest(
+            id="callback-result",
+            method="callback/result",
+            params={"result": {"callbackId": "callback-1"}},
+        ),
+        DispatchResult(response=CallbackCallResponse(callback_id="callback-1")),
+    )
+    assert server._callback_requests[7].answered
+
     await server._handle_response(
-        JsonRpcSuccessResponse(
+        JsonRpcErrorResponse(
             id=7,
-            result=CallbackCallResponse(callback_id="callback-1").model_dump(
-                mode="json", by_alias=True
+            error=ProtocolError(
+                code=ProtocolErrorCode.INTERNAL_ERROR, message="delivery failed"
             ),
         )
     )
 
     assert server._callback_requests == {}
+    await server.close()
+    await client_transport.close()
+    await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_compact_releases_deferred_events_after_its_error_response() -> (
+    None
+):
+    """*Prepare*: A compact backend that has a failed checkpoint buffered behind its error response.
+    *Do*: Dispatch the compact request.
+    *Assert*: The backend releases the checkpoint only once the error is written.
+    """
+
+    class FailingCompactBackend:
+        session_id = "session-1"
+
+        def guard_request(self) -> None:
+            return None
+
+        async def compact(self, _params: object) -> object:
+            raise SessionBackendError(
+                ProtocolErrorCode.COMPACTION_FAILED,
+                "Context compaction failed",
+                after_response=release_events,
+            )
+
+    # Prepare
+    client_transport, server_transport = memory_transport_pair()
+    agent_loop = build_test_agent_loop()
+    server = build_test_app_server(agent_loop, server_transport)
+    release_events = Mock()
+    server._root = cast(Any, FailingCompactBackend())
+    server._initialization = InitializationState.INITIALIZED
+
+    # Do
+    await server._handle_request_once(
+        ServerRequest(
+            id="compact", method="session/compact", params={"sessionId": "session-1"}
+        )
+    )
+
+    # Assert
+    response = await anext(client_transport.messages())
+    assert response["error"]["code"] == ProtocolErrorCode.COMPACTION_FAILED
+    release_events.assert_called_once_with()
+    server._root = None
+    await server.close()
+    await client_transport.close()
+    await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_response_write_failure_abandons_deferred_backend_work() -> None:
+    """An undelivered turn/start response releases its backend reservation."""
+
+    class DeferredStartBackend:
+        session_id = "session-1"
+
+        def guard_request(self) -> None:
+            return None
+
+        async def start_turn(self, _params: object) -> object:
+            return SessionBackendResult(
+                response=TurnStartResponse(
+                    turn=PublicTurn(
+                        id="turn-1",
+                        session_id=self.session_id,
+                        status=PublicTurnStatus.IN_PROGRESS,
+                        started_at=0,
+                    ),
+                    last_event_id=0,
+                ),
+                on_response_abandoned=abandon,
+            )
+
+    # Prepare
+    client_transport, server_transport = memory_transport_pair()
+    agent_loop = build_test_agent_loop()
+    server = build_test_app_server(agent_loop, server_transport)
+    abandon = Mock()
+    server._root = cast(Any, DeferredStartBackend())
+    server._initialization = InitializationState.INITIALIZED
+    server._send = AsyncMock(side_effect=ConnectionError("connection closed"))
+
+    # Do / Assert
+    with pytest.raises(ConnectionError, match="connection closed"):
+        await server._handle_request_once(
+            ServerRequest(
+                id="start",
+                method="turn/start",
+                params={
+                    "sessionId": "session-1",
+                    "message": [{"type": "text", "text": "hello"}],
+                },
+            )
+        )
+    abandon.assert_called_once_with()
+    server._root = None
+    await server.close()
+    await client_transport.close()
+    await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_compact_response_write_failure_abandons_deferred_events() -> None:
+    """*Prepare*: A failed compact whose error response cannot be written.
+    *Do*: Dispatch the compact request.
+    *Assert*: The backend discards the undeliverable checkpoint and releases its gate.
+    """
+
+    class FailingCompactBackend:
+        session_id = "session-1"
+
+        def guard_request(self) -> None:
+            return None
+
+        async def compact(self, _params: object) -> object:
+            raise SessionBackendError(
+                ProtocolErrorCode.COMPACTION_FAILED,
+                "Context compaction failed",
+                on_response_abandoned=abandon_events,
+            )
+
+    # Prepare
+    client_transport, server_transport = memory_transport_pair()
+    agent_loop = build_test_agent_loop()
+    server = build_test_app_server(agent_loop, server_transport)
+    abandon_events = Mock()
+    server._root = cast(Any, FailingCompactBackend())
+    server._initialization = InitializationState.INITIALIZED
+    server._send = AsyncMock(side_effect=ConnectionError("connection closed"))
+
+    # Do / Assert
+    with pytest.raises(ConnectionError, match="connection closed"):
+        await server._handle_request_once(
+            ServerRequest(
+                id="compact",
+                method="session/compact",
+                params={"sessionId": "session-1"},
+            )
+        )
+    abandon_events.assert_called_once_with()
+    server._root = None
     await server.close()
     await client_transport.close()
     await agent_loop.aclose()
@@ -221,10 +423,11 @@ async def test_shutdown_closes_root_and_transport_after_child_cleanup_failure() 
     client = AppServerClient(client_transport, run_peer=server.serve)
     await client.initialize(ClientInfo(name="test", version="1"))
     await client.notify("initialized")
-    await client.request("session/start", {"cwd": str(agent_loop.cwd)})
-    handler = server._handler
+    await client.request("session/start", {"agentConfig": {"cwd": str(agent_loop.cwd)}})
+    backend = legacy_backend(server)
+    handler = backend.handler
     handler.close = AsyncMock()
-    server._sessions.close = AsyncMock(side_effect=RuntimeError("child close failed"))
+    backend.children.close = AsyncMock(side_effect=RuntimeError("child close failed"))
     agent_loop.emit_session_closed_telemetry = Mock()
     agent_loop.aclose = AsyncMock()
     agent_loop.telemetry_client.aclose = AsyncMock()
@@ -260,12 +463,14 @@ async def test_session_close_records_pointer_before_responding(
         ),
     )
     record = Mock()
-    monkeypatch.setattr("vibe.app_server.server.last_session_pointer.record", record)
+    monkeypatch.setattr(
+        "vibe.app_server._legacy_session_runtime.last_session_pointer.record", record
+    )
 
     await client.initialize(ClientInfo(name="test", version="1"))
     await client.notify("initialized")
-    await client.request("session/start", {"cwd": str(agent_loop.cwd)})
-    await client.request("session/close", {"sessionId": agent_loop.session_id})
+    await client.request("session/start", {"agentConfig": {"cwd": str(agent_loop.cwd)}})
+    await client.request("session/stop", {"sessionId": agent_loop.session_id})
 
     record.assert_called_once_with(
         agent_loop.config.session_logging, agent_loop.session_id
@@ -288,12 +493,14 @@ async def test_session_close_does_not_record_unpersisted_pointer(
         ),
     )
     record = Mock()
-    monkeypatch.setattr("vibe.app_server.server.last_session_pointer.record", record)
+    monkeypatch.setattr(
+        "vibe.app_server._legacy_session_runtime.last_session_pointer.record", record
+    )
 
     await client.initialize(ClientInfo(name="test", version="1"))
     await client.notify("initialized")
-    await client.request("session/start", {"cwd": str(agent_loop.cwd)})
-    await client.request("session/close", {"sessionId": agent_loop.session_id})
+    await client.request("session/start", {"agentConfig": {"cwd": str(agent_loop.cwd)}})
+    await client.request("session/stop", {"sessionId": agent_loop.session_id})
 
     record.assert_not_called()
     await client.close()

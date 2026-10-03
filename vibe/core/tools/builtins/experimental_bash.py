@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-from collections.abc import AsyncGenerator, Collection
+from collections.abc import AsyncGenerator, AsyncIterator, Collection
+import contextlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import errno
@@ -17,13 +18,17 @@ import time
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, get_args
 import uuid
 
-from pydantic import AliasChoices, BaseModel, Field, model_validator
-from tree_sitter import Language, Node, Parser
-import tree_sitter_bash as tsbash
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    Field,
+    JsonValue,
+    computed_field,
+    model_validator,
+)
 
 from vibe.core.paths import VIBE_HOME
 from vibe.core.scratchpad import is_scratchpad_path
-from vibe.core.tools.arity import build_session_pattern
 from vibe.core.tools.base import (
     BaseTool,
     BaseToolConfig,
@@ -32,9 +37,24 @@ from vibe.core.tools.base import (
     ToolError,
     ToolPermission,
 )
-from vibe.core.tools.builtins.bash import BashToolConfig
+from vibe.core.tools.builtins._shell_command_policy import (
+    analyze_shell_command_policy,
+    git_repository_requires_approval,
+    path_candidates,
+)
+from vibe.core.tools.builtins._shell_permission_analysis import analyze_shell_command
+from vibe.core.tools.builtins.bash import (
+    BashToolConfig,
+    _expand_guardrail_commands,
+    _git_repository_permission_pattern,
+    _update_guardrail_cwds,
+    command_session_pattern,
+    needs_exact_command_scope,
+    scoped_command_parts,
+)
 from vibe.core.tools.builtins.managed_shell import backend as managed_shell_backend
 from vibe.core.tools.builtins.managed_shell.backend import (
+    UNKNOWN_EXIT_CODE,
     ManagedShellBackend,
     ManagedShellBackendError,
     ManagedTerminal,
@@ -45,10 +65,12 @@ from vibe.core.tools.permissions import (
     RequiredPermission,
 )
 from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
-from vibe.core.tools.utils import is_path_within_workdir
+from vibe.core.tools.utils import ToolPath, is_path_within_workdir, resolve_tool_path
 from vibe.core.types import ToolResultEvent, ToolStreamEvent
 from vibe.core.utils import is_windows
-from vibe.utils.io import decode_safe
+from vibe.core.workspace import Workspace
+from vibe.observability.logging import logger
+from vibe.utils.io import decode_console_safe
 from vibe.utils.tool_presentation import ToolEffectKind
 
 if TYPE_CHECKING:
@@ -65,6 +87,7 @@ DEFAULT_MAX_POLL_SECONDS = 300.0
 KILL_GRACE_SECONDS = 2.0
 FORCE_TERMINATION_TIMEOUT_SECONDS = 2.0
 READER_SELECT_SECONDS = 0.1
+FOREGROUND_STREAM_SECONDS = 0.2
 
 CONTROL_SEQUENCES: dict[str, bytes] = {
     "ctrl_@": b"\x00",
@@ -164,42 +187,8 @@ class SessionNotFoundError(ManagedShellError):
     pass
 
 
-@functools.lru_cache(maxsize=1)
-def _get_parser() -> Parser:
-    return Parser(Language(tsbash.language()))
-
-
 def _extract_commands(command: str) -> list[str]:
-    parser = _get_parser()
-    tree = parser.parse(command.encode("utf-8"))
-
-    commands: list[str] = []
-
-    def find_commands(node: Node) -> None:
-        if node.type == "command":
-            parts = []
-            for child in node.children:
-                if (
-                    child.type
-                    in {"command_name", "word", "string", "raw_string", "concatenation"}
-                    and child.text is not None
-                ):
-                    parts.append(child.text.decode("utf-8"))
-            # When a command has a heredoc (or other redirect), tree-sitter
-            # wraps it in a redirected_statement and the redirect is a sibling
-            # of the command node, not a child.  Without this check,
-            # `python3 << 'EOF'` is extracted as bare `python3` and
-            # incorrectly blocked by the standalone denylist.
-            if parts and node.parent and node.parent.type == "redirected_statement":
-                parts.append("<redirect>")
-            if parts:
-                commands.append(" ".join(parts))
-
-        for child in node.children:
-            find_commands(child)
-
-    find_commands(tree.root_node)
-    return commands
+    return list(analyze_shell_command(command).command_parts)
 
 
 def _get_shell_executable() -> str | None:
@@ -325,14 +314,13 @@ def _get_default_denylist_standalone() -> list[str]:
 _MUTATING_PATH_COMMANDS = {"cd", "chmod", "chown", "cp", "mkdir", "mv", "rm", "touch"}
 _PATH_COMMANDS = _MUTATING_PATH_COMMANDS | set(_READ_ONLY_COMMANDS_POSIX)
 
-_FIND_EXECUTION_PREDICATES = {"-exec", "-execdir", "-ok", "-okdir"}
-_MSYS_DRIVE_PATH_PREFIX_LEN = 2
-
 
 def _split_command_tokens(
-    command: str, *, preserve_backslashes: bool = False
+    command: str, *, preserve_backslashes: bool | None = None
 ) -> list[str]:
     try:
+        if preserve_backslashes is None:
+            preserve_backslashes = is_windows()
         if preserve_backslashes:
             lexer = shlex.shlex(command, posix=True)
             lexer.whitespace_split = True
@@ -353,30 +341,11 @@ def _looks_like_path(token: str) -> bool:
     )
 
 
-def _normalize_bash_path_token(token: str) -> str:
-    if not is_windows() or not token.startswith("/"):
-        return token
-    if len(token) < _MSYS_DRIVE_PATH_PREFIX_LEN:
-        return token
-
-    drive = token[1]
-    if not drive.isascii() or not drive.isalpha():
-        return token
-    if len(token) > _MSYS_DRIVE_PATH_PREFIX_LEN and token[
-        _MSYS_DRIVE_PATH_PREFIX_LEN
-    ] not in {"/", "\\"}:
-        return token
-
-    suffix = token[_MSYS_DRIVE_PATH_PREFIX_LEN:].replace("\\", "/")
-    return f"{drive.upper()}:{suffix or '/'}"
-
-
 def _collect_outside_dirs(
     command_parts: list[str],
     *,
     command_cwd: Path,
-    cwd: Path,
-    project_roots: list[Path],
+    workspace: Workspace,
     scratchpad_dir: Path | None,
     path_commands: Collection[str] = _PATH_COMMANDS,
     case_sensitive_commands: bool = True,
@@ -384,7 +353,7 @@ def _collect_outside_dirs(
 ) -> set[str]:
     dirs: set[str] = set()
     if not is_path_within_workdir(
-        str(command_cwd), cwd=cwd, project_roots=project_roots
+        str(command_cwd), workspace=workspace
     ) and not is_scratchpad_path(str(command_cwd), scratchpad_dir=scratchpad_dir):
         dirs.add(str(command_cwd))
 
@@ -394,33 +363,15 @@ def _collect_outside_dirs(
         if not command:
             continue
         command_name = command if case_sensitive_commands else command.lower()
-        if command_name not in path_commands:
-            continue
-        for token in tokens[1:]:
-            if token.startswith("-"):
-                continue
-            if command_name == "chmod" and token.startswith("+"):
-                continue
+        for token in path_candidates(
+            tokens, inspect_positional_paths=command_name in path_commands
+        ):
             if not _looks_like_path(token):
                 continue
 
-            path_token = _normalize_bash_path_token(token)
-            if path_token != token:
-                if is_path_within_workdir(
-                    path_token, cwd=cwd, project_roots=project_roots
-                ):
-                    continue
-                if is_scratchpad_path(path_token, scratchpad_dir=scratchpad_dir):
-                    continue
+            resolved = resolve_tool_path(token, command_cwd)
 
-            resolved = Path(path_token).expanduser()
-            if not resolved.is_absolute():
-                resolved = command_cwd / resolved
-            resolved = resolved.resolve()
-
-            if is_path_within_workdir(
-                str(resolved), cwd=cwd, project_roots=project_roots
-            ):
+            if is_path_within_workdir(str(resolved), workspace=workspace):
                 continue
             if is_scratchpad_path(str(resolved), scratchpad_dir=scratchpad_dir):
                 continue
@@ -503,7 +454,8 @@ def _now_iso(timestamp: float | None = None) -> str:
 
 
 def _decode_output(raw: bytes) -> str:
-    return decode_safe(raw, from_subprocess=True).text
+    # Verbatim, including CRLF: rewriting newlines would depend on where the window ends.
+    return decode_console_safe(raw)
 
 
 _UTF8_CONTINUATION_MIN = 0x80
@@ -539,6 +491,19 @@ def _trim_incomplete_utf8_suffix(raw: bytes) -> bytes:
             return raw[:-back]
         return raw
     return raw
+
+
+def _output_detail(output: str) -> str | None:
+    # The model needs the output spelled out; the client already streamed it.
+    return f"Output:\n{output}" if output else None
+
+
+def _clip_to_bytes(text: str, max_bytes: int) -> str:
+    raw = text.encode()
+    if len(raw) <= max_bytes:
+        return text
+    # A clip lands up to 3 bytes short of max_bytes to keep the last character whole.
+    return _trim_incomplete_utf8_suffix(raw[:max_bytes]).decode()
 
 
 def _skip_utf8_continuation_prefix(path: Path, cursor: int) -> int:
@@ -637,17 +602,6 @@ class TerminalSessionManager:
     def resolve_shell(self, requested: str | None, configured: str | None) -> str:
         return self._backend.resolve_shell(requested, configured)
 
-    def wait_for_exit(self, session_id: str, timeout_seconds: float) -> bool:
-        session = self._live_session(session_id)
-        deadline = time.monotonic() + timeout_seconds
-        with session.condition:
-            while session.status == "running":
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                session.condition.wait(timeout=remaining)
-            return True
-
     def write_stdin(self, session_id: str, text: str) -> int:
         return self.write_bytes(session_id, text.encode("utf-8"))
 
@@ -692,7 +646,7 @@ class TerminalSessionManager:
                 session.output_path,
                 cursor=cursor,
                 max_bytes=max_bytes,
-                trim_final_incomplete_utf8=info.status == "running",
+                more_output_expected=info.status == "running",
             )
             return info, chunk
 
@@ -707,7 +661,7 @@ class TerminalSessionManager:
             output_path,
             cursor=cursor,
             max_bytes=max_bytes,
-            trim_final_incomplete_utf8=info.status == "running",
+            more_output_expected=info.status == "running",
         )
         return info, chunk
 
@@ -808,7 +762,7 @@ class TerminalSessionManager:
             path,
             cursor=offset,
             max_bytes=max_bytes,
-            trim_final_incomplete_utf8=self._is_running_output_path(path),
+            more_output_expected=self._is_running_output_path(path),
         )
 
     def write_log_file(self, path: Path, *, action: LogAction, content: str) -> int:
@@ -896,7 +850,11 @@ class TerminalSessionManager:
             with session.condition:
                 if session.status == "running":
                     session.status = "completed"
-                session.exit_code = session.terminal.returncode
+                # The terminate above can leave the terminal unreaped.
+                returncode = session.terminal.returncode
+                session.exit_code = (
+                    UNKNOWN_EXIT_CODE if returncode is None else returncode
+                )
                 session.updated_at = time.time()
                 session.condition.notify_all()
                 self._save_manifest(session)
@@ -1120,7 +1078,7 @@ class TerminalSessionManager:
         *,
         cursor: int,
         max_bytes: int,
-        trim_final_incomplete_utf8: bool = False,
+        more_output_expected: bool = False,
     ) -> OutputChunk:
         if cursor < 0:
             raise ManagedShellError("cursor must be a non-negative byte offset")
@@ -1134,7 +1092,7 @@ class TerminalSessionManager:
         with path.open("rb") as handle:
             handle.seek(safe_cursor)
             raw = handle.read(max_bytes)
-        if trim_final_incomplete_utf8 or size > safe_cursor + len(raw):
+        if more_output_expected or size > safe_cursor + len(raw):
             raw = _trim_incomplete_utf8_suffix(raw)
         next_cursor = safe_cursor + len(raw)
         return OutputChunk(
@@ -1146,6 +1104,71 @@ class TerminalSessionManager:
     def _new_session_id(self) -> str:
         stamp = datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S")
         return f"{self.session_prefix}_{stamp}_{uuid.uuid4().hex[:8]}"
+
+
+class _ForegroundStream:
+    """Drained before any result is yielded, so "streamed" means "streamed whole"."""
+
+    def __init__(
+        self,
+        manager: TerminalSessionManager,
+        *,
+        session_id: str,
+        tool_name: str,
+        tool_call_id: str | None,
+        max_bytes: int,
+    ) -> None:
+        self._manager = manager
+        self._session_id = session_id
+        self._tool_name = tool_name
+        self._tool_call_id = tool_call_id
+        # Caps both a single read and the total; the result is read under it too.
+        self._max_bytes = max_bytes
+        self._budget = max_bytes
+        self._cursor = 0
+        self.completed = False
+
+    def _event(self, output: str) -> ToolStreamEvent | None:
+        if self._tool_call_id is None or self._budget <= 0:
+            return None
+        message = _clip_to_bytes(output, self._budget)
+        if not message:
+            return None
+        self._budget -= len(message.encode())
+        return ToolStreamEvent(
+            tool_name=self._tool_name, tool_call_id=self._tool_call_id, message=message
+        )
+
+    async def pump(self, *, timeout: float) -> AsyncGenerator[ToolStreamEvent, None]:
+        deadline = time.monotonic() + timeout
+        while not self.completed:
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                return
+            info, chunk = await asyncio.to_thread(
+                self._manager.read_output,
+                session_id=self._session_id,
+                cursor=self._cursor,
+                wait_seconds=min(remaining_seconds, FOREGROUND_STREAM_SECONDS),
+                max_bytes=self._max_bytes,
+            )
+            self._cursor = chunk.next_cursor
+            if event := self._event(chunk.output):
+                yield event
+            # A terminal status is published only after the reader's last write.
+            self.completed = info.status != "running"
+
+    async def drain(self) -> ToolStreamEvent | None:
+        info, chunk = await asyncio.to_thread(
+            self._manager.read_output,
+            session_id=self._session_id,
+            cursor=self._cursor,
+            wait_seconds=0,
+            max_bytes=self._max_bytes,
+        )
+        self._cursor = chunk.next_cursor
+        self.completed = info.status != "running"
+        return self._event(chunk.output)
 
 
 def _manager(
@@ -1241,7 +1264,9 @@ class ExperimentalBashArgs(BaseModel):
         default=False,
         description="Kill the process group when timeout_seconds expires.",
     )
-    cwd: str | None = Field(default=None, description="Working directory override.")
+    cwd: ToolPath | None = Field(
+        default=None, description="Working directory override."
+    )
     env: dict[str, str] | None = Field(
         default=None, description="Environment variable overrides."
     )
@@ -1255,13 +1280,18 @@ class ExperimentalBashResult(BaseModel):
     exit_code: int | None = None
     shell: str = ""
     background: bool = False
+    # The PTY interleaves both streams here, so there is no separate stderr.
     output: str = ""
     next_cursor: int = 0
     truncated: bool = False
     output_path: str = ""
-    stdout: str = ""
-    stderr: str = ""
-    returncode: int = 0
+
+    # Kept for `post_tool` hooks that read `tool_output.returncode`; the dumped
+    # result is the hook payload verbatim.
+    @computed_field(description="Deprecated alias for `exit_code`.")
+    @property
+    def returncode(self) -> int:
+        return self.exit_code or 0
 
 
 class BashOutputArgs(BaseModel):
@@ -1386,6 +1416,12 @@ class BashLogFileResult(BaseModel):
 
 
 class _BashPermissionMixin[ConfigT: BashToolConfig]:
+    # A shell reads its allowlist as command prefixes, so an outside-workdir
+    # glob persisted there would match no command at all.
+    allowlist_scopes: ClassVar[frozenset[PermissionScope]] = frozenset({
+        PermissionScope.COMMAND_PATTERN
+    })
+
     if TYPE_CHECKING:
 
         @property
@@ -1393,23 +1429,23 @@ class _BashPermissionMixin[ConfigT: BashToolConfig]:
 
         cwd: Path
         harness_files: HarnessFilesManager
+        workspace: Workspace
         scratchpad_dir: Path | None
 
     @staticmethod
-    def _has_find_execution_predicate(command: str) -> bool:
-        if not _matches_pattern(command, "find"):
-            return False
-        return any(predicate in command for predicate in _FIND_EXECUTION_PREDICATES)
-
-    @staticmethod
     def _build_command_required_permission(
-        invocation_pattern: str, session_pattern: str, label: str
+        invocation_pattern: str,
+        session_pattern: str,
+        label: str,
+        *,
+        literal: bool = False,
     ) -> RequiredPermission:
         return RequiredPermission(
             scope=PermissionScope.COMMAND_PATTERN,
             invocation_pattern=invocation_pattern,
             session_pattern=session_pattern,
             label=label,
+            literal=literal,
         )
 
     @staticmethod
@@ -1456,12 +1492,17 @@ class _BashPermissionMixin[ConfigT: BashToolConfig]:
         return tokens[0] in self.config.sensitive_patterns
 
     def _resolve_guardrail_permission(
-        self, command_parts: list[str]
+        self,
+        command_parts: list[str],
+        *,
+        command_cwd: Path,
+        preserve_backslashes: bool | None = None,
     ) -> PermissionContext | None:
-        find_execution_required: list[RequiredPermission] = []
-        seen_find_execution: set[str] = set()
+        option_required_by_command: dict[str, RequiredPermission] = {}
+        possible_cwds = {command_cwd}
+        cwd_is_unknown = False
 
-        for part in command_parts:
+        for part in _expand_guardrail_commands(command_parts):
             if matched := self._find_denylist_match(part):
                 return PermissionContext(
                     permission=ToolPermission.NEVER,
@@ -1472,21 +1513,39 @@ class _BashPermissionMixin[ConfigT: BashToolConfig]:
                     permission=ToolPermission.NEVER,
                     reason=f"Command denied: '{part}' is not allowed as a standalone command. Do not attempt to run this command.",
                 )
-            if not self._has_find_execution_predicate(part):
-                continue
-            if part in seen_find_execution:
-                continue
-            seen_find_execution.add(part)
-            find_execution_required.append(
-                self._build_command_required_permission(
-                    invocation_pattern=part, session_pattern=part, label=part
+            tokens = _split_command_tokens(
+                part, preserve_backslashes=preserve_backslashes
+            )
+            cwd_is_unknown = (
+                _update_guardrail_cwds(tokens, possible_cwds) or cwd_is_unknown
+            )
+            policy = analyze_shell_command_policy(tokens)
+            repository_requires_approval = policy.inspect_git_repository and (
+                cwd_is_unknown
+                or any(
+                    git_repository_requires_approval(tokens, cwd=cwd)
+                    for cwd in possible_cwds
                 )
             )
+            if not (policy.requires_approval or repository_requires_approval):
+                continue
+            permission_pattern = part
+            if policy.inspect_git_repository:
+                permission_pattern = _git_repository_permission_pattern(
+                    part, possible_cwds, cwd_is_unknown=cwd_is_unknown
+                )
+            option_required_by_command[part] = self._build_command_required_permission(
+                invocation_pattern=permission_pattern,
+                session_pattern=permission_pattern,
+                label=part,
+                literal=True,
+            )
 
-        if not find_execution_required:
+        if not option_required_by_command:
             return None
         return PermissionContext(
-            permission=ToolPermission.ASK, required_permissions=find_execution_required
+            permission=ToolPermission.ASK,
+            required_permissions=list(option_required_by_command.values()),
         )
 
     def _is_unconditionally_allowed(
@@ -1510,9 +1569,16 @@ class _BashPermissionMixin[ConfigT: BashToolConfig]:
         self,
         command_parts: list[str],
         outside_dirs: set[str],
-        required_context_permissions: list[RequiredPermission] | None = None,
+        *,
+        include_allowlisted: bool = False,
     ) -> list[RequiredPermission]:
-        required_context_permissions = required_context_permissions or []
+        """What this call needs on account of the commands it runs.
+
+        Context permissions are the caller's to append: they scope the shell and
+        the environment a call was handed, not the command, and
+        ``needs_exact_command_scope`` reads this list for whether the command
+        itself came out scoped.
+        """
         required: list[RequiredPermission] = []
         seen_session: set[str] = set()
 
@@ -1524,18 +1590,25 @@ class _BashPermissionMixin[ConfigT: BashToolConfig]:
                 continue
 
             is_sensitive = self._is_sensitive(part)
-            if not is_sensitive and self._is_allowlisted(part):
+            if (
+                not is_sensitive
+                and not include_allowlisted
+                and self._is_allowlisted(part)
+            ):
                 continue
 
             if is_sensitive:
                 required.append(
                     self._build_command_required_permission(
-                        invocation_pattern=part, session_pattern=part, label=part
+                        invocation_pattern=part,
+                        session_pattern=part,
+                        label=part,
+                        literal=True,
                     )
                 )
                 continue
 
-            session_pattern = build_session_pattern(tokens)
+            session_pattern, literal = command_session_pattern(tokens)
             if session_pattern in seen_session:
                 continue
             seen_session.add(session_pattern)
@@ -1544,13 +1617,13 @@ class _BashPermissionMixin[ConfigT: BashToolConfig]:
                     invocation_pattern=part,
                     session_pattern=session_pattern,
                     label=session_pattern,
+                    literal=literal,
                 )
             )
 
         for glob in sorted(str(Path(directory) / "*") for directory in outside_dirs):
             required.append(self._build_outside_directory_permission(glob))
 
-        required.extend(required_context_permissions)
         return required
 
     def _resolve_posix_shell_permission(
@@ -1560,23 +1633,25 @@ class _BashPermissionMixin[ConfigT: BashToolConfig]:
         cwd: str | None,
         required_context_permissions: list[RequiredPermission] | None = None,
     ) -> PermissionContext | None:
-        command_parts = _extract_commands(command)
-        if not command_parts:
+        analysis = analyze_shell_command(command)
+        command_parts = list(analysis.command_parts)
+        if not command_parts and not analysis.requires_approval:
             return None
 
-        guardrail_permission = self._resolve_guardrail_permission(command_parts)
+        command_cwd = resolve_tool_path(cwd, self.cwd)
+        guardrail_permission = self._resolve_guardrail_permission(
+            command_parts, command_cwd=command_cwd
+        )
         if (
             guardrail_permission
             and guardrail_permission.permission == ToolPermission.NEVER
         ):
             return guardrail_permission
 
-        command_cwd = Path(cwd).expanduser().resolve() if cwd is not None else self.cwd
         outside_dirs = _collect_outside_dirs(
             command_parts,
             command_cwd=command_cwd,
-            cwd=self.cwd,
-            project_roots=self.harness_files.project_roots,
+            workspace=self.workspace,
             scratchpad_dir=self.scratchpad_dir,
         )
         context_required = required_context_permissions or []
@@ -1585,14 +1660,28 @@ class _BashPermissionMixin[ConfigT: BashToolConfig]:
                 command_parts, outside_dirs, context_required
             )
             and not guardrail_permission
+            and not analysis.requires_approval
         ):
             return PermissionContext(permission=ToolPermission.ALWAYS)
 
+        scoped_parts, include_allowlisted = scoped_command_parts(
+            analysis, command_parts
+        )
         required = self._build_required_permissions(
-            command_parts, outside_dirs, context_required
+            scoped_parts, outside_dirs, include_allowlisted=include_allowlisted
         )
         if guardrail_permission:
             required.extend(guardrail_permission.required_permissions)
+        if needs_exact_command_scope(analysis, required):
+            required.append(
+                self._build_command_required_permission(
+                    invocation_pattern=command,
+                    session_pattern=command,
+                    label=analysis.approval_label,
+                    literal=True,
+                )
+            )
+        required.extend(context_required)
         if not required:
             return None
 
@@ -1658,6 +1747,16 @@ class ExperimentalBash(
         )
 
     @classmethod
+    def project_result(cls, result: ExperimentalBashResult) -> JsonValue:
+        # The PTY interleaves both streams, so the transcript is the whole output.
+        return {
+            "stdout": result.output,
+            "stderr": "",
+            "output": result.output,
+            "truncated": result.truncated,
+        }
+
+    @classmethod
     def get_status_text(cls) -> str:
         return "Running command"
 
@@ -1707,7 +1806,6 @@ class ExperimentalBash(
     async def run(
         self, args: ExperimentalBashArgs, ctx: InvokeContext | None = None
     ) -> AsyncGenerator[ToolStreamEvent | ExperimentalBashResult, None]:
-        _ = ctx
         requested_timeout = (
             float(args.timeout) if args.timeout is not None else args.timeout_seconds
         )
@@ -1715,7 +1813,7 @@ class ExperimentalBash(
         timeout = self._resolve_timeout(requested_timeout)
         max_bytes = self.config.max_output_bytes
         try:
-            cwd = Path(args.cwd).expanduser().resolve() if args.cwd else self.cwd
+            cwd = resolve_tool_path(args.cwd, self.cwd)
             manager = self._session_manager()
             shell = manager.resolve_shell(args.shell, self.config.shell)
             session = await asyncio.to_thread(
@@ -1727,14 +1825,27 @@ class ExperimentalBash(
                 background=args.background,
             )
             if args.background:
-                yield self._result_from_session(session.session_id, True, max_bytes)
+                yield await self._result_from_session(
+                    session.session_id, True, max_bytes
+                )
                 return
 
-            completed = await asyncio.to_thread(
-                manager.wait_for_exit, session.session_id, timeout
+            stream = _ForegroundStream(
+                manager,
+                session_id=session.session_id,
+                tool_name=self.get_name(),
+                tool_call_id=ctx.tool_call_id if ctx is not None else None,
+                max_bytes=max_bytes,
             )
-            if completed:
-                yield self._result_from_session(
+            # The session is ours until it exits or is handed over to the background.
+            async with self._kill_on_abort(session.session_id):
+                async for event in stream.pump(timeout=timeout):
+                    yield event
+                if event := await stream.drain():
+                    yield event
+
+            if stream.completed:
+                yield await self._result_from_session(
                     session.session_id,
                     background=False,
                     max_bytes=max_bytes,
@@ -1743,23 +1854,31 @@ class ExperimentalBash(
                 return
 
             if not hard_timeout:
-                yield self._result_from_session(session.session_id, True, max_bytes)
+                yield await self._result_from_session(
+                    session.session_id, True, max_bytes
+                )
                 return
 
             info = await asyncio.to_thread(
                 manager.kill, session.session_id, status="timed_out"
             )
-            chunk = manager.read_log_file(
-                Path(info.output_path), offset=0, max_bytes=max_bytes
+            # The kill can push out a last line after the drain above.
+            if event := await stream.drain():
+                yield event
+            chunk = await asyncio.to_thread(
+                manager.read_log_file,
+                Path(info.output_path),
+                offset=0,
+                max_bytes=max_bytes,
             )
-            raise ToolError(
+            reason = (
                 "Command timed out after "
                 f"{timeout:g}s: {args.command!r}\n"
                 f"session_id: {info.session_id}\n"
                 f"status: {info.status}\n"
-                f"output_path: {info.output_path}\n"
-                f"output:\n{chunk.output}"
+                f"output_path: {info.output_path}"
             )
+            raise ToolError(reason, model_detail=_output_detail(chunk.output))
         except ToolError:
             raise
         except (ManagedShellError, ManagedShellBackendError) as exc:
@@ -1767,11 +1886,29 @@ class ExperimentalBash(
         except Exception as exc:
             raise ToolError(f"Error running command {args.command!r}: {exc}") from exc
 
+    @contextlib.asynccontextmanager
+    async def _kill_on_abort(self, session_id: str) -> AsyncIterator[None]:
+        try:
+            yield
+        except (asyncio.CancelledError, GeneratorExit):
+            try:
+                # Shielded: a second cancellation must not leave the PTY running.
+                await asyncio.shield(
+                    asyncio.to_thread(self._session_manager().kill, session_id)
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to kill managed shell session %s after cancellation",
+                    session_id,
+                    exc_info=True,
+                )
+            raise
+
     def _resolve_timeout(self, requested: float | None) -> float:
         timeout = self.config.default_timeout if requested is None else requested
         return min(timeout, self.config.max_timeout_seconds)
 
-    def _result_from_session(
+    async def _result_from_session(
         self,
         session_id: str,
         background: bool,
@@ -1779,20 +1916,21 @@ class ExperimentalBash(
         *,
         enforce_success: bool = False,
     ) -> ExperimentalBashResult:
-        info, chunk = self._session_manager().read_output(
-            session_id=session_id, cursor=0, wait_seconds=0, max_bytes=max_bytes
+        manager = self._session_manager()
+        info, chunk = await asyncio.to_thread(
+            manager.read_output,
+            session_id=session_id,
+            cursor=0,
+            wait_seconds=0,
+            max_bytes=max_bytes,
         )
         returncode = info.exit_code or 0
         if enforce_success and (info.status != "completed" or returncode != 0):
-            error_msg = f"Command failed: {info.command!r}\n"
-            error_msg += f"Return code: {returncode}"
+            reason = f"Command failed: {info.command!r}\nReturn code: {returncode}"
             if info.status != "completed":
-                error_msg += f"\nStatus: {info.status}"
-            if chunk.output:
-                error_msg += f"\nStdout: {chunk.output}"
-            raise ToolError(error_msg.strip())
+                reason += f"\nStatus: {info.status}"
+            raise ToolError(reason, model_detail=_output_detail(chunk.output))
 
-        normalized_output = chunk.output.replace("\r\n", "\n")
         return ExperimentalBashResult(
             command=info.command,
             session_id=info.session_id,
@@ -1804,9 +1942,6 @@ class ExperimentalBash(
             truncated=chunk.truncated,
             output_path=info.output_path,
             shell=info.shell,
-            stdout=normalized_output,
-            stderr="",
-            returncode=returncode,
         )
 
 
@@ -1914,6 +2049,11 @@ class BashStdin(
     shell_family: ClassVar[str] = "posix"
     session_prefix: ClassVar[str] = "bash"
     session_label: ClassVar[str] = "bash"
+    _PAGER_SESSION_COMMANDS: ClassVar[frozenset[str]] = frozenset({
+        "git",
+        "less",
+        "more",
+    })
 
     @classmethod
     def is_available(cls, config: VibeConfigSchema | None = None) -> bool:
@@ -1949,6 +2089,64 @@ class BashStdin(
         return _manager(
             self, shell_family=self.shell_family, session_prefix=self.session_prefix
         )
+
+    @staticmethod
+    def _pager_input_permission(session_id: str) -> PermissionContext:
+        label = f"input to pager session {session_id}"
+        return PermissionContext(
+            permission=ToolPermission.ASK,
+            required_permissions=[
+                RequiredPermission(
+                    scope=PermissionScope.COMMAND_PATTERN,
+                    invocation_pattern=label,
+                    session_pattern=label,
+                    label=label,
+                )
+            ],
+        )
+
+    def resolve_permission(self, args: BashStdinArgs) -> PermissionContext | None:
+        if self.shell_family not in {"posix", "git_bash", "powershell", "windows"}:
+            return None
+        try:
+            command = self._session_manager().info(args.session_id).command
+        except (ManagedShellError, ManagedShellBackendError):
+            return self._pager_input_permission(args.session_id)
+
+        if self.shell_family in {"powershell", "windows"}:
+            # Imported lazily because windows_shell subclasses BashStdin.
+            from vibe.core.tools.builtins.windows_shell import (
+                _split_windows_command_parts,
+                _split_windows_command_tokens,
+                _windows_command_name,
+                _windows_invoked_command,
+            )
+
+            command_parts = _expand_guardrail_commands(
+                _split_windows_command_parts(command)
+            )
+            for part in command_parts:
+                tokens = _split_windows_command_tokens(part)
+                if not tokens:
+                    continue
+                executable, _arguments = _windows_invoked_command(tokens)
+                command_name = _windows_command_name(executable)
+                if command_name in self._PAGER_SESSION_COMMANDS:
+                    return self._pager_input_permission(args.session_id)
+            return None
+
+        command_parts = _expand_guardrail_commands(
+            list(analyze_shell_command(command).command_parts)
+        )
+        for part in command_parts:
+            tokens = _split_command_tokens(
+                part, preserve_backslashes=self.shell_family == "git_bash"
+            )
+            if tokens:
+                command_name = os.path.basename(tokens[0]).lower().removesuffix(".exe")
+                if command_name in self._PAGER_SESSION_COMMANDS:
+                    return self._pager_input_permission(args.session_id)
+        return None
 
     async def run(
         self, args: BashStdinArgs, ctx: InvokeContext | None = None

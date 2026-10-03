@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 from enum import StrEnum, auto
-from typing import Annotated, ClassVar, Literal, cast
+from typing import Annotated, ClassVar, Literal, Self, cast
 
-from pydantic import BaseModel, Field, JsonValue
+from pydantic import BaseModel, Field, JsonValue, model_validator
 
 from vibe.app_server._model import ProtocolModel
 from vibe.questions import UserQuestionRequest
 from vibe.utils.tool_presentation import EffectCallDisplay, ToolEffectKind
+
+# The ``tool_name`` on the effect behind a manual `!<command>`. A model's shell
+# call carries the real tool's name (``bash``, ``git_bash``, ``powershell``), so
+# this is what tells a user's own shell output apart from the agent's -- the
+# ``SHELL`` effect kind alone covers both.
+MANUAL_SHELL_TOOL_NAME = "shell"
 
 
 class ShellEffectInput(ProtocolModel):
@@ -17,6 +23,18 @@ class ShellEffectInput(ProtocolModel):
 class ShellEffectOutput(ProtocolModel):
     stdout: str
     stderr: str
+    # Arrival-ordered transcript; empty for producers that never streamed.
+    output: str = ""
+    truncated: bool = False
+
+    @property
+    def transcript(self) -> str:
+        if self.output:
+            return self.output
+        # Separate captures: concatenating them bare would fabricate a line.
+        if self.stdout and self.stderr and not self.stdout.endswith("\n"):
+            return f"{self.stdout}\n{self.stderr}"
+        return self.stdout + self.stderr
 
 
 class FileEditEffectInput(ProtocolModel):
@@ -24,6 +42,17 @@ class FileEditEffectInput(ProtocolModel):
     old_string: str
     new_string: str
     replace_all: bool = False
+
+
+class FileEditEffectChange(ProtocolModel):
+    old_string: str
+    new_string: str
+    replace_all: bool = False
+
+
+class FileEditEffectBatchInput(ProtocolModel):
+    file_path: str
+    changes: list[FileEditEffectChange] = Field(min_length=1)
 
 
 class FileEditEffectOccurrence(ProtocolModel):
@@ -34,9 +63,18 @@ class FileEditEffectOccurrence(ProtocolModel):
 
 class FileEditEffectOutput(ProtocolModel):
     file: str
-    old_string: str
-    new_string: str
+    old_string: str | None = None
+    new_string: str | None = None
     occurrences: list[FileEditEffectOccurrence] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_diff_content(self) -> Self:
+        has_legacy_pair = self.old_string is not None and self.new_string is not None
+        if (self.old_string is None) != (self.new_string is None):
+            raise ValueError("old_string and new_string must be provided together")
+        if not has_legacy_pair and not self.occurrences:
+            raise ValueError("file edit output requires a diff pair or occurrences")
+        return self
 
 
 class FileSearchEffectInput(ProtocolModel):
@@ -62,7 +100,7 @@ class FileReadEffectInput(ProtocolModel):
 
     file_path: str
     offset: int | None = None
-    limit: int = DEFAULT_LIMIT
+    limit: int | None = DEFAULT_LIMIT
 
 
 class FileReadEffectOutput(ProtocolModel):
@@ -71,7 +109,7 @@ class FileReadEffectOutput(ProtocolModel):
     num_lines: int
     start_line: int
     requested_offset: int | None = None
-    requested_limit: int = FileReadEffectInput.DEFAULT_LIMIT
+    requested_limit: int | None = FileReadEffectInput.DEFAULT_LIMIT
     total_lines: int | None = None
     was_truncated: bool = False
 
@@ -163,6 +201,15 @@ class SubagentEffectOutput(ProtocolModel):
     completed: bool
 
 
+# The path is carried alongside the name because a managed worktree lives under
+# $VIBE_HOME rather than beside the repo, so the name alone does not tell the
+# user where on disk the directory landed.
+class WorktreeEffectInput(ProtocolModel):
+    name: str
+    branch: str
+    path: str
+
+
 class _EffectDetailBase(ProtocolModel):
     tool_name: str
     display: EffectCallDisplay
@@ -180,7 +227,7 @@ class ShellEffectDetail(_EffectDetailBase):
 
 class FileEditEffectDetail(_EffectDetailBase):
     kind: Literal[ToolEffectKind.FILE_EDIT] = ToolEffectKind.FILE_EDIT
-    input: FileEditEffectInput | None = None
+    input: FileEditEffectInput | FileEditEffectBatchInput | None = None
 
 
 class FileSearchEffectDetail(_EffectDetailBase):
@@ -229,6 +276,16 @@ class SubagentEffectDetail(_EffectDetailBase):
     child_session_id: str | None = None
 
 
+class WorktreeEffectDetail(_EffectDetailBase):
+    kind: Literal[ToolEffectKind.WORKTREE] = ToolEffectKind.WORKTREE
+    input: WorktreeEffectInput | None = None
+
+
+class ProcessEffectDetail(_EffectDetailBase):
+    kind: Literal[ToolEffectKind.PROCESS] = ToolEffectKind.PROCESS
+    input: JsonValue = None
+
+
 EffectDetail = Annotated[
     GenericEffectDetail
     | ShellEffectDetail
@@ -241,7 +298,9 @@ EffectDetail = Annotated[
     | WebSearchEffectDetail
     | WebFetchEffectDetail
     | SkillEffectDetail
-    | SubagentEffectDetail,
+    | SubagentEffectDetail
+    | WorktreeEffectDetail
+    | ProcessEffectDetail,
     Field(discriminator="kind"),
 ]
 

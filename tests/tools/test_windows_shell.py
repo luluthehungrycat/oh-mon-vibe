@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -30,6 +31,7 @@ from vibe.core.tools.builtins.experimental_bash import (
     BashStdinConfig,
     ExperimentalBashArgs,
     ExperimentalBashToolConfig,
+    SessionInfo,
     SessionNotFoundError,
     TerminalSessionManager,
 )
@@ -65,6 +67,8 @@ from vibe.core.tools.terminal_runtime import TerminalRuntime
 from vibe.core.tools.ui import ToolUIDataAdapter
 from vibe.core.types import ToolCallEvent, ToolResultEvent
 from vibe.core.utils import is_windows
+from vibe.core.workspace import Workspace
+from vibe.utils import paths
 
 
 class _UnusedBackend:
@@ -138,13 +142,16 @@ def test_windows_shell_resolver_prefers_pwsh_then_powershell(monkeypatch):
 def test_git_bash_normalizes_msys_drive_paths_before_workdir_check(
     tmp_path, monkeypatch
 ):
-    seen_paths: list[str] = []
+    # Compared as paths, not strings: str(WindowsPath) renders backslashes.
+    seen_paths: list[Path] = []
+    inside = {tmp_path, Path("C:/repo/file.txt")}
 
     def is_within_workdir(path: str, **_kwargs) -> bool:
-        seen_paths.append(path)
-        return path in {str(tmp_path), "C:/repo/file.txt"}
+        seen_paths.append(Path(path))
+        return Path(path) in inside
 
     monkeypatch.setattr(experimental_bash_module, "is_windows", lambda: True)
+    monkeypatch.setattr(paths, "is_windows", lambda: True)
     monkeypatch.setattr(
         experimental_bash_module, "is_path_within_workdir", is_within_workdir
     )
@@ -152,13 +159,12 @@ def test_git_bash_normalizes_msys_drive_paths_before_workdir_check(
     outside_dirs = experimental_bash_module._collect_outside_dirs(
         ["cat /c/repo/file.txt"],
         command_cwd=tmp_path,
-        cwd=tmp_path,
-        project_roots=[],
+        workspace=Workspace.for_session(tmp_path),
         scratchpad_dir=None,
     )
 
     assert outside_dirs == set()
-    assert "C:/repo/file.txt" in seen_paths
+    assert Path("C:/repo/file.txt") in seen_paths
 
 
 def test_managed_git_bash_env_uses_posix_defaults(monkeypatch):
@@ -549,6 +555,43 @@ def test_windows_shell_stdin_preserves_non_text_payloads(args, expected):
     )
 
     assert tool._build_payload(args) == expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "less.exe input.txt",
+        r"C:\Tools\less.cmd input.txt",
+        r'& "C:\Program Files\more.com" input.txt',
+        r'& "C:\Program Files\Git\cmd\git.exe" log -p',
+    ],
+)
+def test_windows_shell_stdin_to_pager_session_requires_approval(
+    command: str, monkeypatch: pytest.MonkeyPatch
+):
+    tool = WindowsShellStdin(
+        config_getter=lambda: BashStdinConfig(), state=BaseToolState()
+    )
+    info = SessionInfo(
+        session_id="powershell_1",
+        command=command,
+        cwd=".",
+        shell="powershell",
+        status="running",
+        exit_code=None,
+        output_path="powershell_1.log",
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+    manager = SimpleNamespace(info=lambda _session_id: info)
+    monkeypatch.setattr(WindowsShellStdin, "_session_manager", lambda _self: manager)
+
+    permission = tool.resolve_permission(
+        BashStdinArgs(session_id="powershell_1", text="q")
+    )
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.ASK
 
 
 def test_windows_shell_inherited_ui_text_does_not_say_bash():
@@ -1036,6 +1079,53 @@ def test_windows_shell_redirection_requires_approval_for_outside_path():
     )
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo pwned > output.txt",
+        "echo pwned >> output.txt",
+        "echo pwned *> output.txt",
+        "echo pwned 2> errors.txt",
+    ],
+)
+def test_windows_shell_redirection_requires_approval_inside_workspace(command):
+    tool = WindowsShell(
+        config_getter=lambda: WindowsShellToolConfig(allowlist=["echo"]),
+        state=BaseToolState(),
+    )
+
+    permission = tool.resolve_permission(WindowsShellArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.ASK
+    assert any(
+        required.label.startswith("output redirection (")
+        for required in permission.required_permissions
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo harmless > $null",
+        "echo harmless > NUL",
+        "echo harmless > NUL:",
+        "echo harmless 2>&1",
+        "echo harmless *>&1",
+    ],
+)
+def test_windows_shell_discard_and_descriptor_redirections_remain_allowed(command):
+    tool = WindowsShell(
+        config_getter=lambda: WindowsShellToolConfig(allowlist=["echo"]),
+        state=BaseToolState(),
+    )
+
+    permission = tool.resolve_permission(WindowsShellArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.ALWAYS
+
+
 def test_windows_shell_quoted_redirection_text_is_not_treated_as_a_target():
     tool = WindowsShell(
         config_getter=lambda: WindowsShellToolConfig(allowlist=["echo"]),
@@ -1120,7 +1210,6 @@ def test_windows_shell_allowlisted_command_checks_dynamic_path(tmp_path, monkeyp
 @pytest.mark.parametrize(
     ("pattern", "command_template"),
     [
-        ("git diff", r"git diff --no-index .\a.txt .\b.txt"),
         ("get-content", 'Get-Content "FileSystem::{inside}"'),
         ("out-file", 'Out-File -FilePath "{inside}"'),
         ("tree", "tree /f"),
@@ -1142,6 +1231,201 @@ def test_windows_shell_allowlisted_command_keeps_in_workdir_paths_allowed(
 
     assert isinstance(permission, PermissionContext)
     assert permission.permission is ToolPermission.ALWAYS
+
+
+@pytest.mark.parametrize("command", ["git diff", "git log", "git status"])
+def test_windows_shell_git_readers_remain_allowed_for_an_ordinary_repository(
+    command, tmp_path, monkeypatch
+):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("[core]\n\trepositoryformatversion = 0\n")
+    monkeypatch.chdir(tmp_path)
+    tool = WindowsShell(
+        config_getter=lambda: WindowsShellToolConfig(allowlist=[command]),
+        state=BaseToolState(),
+    )
+
+    permission = tool.resolve_permission(WindowsShellArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.ALWAYS
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git log --remerge-diff -1",
+        "git log -p --diff-merges=remerge",
+        "git log -p --diff-merges=r",
+    ],
+)
+def test_windows_shell_git_remerge_diff_requires_approval(
+    command, tmp_path, monkeypatch
+):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("[core]\n\trepositoryformatversion = 0\n")
+    monkeypatch.chdir(tmp_path)
+    tool = WindowsShell(
+        config_getter=lambda: WindowsShellToolConfig(allowlist=["git log"]),
+        state=BaseToolState(),
+    )
+
+    permission = tool.resolve_permission(WindowsShellArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.ASK
+
+
+def test_windows_shell_repeated_git_reader_checks_each_repository(
+    tmp_path, monkeypatch
+):
+    clean = tmp_path / "clean"
+    evil = clean / "evil"
+    for repository in (tmp_path, clean, evil):
+        (repository / ".git").mkdir(parents=True)
+        (repository / ".git" / "config").write_text(
+            "[core]\n\trepositoryformatversion = 0\n"
+        )
+    (evil / ".git" / "config").write_text("[diff]\n\texternal = evil-diff.exe\n")
+    monkeypatch.chdir(tmp_path)
+    tool = WindowsShell(
+        config_getter=lambda: WindowsShellToolConfig(allowlist=["cd", "git diff"]),
+        state=BaseToolState(),
+    )
+
+    permission = tool.resolve_permission(
+        WindowsShellArgs(command="cd clean; git diff; cd evil; git diff")
+    )
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.ASK
+    git_permissions = [
+        required
+        for required in permission.required_permissions
+        if required.label == "git diff"
+    ]
+    assert len(git_permissions) == 1
+    assert str(evil.resolve()) in git_permissions[0].invocation_pattern
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pushd evil; git diff",
+        "Push-Location evil; git diff",
+        "Push-Location evil; Pop-Location; git diff",
+    ],
+)
+def test_windows_shell_tracks_directory_stack_builtins(command, tmp_path, monkeypatch):
+    evil = tmp_path / "evil"
+    for repository in (tmp_path, evil):
+        (repository / ".git").mkdir(parents=True)
+        (repository / ".git" / "config").write_text(
+            "[core]\n\trepositoryformatversion = 0\n"
+        )
+    (evil / ".git" / "config").write_text("[diff]\n\texternal = evil-diff.exe\n")
+    monkeypatch.chdir(tmp_path)
+    tool = WindowsShell(
+        config_getter=lambda: WindowsShellToolConfig(
+            allowlist=["pushd", "Push-Location", "Pop-Location", "git diff"]
+        ),
+        state=BaseToolState(),
+    )
+
+    permission = tool.resolve_permission(WindowsShellArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.ASK
+
+
+@pytest.mark.parametrize(
+    ("command", "config"),
+    [
+        ("git status", "[core]\n\tfsmonitor = monitor.exe\n"),
+        ("git status", '[filter "unsafe"]\n\tclean = clean.exe\n'),
+        ("git diff", '[diff "unsafe"]\n\tcommand = diff.exe\n'),
+        ("git log", "[gpg]\n\tprogram = fake-gpg.exe\n"),
+        ("git log", '[merge "unsafe"]\n\tdriver = merge.exe\n'),
+    ],
+    ids=[
+        "fsmonitor",
+        "clean-filter",
+        "external-diff",
+        "signature-program",
+        "merge-driver",
+    ],
+)
+def test_windows_shell_git_readers_require_approval_for_executable_repository_config(
+    command, config, tmp_path, monkeypatch
+):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text(config)
+    monkeypatch.chdir(tmp_path)
+    tool = WindowsShell(
+        config_getter=lambda: WindowsShellToolConfig(allowlist=[command]),
+        state=BaseToolState(),
+    )
+
+    permission = tool.resolve_permission(WindowsShellArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.ASK
+
+
+def test_windows_shell_git_reader_approval_is_scoped_to_the_repository(
+    tmp_path, monkeypatch
+):
+    patterns = []
+    for name in ("first", "second"):
+        repository = tmp_path / name
+        (repository / ".git").mkdir(parents=True)
+        (repository / ".git" / "config").write_text(
+            "[core]\n\tfsmonitor = monitor.exe\n"
+        )
+        monkeypatch.chdir(repository)
+        tool = WindowsShell(
+            config_getter=lambda: WindowsShellToolConfig(allowlist=["git status"]),
+            state=BaseToolState(),
+        )
+        permission = tool.resolve_permission(WindowsShellArgs(command="git status"))
+        assert isinstance(permission, PermissionContext)
+        assert permission.permission is ToolPermission.ASK
+        assert len(permission.required_permissions) == 1
+        patterns.append(permission.required_permissions[0].session_pattern)
+
+    assert patterns[0] != patterns[1]
+
+
+@pytest.mark.parametrize("command", ["git.exe status", r"C:\tools\git.exe status"])
+def test_windows_executable_suffixes_do_not_skip_git_guardrails(
+    command, tmp_path, monkeypatch
+):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("[core]\n\tfsmonitor = monitor.exe\n")
+    monkeypatch.chdir(tmp_path)
+    tool = WindowsShell(
+        config_getter=lambda: WindowsShellToolConfig(allowlist=[command]),
+        state=BaseToolState(),
+    )
+
+    permission = tool.resolve_permission(WindowsShellArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.ASK
+
+
+def test_windows_executable_suffixes_do_not_skip_less_guardrails():
+    tool = WindowsShell(
+        config_getter=lambda: WindowsShellToolConfig(allowlist=["less"]),
+        state=BaseToolState(),
+    )
+
+    permission = tool.resolve_permission(
+        WindowsShellArgs(command="less.exe --lesskey-src=keys input.txt")
+    )
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.ASK
 
 
 def test_windows_shell_path_qualified_denylist_matches_basename():
@@ -1318,7 +1602,8 @@ async def test_git_bash_fallback_projects_native_shell_to_client_terminal(
         )
     )
 
-    assert result.output == "client stdoutclient stderr"
+    assert result.stdout == "client stdout"
+    assert result.stderr == "client stderr"
     assert tool_io.requests == [
         ShellCommandRequest(
             session_id="session-1",
@@ -1372,7 +1657,8 @@ async def test_powershell_fallback_projects_native_shell_to_client_terminal(
         )
     )
 
-    assert result.output == "client stdoutclient stderr"
+    assert result.stdout == "client stdout"
+    assert result.stderr == "client stderr"
     assert tool_io.requests == [
         ShellCommandRequest(
             session_id="session-2",
@@ -1478,7 +1764,7 @@ async def test_windows_shell_managed_echo_hello(native_windows_platform):
     )
 
     assert result.status == "completed"
-    assert result.returncode == 0
+    assert result.exit_code == 0
     assert "hello" in result.output.lower()
     assert result.shell
     assert result.session_id.startswith("powershell_")

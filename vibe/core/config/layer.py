@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import asyncio
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
 from jsonpatch import JsonPatchException, apply_patch
@@ -45,15 +46,6 @@ class EmptyLayerError(ConfigLayerError):
         super().__init__(layer_name, f"Layer '{layer_name}' has no data after load")
 
 
-class TrustNotResolvedError(ConfigLayerError):
-    """Raised when grant_trust/revoke_trust is called before trust has been resolved."""
-
-    def __init__(self, layer_name: str) -> None:
-        super().__init__(
-            layer_name, f"Layer '{layer_name}': trust has not been resolved yet"
-        )
-
-
 class LayerNotLoadedError(ConfigLayerError):
     """Raised when a layer operation requires cached data and fingerprint."""
 
@@ -88,21 +80,28 @@ class LayerImplementationError(ConfigLayerError):
         self.method_name = method_name
 
 
+class ConfigStorageError(ConfigLayerError):
+    """Raised when a config file cannot be read from or written to.
+
+    Wraps the underlying ``OSError`` (e.g. a read-only ``config.toml``) so
+    callers can surface a clear message without catching raw ``OSError``,
+    which other subsystems also raise.
+    """
+
+    def __init__(self, layer_name: str, path: Path, operation: str) -> None:
+        super().__init__(
+            layer_name,
+            f"Layer '{layer_name}': cannot {operation} config file at {path}",
+        )
+        self.path = path
+        self.operation = operation
+
+
 @dataclass(frozen=True, slots=True)
 class _LayerState[S: BaseModel]:
     is_trusted: bool | None = None
     data: S | None = None
     fingerprint: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _GrantTrust:
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class _RevokeTrust:
-    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,14 +159,6 @@ class ConfigLayer[S: BaseModel](ABC):
         """
         ...
 
-    async def _on_trust_changed(self, old: bool | None, new: bool | None) -> None:
-        """Called when the trust status changes.
-
-        Override to persist trust status or react to trust transitions.
-        Default is a no-op.
-        """
-        return
-
     @abstractmethod
     async def _save_to_store(self, _next_config: S) -> str:
         """Persist full layer data and return the store's new fingerprint.
@@ -177,15 +168,6 @@ class ConfigLayer[S: BaseModel](ABC):
         ...
 
     # --- Internal ---
-
-    async def _notify_trust_change(self, old: bool | None, new: bool | None) -> None:
-        """Call ``_on_trust_changed`` and wrap any error."""
-        if old == new:
-            return
-        try:
-            await self._on_trust_changed(old, new)
-        except Exception as e:
-            raise LayerImplementationError(self.name, "_on_trust_changed") from e
 
     async def _resolve_check_trust(self) -> bool:
         """Call ``_check_trust`` and wrap any error."""
@@ -204,10 +186,6 @@ class ConfigLayer[S: BaseModel](ABC):
             )
 
             match action:
-                case _GrantTrust():
-                    new_state = await self._handle_grant_trust(state)
-                case _RevokeTrust():
-                    new_state = await self._handle_revoke_trust(state)
                 case _ResolveTrust():
                     new_state = await self._handle_resolve_trust(state)
                 case _Load(force=force):
@@ -225,34 +203,8 @@ class ConfigLayer[S: BaseModel](ABC):
 
             return new_state
 
-    async def _handle_grant_trust(self, state: _LayerState[S]) -> _LayerState[S]:
-        if state.is_trusted is None:
-            raise TrustNotResolvedError(self.name)
-
-        if state.is_trusted is True:
-            return state
-
-        await self._notify_trust_change(state.is_trusted, True)
-
-        return _LayerState(
-            is_trusted=True, data=state.data, fingerprint=state.fingerprint
-        )
-
-    async def _handle_revoke_trust(self, state: _LayerState[S]) -> _LayerState[S]:
-        if state.is_trusted is None:
-            raise TrustNotResolvedError(self.name)
-
-        if state.is_trusted is False:
-            return state
-
-        await self._notify_trust_change(state.is_trusted, False)
-
-        return _LayerState(is_trusted=False, data=None, fingerprint=None)
-
     async def _handle_resolve_trust(self, state: _LayerState[S]) -> _LayerState[S]:
         is_trusted = await self._resolve_check_trust()
-
-        await self._notify_trust_change(state.is_trusted, is_trusted)
 
         return _LayerState(
             is_trusted=is_trusted,
@@ -265,8 +217,6 @@ class ConfigLayer[S: BaseModel](ABC):
             is_trusted = state.is_trusted
         else:
             is_trusted = await self._resolve_check_trust()
-
-        await self._notify_trust_change(state.is_trusted, is_trusted)
 
         if not is_trusted:
             return _LayerState(is_trusted=is_trusted, data=None, fingerprint=None)
@@ -283,7 +233,7 @@ class ConfigLayer[S: BaseModel](ABC):
                     data=self.validate_output(snapshot.data),
                     fingerprint=snapshot.fingerprint,
                 )
-            except ConcurrencyConflictError:
+            except (ConcurrencyConflictError, ConfigStorageError):
                 raise
             except Exception as e:
                 raise LayerImplementationError(
@@ -324,7 +274,7 @@ class ConfigLayer[S: BaseModel](ABC):
 
         try:
             new_fingerprint = await self._save_to_store(validated_new_data)
-        except NotImplementedError:
+        except (NotImplementedError, ConfigStorageError):
             raise
         except Exception as e:
             raise LayerImplementationError(self.name, "_save_to_store") from e
@@ -345,14 +295,6 @@ class ConfigLayer[S: BaseModel](ABC):
             raise TrustResolutionError(self.name)
 
         return state.is_trusted
-
-    async def grant_trust(self) -> None:
-        """Explicitly mark this layer as trusted."""
-        await self._dispatch(_GrantTrust())
-
-    async def revoke_trust(self) -> None:
-        """Explicitly mark this layer as untrusted and clear cached data."""
-        await self._dispatch(_RevokeTrust())
 
     async def invalidate_cache(self) -> None:
         """Clear the in-memory cache so the next ``load()`` re-reads."""

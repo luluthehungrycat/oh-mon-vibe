@@ -2,16 +2,28 @@ from __future__ import annotations
 
 import logging
 from logging.handlers import RotatingFileHandler
+import os
 from pathlib import Path
+import stat
 from textwrap import dedent
 
 import pytest
 
 from vibe.observability.logging import (
+    LOG_LEVELS,
+    LogLevelChain,
+    OwnerOnlyRotatingFileHandler,
     StructuredLogFormatter,
+    _VibeFileHandler,
     decode_log_message,
     encode_log_message,
+    get_effective_log_level,
+    get_log_level_chain,
+    get_session_override,
     init_file_logging,
+    set_config_log_level,
+    set_log_level,
+    set_session_override,
 )
 
 
@@ -159,6 +171,32 @@ class TestInitFileLogging:
         init_file_logging(log_file, target_logger=test_logger)
 
         assert len(test_logger.handlers) == initial_handler_count + 1
+
+    def test_also_captures_unified_harness_logger(
+        self, log_file: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The experimental harness runtime logs under "mistralai_vibe_local_harness", which
+        # is not a child of "vibe"; without explicit capture its diagnostics propagate
+        # to the root logger and never reach vibe.log.
+        monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+        resolved = log_file.expanduser().resolve()
+        harness_logger = logging.getLogger("mistralai_vibe_local_harness")
+
+        def file_handlers() -> list[_VibeFileHandler]:
+            return [
+                handler
+                for handler in harness_logger.handlers
+                if isinstance(handler, _VibeFileHandler)
+                and Path(handler.baseFilename) == resolved
+            ]
+
+        assert file_handlers() == []
+
+        init_file_logging(
+            log_file, target_logger=logging.getLogger("test_harness_capture")
+        )
+
+        assert len(file_handlers()) == 1
 
     def test_creates_log_file(
         self, log_file: Path, monkeypatch: pytest.MonkeyPatch
@@ -331,3 +369,163 @@ class TestDecodeLogMessage:
         assert "\n" not in output
         # The backslashes in the exception should be escaped
         assert "C:\\\\new\\\\path" in output
+
+
+class TestRuntimeLogLevel:
+    def test_log_levels_constant_has_all_five(self) -> None:
+        assert LOG_LEVELS == frozenset({
+            "DEBUG",
+            "INFO",
+            "WARNING",
+            "ERROR",
+            "CRITICAL",
+        })
+
+    def test_set_log_level_changes_handler_level(
+        self, log_file: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LOG_LEVEL", "WARNING")
+        test_logger = logging.getLogger("test_set_runtime")
+        test_logger.handlers.clear()
+        init_file_logging(log_file, target_logger=test_logger)
+
+        returned = set_log_level("DEBUG", target_logger=test_logger)
+
+        assert returned == "DEBUG"
+        handler = next(
+            h for h in test_logger.handlers if isinstance(h, _VibeFileHandler)
+        )
+        assert logging.getLevelName(handler.level) == "DEBUG"
+
+    def test_set_log_level_normalizes_case(
+        self, log_file: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LOG_LEVEL", "WARNING")
+        test_logger = logging.getLogger("test_set_runtime_case")
+        test_logger.handlers.clear()
+        init_file_logging(log_file, target_logger=test_logger)
+
+        assert set_log_level("info", target_logger=test_logger) == "INFO"
+
+    def test_set_log_level_rejects_invalid(
+        self, log_file: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LOG_LEVEL", "WARNING")
+        test_logger = logging.getLogger("test_set_runtime_invalid")
+        test_logger.handlers.clear()
+        init_file_logging(log_file, target_logger=test_logger)
+        original = get_effective_log_level(target_logger=test_logger)
+
+        with pytest.raises(ValueError):
+            set_log_level("VERBOSE", target_logger=test_logger)
+
+        assert get_effective_log_level(target_logger=test_logger) == original
+
+    def test_get_effective_log_level_no_handlers(self) -> None:
+        test_logger = logging.getLogger("test_no_handlers")
+        test_logger.handlers.clear()
+        assert get_effective_log_level(target_logger=test_logger) == "WARNING"
+
+    def test_session_override_round_trip(self) -> None:
+        set_session_override(None)
+        assert get_session_override() is None
+        set_session_override("DEBUG")
+        assert get_session_override() == "DEBUG"
+        set_session_override(None)
+        assert get_session_override() is None
+
+    def test_chain_session_wins_over_env_and_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        set_session_override("DEBUG")
+        set_config_log_level("INFO")
+        monkeypatch.setenv("LOG_LEVEL", "ERROR")
+        chain = get_log_level_chain()
+        assert chain.session == "DEBUG"
+        assert chain.env == "ERROR"
+        assert chain.config == "INFO"
+        assert chain.effective == "DEBUG"
+        set_session_override(None)
+        set_config_log_level(None)
+
+    def test_chain_env_wins_over_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        set_session_override(None)
+        set_config_log_level("INFO")
+        monkeypatch.setenv("LOG_LEVEL", "ERROR")
+        chain = get_log_level_chain()
+        assert chain.session is None
+        assert chain.env == "ERROR"
+        assert chain.config == "INFO"
+        assert chain.effective == "ERROR"
+        set_config_log_level(None)
+
+    def test_chain_config_when_no_env_no_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        set_session_override(None)
+        set_config_log_level("INFO")
+        monkeypatch.delenv("LOG_LEVEL", raising=False)
+        chain = get_log_level_chain()
+        assert chain.session is None
+        assert chain.env is None
+        assert chain.config == "INFO"
+        assert chain.effective == "INFO"
+        set_config_log_level(None)
+
+    def test_chain_defaults_to_warning(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        set_session_override(None)
+        set_config_log_level(None)
+        monkeypatch.delenv("LOG_LEVEL", raising=False)
+        chain = get_log_level_chain()
+        assert chain.session is None
+        assert chain.env is None
+        assert chain.config is None
+        assert chain.effective == "WARNING"
+
+    def test_chain_env_none_when_invalid(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        set_session_override(None)
+        set_config_log_level("INFO")
+        monkeypatch.setenv("LOG_LEVEL", "VERBOSE")
+        chain = get_log_level_chain()
+        assert chain.env is None
+        assert chain.effective == "INFO"
+        set_config_log_level(None)
+
+    def test_chain_returns_frozen_dataclass(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        set_config_log_level("WARNING")
+        monkeypatch.delenv("LOG_LEVEL", raising=False)
+        chain = get_log_level_chain()
+        assert isinstance(chain, LogLevelChain)
+        set_config_log_level(None)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+class TestOwnerOnlyLogFile:
+    def test_creates_owner_only_log_file(
+        self, log_file: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+        test_logger = logging.getLogger("test_owner_only_log")
+        test_logger.setLevel(logging.DEBUG)
+
+        init_file_logging(log_file, target_logger=test_logger)
+        test_logger.info("Test log entry")
+
+        assert stat.S_IMODE(log_file.stat().st_mode) & 0o077 == 0
+
+    def test_reopen_after_rotation_keeps_owner_only(self, log_file: Path) -> None:
+        handler = OwnerOnlyRotatingFileHandler(
+            log_file, maxBytes=100, backupCount=0, encoding="utf-8"
+        )
+        try:
+            assert stat.S_IMODE(log_file.stat().st_mode) & 0o077 == 0
+
+            log_file.unlink()
+            stream = handler._open()
+            stream.close()
+
+            assert stat.S_IMODE(log_file.stat().st_mode) & 0o077 == 0
+        finally:
+            handler.close()

@@ -26,6 +26,20 @@ def _pin_banner_version(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _pin_process_title(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "vibe.cli.textual_ui.app.process_id_label", lambda: "[PID 00000]"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _disable_loading_easter_eggs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "vibe.cli.textual_ui.widgets.loading.random.random", lambda: 1.0
+    )
+
+
+@pytest.fixture(autouse=True)
 def _pin_spinner_frames(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stop spinners ticking, so a captured frame does not depend on timing.
 
@@ -51,5 +65,5 @@ def _disable_managed_config_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
         return ManagedConfigResult()
 
     monkeypatch.setattr(
-        "vibe.app_server._resources.fetch_managed_config", no_managed_config
+        "vibe.app_server._admin_config.fetch_managed_config", no_managed_config
     )

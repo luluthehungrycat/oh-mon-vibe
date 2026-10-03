@@ -127,6 +127,9 @@ def parse_previous_user_messages(content: str) -> list[str]:
 
 
 def _is_compaction_context_message(message: LLMMessage) -> bool:
+    if message.context_boundary == "compaction":
+        return True
+
     content = message.content or ""
     return (
         message.role == Role.user
@@ -136,6 +139,63 @@ def _is_compaction_context_message(message: LLMMessage) -> bool:
         and _COMPACTION_SUMMARY_OPEN in content
         and _COMPACTION_SUMMARY_CLOSE in content
     )
+
+
+def select_model_context(messages: Sequence[LLMMessage]) -> list[LLMMessage]:
+    boundary_index = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if _is_compaction_context_message(messages[index])
+        ),
+        None,
+    )
+    if boundary_index is None:
+        return list(messages)
+
+    system_messages = [
+        message for message in messages[:boundary_index] if message.role == Role.system
+    ]
+    return [*system_messages, *messages[boundary_index:]]
+
+
+def reorder_for_tool_adjacency(messages: Sequence[LLMMessage]) -> list[LLMMessage]:
+    """Move messages that fell between a tool_use and its tool_result.
+
+    Providers such as Anthropic require every assistant ``tool_use`` to be
+    followed immediately by the matching ``tool_result``. A message steered
+    into a running turn while a tool call is in flight can land in that gap --
+    on its own, or (with skill/file injection) as a nested tool_use/tool_result
+    pair. Only a tool_result whose id matches the open call satisfies that
+    call; everything else in the gap is displaced together to just after the
+    call's results, so nested pairs are moved intact rather than split.
+    Order-stable and pure, so it is safe to run on every outbound request.
+    """
+    result: list[LLMMessage] = []
+    index = 0
+    total = len(messages)
+    while index < total:
+        message = messages[index]
+        result.append(message)
+        index += 1
+        if message.role != Role.assistant or not message.tool_calls:
+            continue
+        pending = {tc.id for tc in message.tool_calls if tc.id is not None}
+        if not pending:
+            continue
+        displaced: list[LLMMessage] = []
+        while index < total and pending:
+            following = messages[index]
+            index += 1
+            call_id = following.tool_call_id
+            if following.role == Role.tool and call_id in pending:
+                result.append(following)
+                pending.discard(call_id)
+            else:
+                displaced.append(following)
+        # Recurse so a nested pair displaced from this gap is itself ordered.
+        result.extend(reorder_for_tool_adjacency(displaced))
+    return result
 
 
 def collect_prior_user_messages(

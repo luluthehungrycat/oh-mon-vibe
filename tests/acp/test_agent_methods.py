@@ -13,15 +13,21 @@ from acp.schema import (
 )
 import pytest
 
+from tests.conftest import build_test_agent_loop, build_test_vibe_config
+from tests.stubs.app_server import start_test_app_server
+from tests.stubs.fake_backend import FakeBackend
 from tests.stubs.fake_client import FakeClient
-from vibe.acp.agent import VibeAcpAgent
+from vibe.acp.agent import SessionStarter, VibeAcpAgent
 from vibe.acp.exceptions import InvalidRequestError
-from vibe.app_server.models import PublicMessageEntry
+from vibe.app_server.local import LocalHarnessOptions
+from vibe.app_server.models import IdleSessionStatus, PublicMessageEntry, PublicSession
 from vibe.app_server.protocol import (
     AppServerResponseError,
     ProtocolError,
     ProtocolErrorCode,
 )
+from vibe.app_server.session import AppServerSession
+from vibe.core.config import ModelConfig
 
 
 async def _new_session(agent: VibeAcpAgent) -> str:
@@ -112,7 +118,7 @@ async def test_delete_session_remains_retryable_after_cleanup_failure(
 
 
 @pytest.mark.asyncio
-async def test_delete_session_uses_replacement_session_id_after_compaction(
+async def test_delete_session_uses_same_session_id_after_compaction(
     acp_agent_with_session_config: tuple[VibeAcpAgent, FakeClient],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -126,8 +132,8 @@ async def test_delete_session_uses_replacement_session_id_after_compaction(
 
     await session.app_server.compact()
 
-    replacement_id = session.app_server.session_id
-    assert replacement_id != created.session_id
+    session_id = session.app_server.session_id
+    assert session_id == created.session_id
     assert session.app_server.resources.runtime.session_log.persisted
     host = Mock(delete_session=AsyncMock())
     monkeypatch.setattr(agent, "_host_resources", AsyncMock(return_value=host))
@@ -135,7 +141,7 @@ async def test_delete_session_uses_replacement_session_id_after_compaction(
     await agent.ext_method("session/delete", {"sessionId": created.session_id})
 
     assert created.session_id not in agent.sessions
-    host.delete_session.assert_awaited_once_with(replacement_id)
+    host.delete_session.assert_awaited_once_with(session_id)
 
 
 @pytest.mark.asyncio
@@ -160,6 +166,52 @@ async def test_config_options_delegate_to_typed_app_server_resources(
     )
     with pytest.raises(InvalidRequestError):
         await acp_agent_loop.set_config_option("unknown", session_id, "x")
+
+
+def _acp_agent_with_allowed_models(experimental_harness: bool = False) -> VibeAcpAgent:
+    config = build_test_vibe_config(
+        active_model="allowed",
+        allowed_models=["allowed"],
+        models=[
+            ModelConfig(name="allowed", provider="mistral", alias="allowed"),
+            ModelConfig(name="blocked", provider="mistral", alias="blocked"),
+        ],
+    )
+
+    async def start_session(options: LocalHarnessOptions) -> AppServerSession:
+        assert options.experimental_harness is experimental_harness
+        loop = build_test_agent_loop(
+            config=config, backend=FakeBackend(), enable_streaming=True
+        )
+        return await AppServerSession.start(
+            start_test_app_server(loop),
+            client_info=options.client.info,
+            capabilities=options.client.capabilities,
+            session_options=options.session_options,
+        )
+
+    starter: SessionStarter = start_session
+    agent = VibeAcpAgent(
+        session_starter=starter, experimental_harness=experimental_harness
+    )
+    client = FakeClient()
+    agent.on_connect(client)
+    client.on_connect(agent)
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_set_config_option_rejects_model_excluded_by_allowed_models(
+    experimental_harness: bool,
+) -> None:
+    agent = _acp_agent_with_allowed_models(experimental_harness=experimental_harness)
+    session_id = await _new_session(agent)
+
+    with pytest.raises(InvalidRequestError):
+        await agent.set_config_option("model", session_id, "blocked")
+
+    allowed = await agent.set_config_option("model", session_id, "allowed")
+    assert allowed is not None
 
 
 @pytest.mark.asyncio
@@ -245,7 +297,7 @@ async def test_fork_returns_session_state_without_replaying_history(
         child = agent.sessions[response.session_id]
         assert any(
             isinstance(entry, PublicMessageEntry)
-            for entry in child.app_server.state.history.entries
+            for entry in child.app_server.state.history or []
         )
         assert response.modes is not None
         assert response.config_options is not None
@@ -359,3 +411,42 @@ async def test_title_and_session_listing_cross_the_app_server_boundary(
         if isinstance(notification.update, SessionInfoUpdate)
     ]
     assert updates[-1].title == "Reviewed"
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_falls_back_to_preview_when_no_title(
+    acp_agent_loop: VibeAcpAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An LLM title is only generated after a few turns; until then the ACP list
+    # must surface the first-message preview so entries stay identifiable.
+    items = [
+        PublicSession(
+            id="untitled-session",
+            title=None,
+            preview="MARKER-ONE first message",
+            status=IdleSessionStatus(),
+            created_at=0,
+            updated_at=0,
+            cwd=str(Path.cwd()),
+        ),
+        PublicSession(
+            id="titled-session",
+            title="Generated title",
+            preview="MARKER-TWO first message",
+            status=IdleSessionStatus(),
+            created_at=0,
+            updated_at=0,
+            cwd=str(Path.cwd()),
+        ),
+    ]
+    resources = Mock()
+    resources.list_sessions = AsyncMock(return_value=items)
+    monkeypatch.setattr(
+        acp_agent_loop, "_host_resources", AsyncMock(return_value=resources)
+    )
+
+    listed = await acp_agent_loop.list_sessions(cwd=str(Path.cwd()))
+
+    titles = {session.session_id: session.title for session in listed.sessions}
+    assert titles["untitled-session"] == "MARKER-ONE first message"
+    assert titles["titled-session"] == "Generated title"

@@ -1,9 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
-import re
 from typing import cast
-from urllib.parse import urlsplit
 
 from vibe.app_server.models import (
     ContentBlock,
@@ -11,37 +10,39 @@ from vibe.app_server.models import (
     MentionStats,
     PreparedPrompt,
     ResourceContentBlock,
-    TextContentBlock,
     WorkspaceTrustDecision,
     WorkspaceTrustDetails,
 )
-from vibe.app_server.protocol import WorkspaceTrustStatusResponse
+from vibe.app_server.protocol import (
+    WorkspaceTrustStatusResponse,
+    WorkspaceUntrustedConfigResponse,
+)
 from vibe.core.agent_loop import AgentLoop
 from vibe.core.autocompletion.path_prompt import (
     PathPromptPayload,
+    PathResource,
     build_path_prompt_payload,
-    build_title_segments,
 )
 from vibe.core.autocompletion.path_prompt_adapter import extract_image_resources
 from vibe.core.paths import TRUSTED_FOLDERS_FILE
 from vibe.core.session.image_snapshot import ImageSnapshotError, snapshot_image
-from vibe.core.session.title_format import (
-    MentionSegment,
-    TitleSegment,
-    format_session_title,
-)
 from vibe.core.trusted_folders import (
     TrustedFoldersManager,
     WorkspaceTrustDecision as CoreWorkspaceTrustDecision,
     WorkspaceTrustPrompt,
     apply_workspace_trust_decision,
     available_workspace_trust_decisions,
+    find_untrusted_config_dirs,
     maybe_build_workspace_trust_prompt,
 )
-from vibe.user_content import UserResourceLink
+from vibe.user_content import UserTextResource
 from vibe.utils.images import MAX_IMAGES_PER_MESSAGE
+from vibe.utils.io import BoundedReadResult, read_lines_safe, read_lines_safe_async
 
-_LINE_FRAGMENT_RE = re.compile(r"^L(\d+)(?:-L(\d+))?$")
+_MENTIONED_FILE_MAX_BYTES = 50 * 1024
+_MENTIONED_FILE_LINE_LIMIT = 2000
+_MENTIONED_FILE_MAX_FILES = 8
+_TRUNCATED_FILE_NOTE = "\n\n[File mention truncated to fit context limits.]"
 
 
 class PromptPreparationError(ValueError):
@@ -50,6 +51,40 @@ class PromptPreparationError(ValueError):
 
 class WorkspaceTrustError(ValueError):
     pass
+
+
+def is_trust_grant(decision: WorkspaceTrustDecision) -> bool:
+    """Grants reload config and re-derive the runtime; a decline does not."""
+    return decision in {"trust_repo", "trust_cwd"}
+
+
+def require_trust_session_id(session_id: str | None) -> str:
+    """A trust decision is a persistent write, so it must name its session."""
+    if session_id is None:
+        raise WorkspaceTrustError(
+            "Active workspace trust decisions require a session ID"
+        )
+    return session_id
+
+
+def resolve_session_trust_target(
+    session_cwd: Path | str, requested: str | None
+) -> Path:
+    """The directory a session-scoped trust decision may target.
+
+    A trust decision is a persistent write to the trust store, so a
+    caller-supplied ``requested`` path may only be the session's own working
+    directory, after ``~`` and symlink resolution.
+    """
+    target = Path(session_cwd).expanduser().resolve()
+    if requested is None:
+        return target
+    resolved = Path(requested).expanduser().resolve()
+    if resolved != target:
+        raise WorkspaceTrustError(
+            "Workspace trust decisions must target the session's working directory"
+        )
+    return resolved
 
 
 def read_workspace_trust(
@@ -88,6 +123,16 @@ def decide_workspace_trust(
     return read_workspace_trust(resolved, trust_store)
 
 
+def read_untrusted_config_dirs(
+    cwd: Path, trust_store: TrustedFoldersManager
+) -> WorkspaceUntrustedConfigResponse:
+    resolved = cwd.expanduser().resolve()
+    dirs = find_untrusted_config_dirs(resolved, manager=trust_store)
+    return WorkspaceUntrustedConfigResponse(
+        dirs=[str(d) for d in dirs], settings_path=str(TRUSTED_FOLDERS_FILE.path)
+    )
+
+
 def _workspace_trust_details(prompt: WorkspaceTrustPrompt) -> WorkspaceTrustDetails:
     return WorkspaceTrustDetails(
         cwd=str(prompt.cwd.resolve()),
@@ -105,68 +150,124 @@ def _workspace_trust_details(prompt: WorkspaceTrustPrompt) -> WorkspaceTrustDeta
     )
 
 
-def prepare_prompt(
-    agent_loop: AgentLoop, message: str, title_content: list[ContentBlock] | None = None
-) -> PreparedPrompt:
-    payload = build_path_prompt_payload(message, base_dir=agent_loop.cwd)
-    images = _snapshot_images(agent_loop, payload)
+def prepare_prompt(agent_loop: AgentLoop, message: str) -> PreparedPrompt:
     model = agent_loop.config.get_active_model()
-    if images and not model.supports_images:
+    prompt = prepare_prompt_from_context(
+        message, cwd=agent_loop.cwd, session_dir=agent_loop.session_logger.session_dir
+    )
+    if prompt.images and not model.supports_images:
         raise PromptPreparationError(
-            f"Model `{model.alias}` does not support images. "
+            f"Model `{model.display_name or model.alias}` does not support images. "
             "Switch with /model or remove the attachment."
         )
-    title = None
-    if agent_loop.session_logger.needs_initial_auto_title():
-        segments = (
-            _structured_title_segments(title_content, base_dir=agent_loop.cwd)
-            if title_content is not None
-            else build_title_segments(message, base_dir=agent_loop.cwd)
-        )
-        title = format_session_title(segments) or None
+    return prompt
+
+
+def prepare_prompt_from_context(
+    message: str, *, cwd: Path, session_dir: Path | None
+) -> PreparedPrompt:
+    payload = build_path_prompt_payload(message, base_dir=cwd)
+    images = _snapshot_images(session_dir, payload)
+    # The title is left unset here; it is generated in the background by the
+    # agent loop once there is a transcript to summarize.
     return PreparedPrompt(
         display_text=message,
         prompt_text=message,
         images=images,
-        auto_title=title,
+        auto_title=None,
         mentions=_mention_stats(payload),
     )
 
 
-def _structured_title_segments(
-    content: list[ContentBlock], *, base_dir: Path
-) -> list[TitleSegment]:
-    segments: list[TitleSegment] = []
-    for block in content:
-        match block:
-            case TextContentBlock(text=text):
-                segments.extend(build_title_segments(text, base_dir=base_dir))
-            case ResourceContentBlock(resource=resource):
-                uri, start_line, end_line = _resource_location(resource.uri)
-                name = (
-                    resource.name
-                    if isinstance(resource, UserResourceLink) and resource.name
-                    else Path(urlsplit(uri).path).name
-                )
-                if name:
-                    segments.append(MentionSegment(name, start_line, end_line))
-    return segments
+def mentioned_file_content_blocks(
+    message: str, *, base_dir: Path, workspace_roots: Sequence[Path] = ()
+) -> list[ContentBlock]:
+    blocks: list[ContentBlock] = []
+    for resource in _mentioned_file_resources(
+        message, base_dir=base_dir, workspace_roots=workspace_roots
+    ):
+        try:
+            result = read_lines_safe(
+                resource.path,
+                limit=_MENTIONED_FILE_LINE_LIMIT,
+                max_bytes=_MENTIONED_FILE_MAX_BYTES,
+            )
+        except OSError as exc:
+            raise PromptPreparationError(
+                f"Failed to attach file {resource.alias}: {exc}"
+            ) from exc
+        blocks.append(_mentioned_file_content_block(resource.path, result))
+    return blocks
 
 
-def _resource_location(uri: str) -> tuple[str, int | None, int | None]:
-    parts = urlsplit(uri)
-    match = _LINE_FRAGMENT_RE.fullmatch(parts.fragment)
-    if match is None:
-        return uri, None, None
-    return (
-        parts._replace(fragment="").geturl(),
-        int(match.group(1)),
-        int(match.group(2)) if match.group(2) is not None else None,
-    )
+async def mentioned_file_content_blocks_async(
+    message: str, *, base_dir: Path, workspace_roots: Sequence[Path] = ()
+) -> list[ContentBlock]:
+    blocks: list[ContentBlock] = []
+    for resource in _mentioned_file_resources(
+        message, base_dir=base_dir, workspace_roots=workspace_roots
+    ):
+        try:
+            result = await read_lines_safe_async(
+                resource.path,
+                limit=_MENTIONED_FILE_LINE_LIMIT,
+                max_bytes=_MENTIONED_FILE_MAX_BYTES,
+            )
+        except OSError as exc:
+            raise PromptPreparationError(
+                f"Failed to attach file {resource.alias}: {exc}"
+            ) from exc
+        blocks.append(_mentioned_file_content_block(resource.path, result))
+    return blocks
+
+
+def _mentioned_file_resources(
+    message: str, *, base_dir: Path, workspace_roots: Sequence[Path] = ()
+) -> list[PathResource]:
+    """The mentioned files inside the workspace roots, in mention order.
+
+    Inlining skips the read tool's prompt, so it keeps to those roots. A
+    mention outside them stays plain text for the read tool to ask about,
+    rather than failing the whole message.
+    """
+    root = base_dir.expanduser().resolve()
+    roots = _attachable_roots(root, workspace_roots)
+    payload = build_path_prompt_payload(message, base_dir=root)
+    resources = [
+        resource
+        for resource in payload.resources
+        if resource.kind == "file" and _is_within_roots(resource.path, roots)
+    ]
+    if len(resources) > _MENTIONED_FILE_MAX_FILES:
+        raise PromptPreparationError(
+            f"Too many file mentions: {_MENTIONED_FILE_MAX_FILES} maximum"
+        )
+    return resources
+
+
+def _attachable_roots(cwd: Path, workspace_roots: Sequence[Path]) -> tuple[Path, ...]:
+    roots = [root.expanduser().resolve() for root in workspace_roots]
+    if cwd not in roots:
+        roots.insert(0, cwd)
+    return tuple(roots)
+
+
+def _is_within_roots(path: Path, roots: Sequence[Path]) -> bool:
+    resolved = path.expanduser().resolve()
+    return any(resolved.is_relative_to(root) for root in roots)
+
+
+def _mentioned_file_content_block(
+    path: Path, result: BoundedReadResult
+) -> ResourceContentBlock:
+    text = "\n".join(result.lines)
+    if result.was_truncated:
+        text += _TRUNCATED_FILE_NOTE
+    return ResourceContentBlock(resource=UserTextResource(uri=path.as_uri(), text=text))
 
 
 def _snapshot_images(
-    agent_loop: AgentLoop, payload: PathPromptPayload
+    session_dir: Path | None, payload: PathPromptPayload
 ) -> list[ImageAttachment]:
     resources = extract_image_resources(payload)
     if len(resources) > MAX_IMAGES_PER_MESSAGE:
@@ -178,9 +279,7 @@ def _snapshot_images(
     for resource in resources:
         try:
             attachment = snapshot_image(
-                resource.path,
-                alias=resource.alias,
-                session_dir=agent_loop.session_logger.session_dir,
+                resource.path, alias=resource.alias, session_dir=session_dir
             )
         except ImageSnapshotError as exc:
             raise PromptPreparationError(

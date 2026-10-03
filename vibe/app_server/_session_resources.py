@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from contextlib import suppress
 from typing import Literal
 from uuid import uuid4
 
 from vibe.app_server._model import validate_wire
-from vibe.app_server._streaming import BoundedEventQueue, stream_request
+from vibe.app_server._streaming import BoundedEventQueue, stream_until_complete
 from vibe.app_server.client_state import ClientSessionState
 from vibe.app_server.connection import AppServerResourceConnection
 from vibe.app_server.events import (
@@ -20,17 +20,14 @@ from vibe.app_server.models import (
     ContentBlock,
     PreparedPrompt,
     PublicHistoryEntry,
-    PublicHistoryPage,
+    PublicSession,
     PublicSessionState,
-    SavedSessionSummary,
     ScheduledLoop,
     SessionLogSummary,
     WorkspaceTrustDecision,
 )
 from vibe.app_server.protocol import (
     EmptyResponse,
-    HistoryListParams,
-    HistoryListResponse,
     LoopsClearParams,
     LoopsClearResponse,
     LoopsCreateParams,
@@ -39,6 +36,7 @@ from vibe.app_server.protocol import (
     LoopsDeleteResponse,
     LoopsListParams,
     LoopsListResponse,
+    PageRequest,
     ReviewBaselineParams,
     ReviewBaselineResponse,
     ReviewHunksParams,
@@ -55,33 +53,37 @@ from vibe.app_server.protocol import (
     SessionForkResponse,
     SessionHistoryClearParams,
     SessionHistoryClearResponse,
+    SessionHistoryListParams,
+    SessionHistoryListResponse,
     SessionListParams,
     SessionListResponse,
     SessionLogReadParams,
     SessionLogReadResponse,
-    SessionResumeParams,
+    SessionReadParams,
+    SessionReadResponse,
+    SessionRelocateParams,
+    SessionRelocateResponse,
     SessionResumeResponse,
     SessionRewindParams,
     SessionRewindReadParams,
     SessionRewindReadResponse,
     SessionRewindResponse,
     SessionSettingsUpdateParams,
+    SessionShellCommandParams,
+    SessionShellCommandResponse,
     SessionTitleUpdateParams,
     SessionTitleUpdateResponse,
-    ShellInterruptParams,
-    ShellInterruptResponse,
-    ShellRunParams,
-    ShellRunResponse,
     WorkspacePromptPrepareParams,
     WorkspacePromptPrepareResponse,
     WorkspaceTrustDecisionParams,
     WorkspaceTrustStatusParams,
     WorkspaceTrustStatusResponse,
+    WorkspaceUntrustedConfigParams,
+    WorkspaceUntrustedConfigResponse,
 )
 from vibe.app_server.review import ReviewOwner, ReviewTarget
 
 type ShellTimelineEvent = HistoryEntryAdded | HistoryEntryUpdated
-type ShellEvent = ShellTimelineEvent | ShellRunResponse
 
 
 class ShellResource:
@@ -93,40 +95,47 @@ class ShellResource:
         self._events: dict[str, asyncio.Queue[ShellTimelineEvent]] = {}
 
     async def run(
-        self, command: str, *, timeout_seconds: float = 30.0
-    ) -> AsyncGenerator[ShellEvent, None]:
+        self, command: str, *, timeout_seconds: float | None = None
+    ) -> AsyncGenerator[ShellTimelineEvent, None]:
         client = await self._connection.connect()
         operation_id = str(uuid4())
         events = BoundedEventQueue[ShellTimelineEvent]()
         self._events[operation_id] = events
         completed = False
-        try:
-            async for event in stream_request(
-                client,
-                "shell/run",
-                ShellRunParams(
+        request = asyncio.create_task(
+            client.request(
+                "session/shellCommand",
+                SessionShellCommandParams(
                     session_id=self._state.session_id,
-                    operation_id=operation_id,
                     command=command,
                     timeout_seconds=timeout_seconds,
+                    operation_id=operation_id,
+                    action="run",
                 ),
-                events,
-                ShellRunResponse,
-            ):
-                if isinstance(event, ShellRunResponse):
-                    completed = True
+                wait_for_incoming=True,
+            )
+        )
+        try:
+            async for event in stream_until_complete(events, request):
                 yield event
+            validate_wire(SessionShellCommandResponse, await request)
+            completed = True
         finally:
+            if not request.done():
+                request.cancel()
+                with suppress(asyncio.CancelledError):
+                    await request
             try:
                 if not completed:
                     with suppress(Exception):
                         validate_wire(
-                            ShellInterruptResponse,
+                            SessionShellCommandResponse,
                             await client.request(
-                                "shell/interrupt",
-                                ShellInterruptParams(
+                                "session/shellCommand",
+                                SessionShellCommandParams(
                                     session_id=self._state.session_id,
                                     operation_id=operation_id,
+                                    action="interrupt",
                                 ),
                             ),
                         )
@@ -164,13 +173,35 @@ class SessionResource:
     def history(self) -> list[PublicHistoryEntry]:
         return self._state.projection.history
 
-    async def list(self, cwd: str | None = None) -> list[SavedSessionSummary]:
+    async def list(self, cwd: str | None = None) -> list[PublicSession]:
+        client = await self._connection.connect()
+        cursor: str | None = None
+        sessions: list[PublicSession] = []
+        while True:
+            response = validate_wire(
+                SessionListResponse,
+                await client.request(
+                    "session/list", SessionListParams(cwd=cwd, cursor=cursor)
+                ),
+            )
+            sessions.extend(response.items)
+            if response.next_cursor is None:
+                break
+            cursor = response.next_cursor
+        return sessions
+
+    async def resolve_continue_session(self, cwd: str | None = None) -> str | None:
+        """The session `--continue` resumes, resolved server-side (pointer-first)."""
         client = await self._connection.connect()
         response = validate_wire(
             SessionListResponse,
             await client.request("session/list", SessionListParams(cwd=cwd)),
         )
-        return response.sessions
+        return response.continue_session_id
+
+    @property
+    def history_before_cursor(self) -> str | None:
+        return self._state.projection.history_before_cursor
 
     async def delete(self, session_id: str) -> None:
         client = await self._connection.connect()
@@ -189,7 +220,7 @@ class SessionResource:
         response = validate_wire(
             SessionTitleUpdateResponse,
             await client.request(
-                "session/title/update",
+                "session/rename",
                 SessionTitleUpdateParams(
                     session_id=self._state.session_id, title=title
                 ),
@@ -213,17 +244,46 @@ class SessionResource:
         self._state.session_log = response.log
         return response.log
 
-    async def resume(self, session_id: str) -> None:
+    async def resume(
+        self, session_id: str, *, on_adopt: Callable[[], None] | None = None
+    ) -> None:
+        client = await self._connection.connect()
+        adopted: SessionResumeResponse | None = None
+
+        def _adopt(raw_response: dict[str, object]) -> None:
+            nonlocal adopted
+            response = validate_wire(SessionResumeResponse, raw_response)
+            self._state.projection = ClientProjection(response.state)
+            self._state.reset_usage_baseline()
+            self._connection.mark_session_attached()
+            if on_adopt is not None:
+                on_adopt()
+            adopted = response
+
+        await client.request(
+            "session/resume",
+            self._connection.resume_params(session_id),
+            response_boundary=_adopt,
+        )
+        if adopted is None:
+            raise RuntimeError("Session resume response was not adopted")
+
+    async def get_session_history(
+        self, session_id: str, history_limit: int = 200
+    ) -> list[PublicHistoryEntry]:
         client = await self._connection.connect()
         response = validate_wire(
-            SessionResumeResponse,
+            SessionReadResponse,
             await client.request(
-                "session/resume", SessionResumeParams(session_id=session_id)
+                "session/read",
+                SessionReadParams(
+                    session_id=session_id,
+                    history=PageRequest(limit=history_limit),
+                    turns=None,
+                ),
             ),
         )
-        self._state.projection = ClientProjection(response.state)
-        self._state.reset_usage_baseline()
-        self._connection.mark_session_attached()
+        return response.state.history or []
 
     async def update_settings(
         self, *, max_turns: int | None = None, max_tokens: int | None = None
@@ -262,43 +322,59 @@ class SessionResource:
             self._connection.mark_session_attached()
         return response
 
-    async def load_before(self, entry_id: str, limit: int = 10) -> PublicHistoryPage:
+    async def _fetch_history_page(
+        self,
+        *,
+        session_id: str | None = None,
+        turn_id: str | None = None,
+        cursor: str | None = None,
+        limit: int,
+        sort_direction: Literal["forward", "backward"] = "backward",
+    ) -> SessionHistoryListResponse:
         client = await self._connection.connect()
         response = validate_wire(
-            HistoryListResponse,
+            SessionHistoryListResponse,
             await client.request(
-                "history/list",
-                HistoryListParams(
-                    session_id=self._state.session_id, before=entry_id, limit=limit
+                "session/history/list",
+                SessionHistoryListParams(
+                    session_id=session_id or self._state.session_id,
+                    turn_id=turn_id,
+                    page=PageRequest(
+                        cursor=cursor, limit=limit, direction=sort_direction
+                    ),
                 ),
             ),
         )
-        self._state.projection.prepend_history_page(response.history)
-        return response.history
+        return response
+
+    async def load_before(
+        self, entry_id: str, limit: int = 10
+    ) -> SessionHistoryListResponse:
+        page = await self._fetch_history_page(
+            cursor=entry_id, limit=limit, sort_direction="backward"
+        )
+        self._state.state.history_before_cursor = page.next_cursor
+        self._state.projection.prepend_history_page(page.items)
+        return page
 
     async def list_history(
         self,
         *,
+        session_id: str | None = None,
         turn_id: str | None = None,
         before: str | None = None,
         after: str | None = None,
         limit: int = 200,
-    ) -> PublicHistoryPage:
-        client = await self._connection.connect()
-        response = validate_wire(
-            HistoryListResponse,
-            await client.request(
-                "history/list",
-                HistoryListParams(
-                    session_id=self._state.session_id,
-                    turn_id=turn_id,
-                    before=before,
-                    after=after,
-                    limit=limit,
-                ),
+    ) -> SessionHistoryListResponse:
+        return await self._fetch_history_page(
+            session_id=session_id,
+            turn_id=turn_id,
+            cursor=before or after,
+            limit=limit,
+            sort_direction=(
+                "forward" if after is not None and before is None else "backward"
             ),
         )
-        return response.history
 
     async def clear_history(self) -> None:
         client = await self._connection.connect()
@@ -319,7 +395,7 @@ class SessionResource:
         response = validate_wire(
             SessionCompactResponse,
             await client.request(
-                "session/compact/start",
+                "session/compact",
                 SessionCompactParams(
                     session_id=self._state.session_id,
                     extra_instructions=extra_instructions,
@@ -366,6 +442,18 @@ class SessionResource:
         self._state.projection.replace_state(response.state)
         self._state.session_log = response.session_log
         self._connection.mark_session_attached()
+        return response
+
+    async def relocate(self, cwd: str) -> SessionRelocateResponse:
+        client = await self._connection.connect()
+        response = validate_wire(
+            SessionRelocateResponse,
+            await client.request(
+                "session/relocate",
+                SessionRelocateParams(session_id=self._state.session_id, cwd=cwd),
+            ),
+        )
+        self._state.projection.replace_state(response.state)
         return response
 
 
@@ -486,6 +574,20 @@ class WorkspaceResource:
                 "workspace/trust/decision",
                 WorkspaceTrustDecisionParams(
                     session_id=self._state.session_id, cwd=cwd, decision=decision
+                ),
+            ),
+        )
+
+    async def untrusted_config_dirs(
+        self, cwd: str | None = None
+    ) -> WorkspaceUntrustedConfigResponse:
+        client = await self._connection.connect()
+        return validate_wire(
+            WorkspaceUntrustedConfigResponse,
+            await client.request(
+                "workspace/trust/untrustedConfig",
+                WorkspaceUntrustedConfigParams(
+                    cwd=cwd or self._state.state.session.cwd
                 ),
             ),
         )

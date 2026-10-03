@@ -7,20 +7,23 @@ from vibe.app_server._model import validate_wire
 from vibe.app_server.client import AppServerClient
 from vibe.app_server.client_tools import ClientToolHandler
 from vibe.app_server.models import (
-    PublicHistoryPage,
+    PublicSession,
     PublicSessionState,
-    SavedSessionSummary,
     WorkspaceTrustDecision,
 )
 from vibe.app_server.protocol import (
     ClientCapabilities,
     ClientInfo,
+    ConfigReadParams,
+    ConfigReadResponse,
     ConfigSchemaReadParams,
     ConfigSchemaReadResponse,
     EmptyResponse,
-    HistoryListParams,
-    HistoryListResponse,
+    PageRequest,
     SessionDeleteParams,
+    SessionHistoryListParams,
+    SessionHistoryListResponse,
+    SessionKind,
     SessionListParams,
     SessionListResponse,
     SessionOptions,
@@ -101,7 +104,9 @@ class AppServerHost:
         return await self._open_session(self._resume_session_id, self._continue_session)
 
     async def start_session(self) -> AppServerSession:
-        return await self._open_session(None, False)
+        # Backs the --resume picker; the throwaway session must not emit
+        # new-session telemetry since it is discarded on resume.
+        return await self._open_session(None, False, session_kind=SessionKind.EPHEMERAL)
 
     async def resume_session(self, session_id: str) -> AppServerSession:
         return await self._open_session(session_id, False)
@@ -110,7 +115,11 @@ class AppServerHost:
         return await self._open_session(None, True)
 
     async def _open_session(
-        self, resume_session_id: str | None, continue_session: bool
+        self,
+        resume_session_id: str | None,
+        continue_session: bool,
+        *,
+        session_kind: SessionKind = SessionKind.NORMAL,
     ) -> AppServerSession:
         from vibe.app_server.session import AppServerSession
 
@@ -123,32 +132,43 @@ class AppServerHost:
             session_options=self._session_options,
             resume_session_id=resume_session_id,
             continue_session=continue_session,
+            session_kind=session_kind,
             client_tool_handler=self._client_tool_handler,
             client_factory=self._client_factory,
         )
         self._transferred = True
         return session
 
-    async def list_sessions(self, cwd: str | None = None) -> list[SavedSessionSummary]:
+    async def list_sessions(self, cwd: str | None = None) -> list[PublicSession]:
         self._require_host()
-        response = validate_wire(
-            SessionListResponse,
-            await self._client.request("session/list", SessionListParams(cwd=cwd)),
-        )
-        return response.sessions
+        cursor: str | None = None
+        sessions: list[PublicSession] = []
+        while True:
+            response = validate_wire(
+                SessionListResponse,
+                await self._client.request(
+                    "session/list", SessionListParams(cwd=cwd, cursor=cursor)
+                ),
+            )
+            sessions.extend(response.items)
+            if response.next_cursor is None:
+                break
+            cursor = response.next_cursor
+        return sessions
 
     async def read_session(
         self, session_id: str, *, history_limit: int = 200
     ) -> PublicSessionState:
         self._require_host()
-        response = validate_wire(
+        return validate_wire(
             SessionReadResponse,
             await self._client.request(
                 "session/read",
-                SessionReadParams(session_id=session_id, history_limit=history_limit),
+                SessionReadParams(
+                    session_id=session_id, history=PageRequest(limit=history_limit)
+                ),
             ),
-        )
-        return response.state
+        ).state
 
     async def list_history(
         self,
@@ -157,18 +177,27 @@ class AppServerHost:
         before: str | None = None,
         after: str | None = None,
         limit: int = 200,
-    ) -> PublicHistoryPage:
+    ) -> SessionHistoryListResponse:
         self._require_host()
         response = validate_wire(
-            HistoryListResponse,
+            SessionHistoryListResponse,
             await self._client.request(
-                "history/list",
-                HistoryListParams(
-                    session_id=session_id, before=before, after=after, limit=limit
+                "session/history/list",
+                SessionHistoryListParams(
+                    session_id=session_id,
+                    page=PageRequest(
+                        cursor=before or after,
+                        limit=limit,
+                        direction=(
+                            "forward"
+                            if after is not None and before is None
+                            else "backward"
+                        ),
+                    ),
                 ),
             ),
         )
-        return response.history
+        return response
 
     async def delete_session(self, session_id: str) -> None:
         self._require_host()
@@ -186,7 +215,7 @@ class AppServerHost:
         return validate_wire(
             SessionTitleUpdateResponse,
             await self._client.request(
-                "session/title/update",
+                "session/rename",
                 SessionTitleUpdateParams(session_id=session_id, title=title),
             ),
         )
@@ -196,6 +225,13 @@ class AppServerHost:
         return validate_wire(
             ConfigSchemaReadResponse,
             await self._client.request("config/schema", ConfigSchemaReadParams()),
+        )
+
+    async def read_config(self) -> ConfigReadResponse:
+        self._require_host()
+        return validate_wire(
+            ConfigReadResponse,
+            await self._client.request("config/read", ConfigReadParams()),
         )
 
     async def trust_status(

@@ -19,7 +19,6 @@ from tests.e2e.common import (
     send_ctrl_c_until_quit_confirmation,
     wait_for_main_screen,
     wait_for_rendered_text,
-    wait_for_request_count,
 )
 from tests.e2e.mock_server import ChatCompletionsRequestPayload, StreamingMockServer
 
@@ -101,13 +100,20 @@ def test_write_file_approval_creates_file_and_rejection_leaves_file_absent(
     approved_path = e2e_workdir / APPROVED_FILE
     rejected_path = e2e_workdir / REJECTED_FILE
 
-    with spawned_vibe_process(e2e_workdir) as (child, captured):
+    with spawned_vibe_process(e2e_workdir, extra_args=["--agent", "ask"]) as (
+        child,
+        captured,
+    ):
         wait_for_main_screen(child, timeout=15)
         child.send("Create the approved file")
         child.send("\r")
 
-        wait_for_request_count(
-            lambda: len(streaming_mock_server.requests), expected_count=1, timeout=10
+        wait_for_request_count_while_draining_child_output(
+            child,
+            captured,
+            lambda: len(streaming_mock_server.requests),
+            expected_count=1,
+            timeout=10,
         )
         answer_approval(child, captured, tool_name="write_file", key="y")
         wait_for_request_count_while_draining_child_output(
@@ -168,8 +174,12 @@ def test_allow_for_session_reuses_bash_permission_without_prompting_again(
         child.send("Run the first shell command")
         child.send("\r")
 
-        wait_for_request_count(
-            lambda: len(streaming_mock_server.requests), expected_count=1, timeout=10
+        wait_for_request_count_while_draining_child_output(
+            child,
+            captured,
+            lambda: len(streaming_mock_server.requests),
+            expected_count=1,
+            timeout=10,
         )
         answer_approval(child, captured, tool_name="bash", key="2")
         wait_for_request_count_while_draining_child_output(

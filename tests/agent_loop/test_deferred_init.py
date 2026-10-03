@@ -379,7 +379,7 @@ class TestStartInitializeExperiments:
             await task
 
     @pytest.mark.asyncio
-    async def test_refreshes_system_prompt_when_experiments_update(self) -> None:
+    async def test_does_not_refresh_live_session_when_experiments_update(self) -> None:
         loop = build_test_agent_loop(
             launch_context=LaunchContext(
                 agent_entrypoint="cli",
@@ -391,7 +391,33 @@ class TestStartInitializeExperiments:
         )
         refresh_mock = AsyncMock()
         refresh_config_mock = AsyncMock()
-        init_mock = AsyncMock(return_value=True)
+        init_mock = AsyncMock(return_value=(True, None))
+
+        with (
+            patch.object(
+                agent_loop_module, "session_initialize_experiments", new=init_mock
+            ),
+            patch.object(loop, "refresh_config", new=refresh_config_mock),
+            patch.object(loop, "refresh_system_prompt", new=refresh_mock),
+        ):
+            await loop.initialize_experiments()
+
+        refresh_config_mock.assert_not_awaited()
+        refresh_mock.assert_not_awaited()
+        init_mock.assert_awaited_once()
+        init_args = init_mock.await_args
+        assert init_args is not None
+        assert (
+            init_args.kwargs["launch_context"].terminal_emulator
+            is TerminalEmulator.VSCODE
+        )
+
+    @pytest.mark.asyncio
+    async def test_hot_swaps_live_session_on_cold_cache_first_launch(self) -> None:
+        loop = build_test_agent_loop(await_experiment_model=True)
+        refresh_mock = AsyncMock()
+        refresh_config_mock = AsyncMock()
+        init_mock = AsyncMock(return_value=(True, None))
 
         with (
             patch.object(
@@ -405,12 +431,26 @@ class TestStartInitializeExperiments:
         refresh_config_mock.assert_awaited_once()
         refresh_mock.assert_awaited_once()
         init_mock.assert_awaited_once()
-        init_args = init_mock.await_args
-        assert init_args is not None
-        assert (
-            init_args.kwargs["launch_context"].terminal_emulator
-            is TerminalEmulator.VSCODE
-        )
+
+    @pytest.mark.asyncio
+    async def test_no_hot_swap_on_cold_cache_when_eval_unchanged(self) -> None:
+        loop = build_test_agent_loop(await_experiment_model=True)
+        refresh_mock = AsyncMock()
+        refresh_config_mock = AsyncMock()
+
+        with (
+            patch.object(
+                agent_loop_module,
+                "session_initialize_experiments",
+                new=AsyncMock(return_value=(False, None)),
+            ),
+            patch.object(loop, "refresh_config", new=refresh_config_mock),
+            patch.object(loop, "refresh_system_prompt", new=refresh_mock),
+        ):
+            await loop.initialize_experiments()
+
+        refresh_config_mock.assert_not_awaited()
+        refresh_mock.assert_not_awaited()
 
     def test_new_session_telemetry_uses_provided_terminal_emulator(self) -> None:
         loop = build_test_agent_loop(
@@ -444,7 +484,7 @@ class TestStartInitializeExperiments:
             patch.object(
                 agent_loop_module,
                 "session_initialize_experiments",
-                new=AsyncMock(return_value=False),
+                new=AsyncMock(return_value=(False, None)),
             ),
             patch.object(loop, "refresh_system_prompt", new=refresh_mock),
         ):
@@ -544,6 +584,141 @@ class TestWaitUntilReadyJoinsExperiments:
 
         emit_ready.assert_not_called()
         emit_new_session.assert_not_called()
+
+
+class TestHydrateExperimentsOnResume:
+    @pytest.mark.asyncio
+    async def test_skips_prompt_refresh_but_restores_local_state(self) -> None:
+        loop = build_test_agent_loop()
+        refresh_prompt = AsyncMock()
+        refresh_config = AsyncMock()
+        sync_variants = MagicMock()
+        resolve_mock = AsyncMock(return_value="Pro")
+
+        with (
+            patch.object(
+                agent_loop_module,
+                "session_hydrate_experiments_from_session",
+                new=AsyncMock(return_value=True),
+            ),
+            patch.object(
+                agent_loop_module, "session_resolve_plan_attributes", new=resolve_mock
+            ),
+            patch.object(loop, "refresh_system_prompt", new=refresh_prompt),
+            patch.object(loop, "refresh_config", new=refresh_config),
+            patch.object(loop, "_sync_growthbook_layer_variants", new=sync_variants),
+        ):
+            await loop.hydrate_experiments_from_session(refresh_prompt=False)
+            # Plan resolution is backgrounded so resume is not blocked — join it.
+            assert loop._plan_attrs_task is not None
+            await loop._plan_attrs_task
+
+        refresh_prompt.assert_not_called()
+        refresh_config.assert_awaited_once()
+        sync_variants.assert_called_once()
+        resolve_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_default_refreshes_prompt(self) -> None:
+        loop = build_test_agent_loop()
+        refresh_prompt = AsyncMock()
+        refresh_config = AsyncMock()
+        sync_variants = MagicMock()
+        resolve_mock = AsyncMock(return_value="Pro")
+
+        with (
+            patch.object(
+                agent_loop_module,
+                "session_hydrate_experiments_from_session",
+                new=AsyncMock(return_value=True),
+            ),
+            patch.object(
+                agent_loop_module, "session_resolve_plan_attributes", new=resolve_mock
+            ),
+            patch.object(loop, "refresh_system_prompt", new=refresh_prompt),
+            patch.object(loop, "refresh_config", new=refresh_config),
+            patch.object(loop, "_sync_growthbook_layer_variants", new=sync_variants),
+        ):
+            await loop.hydrate_experiments_from_session()
+            assert loop._plan_attrs_task is not None
+            await loop._plan_attrs_task
+
+        refresh_prompt.assert_awaited_once()
+        refresh_config.assert_awaited_once()
+        sync_variants.assert_called_once()
+        resolve_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_always_resolves_plan_attributes_without_rebucketing(self) -> None:
+        # On resume the loop restores only the frozen variant assignment, then
+        # ALWAYS rebuilds plan/org attributes from the user-scoped path — never
+        # by calling initialize_experiments (which would re-bucket) and never
+        # from meta.json. So user_plan reflects the current user.
+        loop = build_test_agent_loop()
+        refresh_prompt = AsyncMock()
+        refresh_config = AsyncMock()
+        sync_variants = MagicMock()
+        init_mock = AsyncMock()
+        resolve_mock = AsyncMock(return_value="Pro")
+
+        with (
+            patch.object(
+                agent_loop_module,
+                "session_hydrate_experiments_from_session",
+                new=AsyncMock(return_value=True),
+            ),
+            patch.object(loop, "initialize_experiments", new=init_mock),
+            patch.object(
+                agent_loop_module, "session_resolve_plan_attributes", new=resolve_mock
+            ),
+            patch.object(loop, "refresh_system_prompt", new=refresh_prompt),
+            patch.object(loop, "refresh_config", new=refresh_config),
+            patch.object(loop, "_sync_growthbook_layer_variants", new=sync_variants),
+        ):
+            await loop.hydrate_experiments_from_session()
+            assert loop._plan_attrs_task is not None
+            await loop._plan_attrs_task
+
+        sync_variants.assert_called_once()
+        refresh_config.assert_awaited_once()
+        init_mock.assert_not_called()
+        resolve_mock.assert_awaited_once()
+        assert loop.user_plan == "Pro"
+
+    @pytest.mark.asyncio
+    async def test_hydrate_leaves_experiments_task_free_for_growthbook(self) -> None:
+        # Regression (Bugbot): the resume plan-resolution uses its OWN task, not
+        # _experiments_task — otherwise start_initialize_experiments (guarded on
+        # _experiments_task) would no-op after hydrate and the session would skip
+        # the GrowthBook eval entirely.
+        loop = build_test_agent_loop()
+        resolve_mock = AsyncMock(return_value="Pro")
+        with (
+            patch.object(
+                agent_loop_module,
+                "session_hydrate_experiments_from_session",
+                new=AsyncMock(return_value=True),
+            ),
+            patch.object(
+                agent_loop_module, "session_resolve_plan_attributes", new=resolve_mock
+            ),
+            patch.object(loop, "refresh_system_prompt", new=AsyncMock()),
+            patch.object(loop, "refresh_config", new=AsyncMock()),
+            patch.object(loop, "_sync_growthbook_layer_variants", new=MagicMock()),
+        ):
+            await loop.hydrate_experiments_from_session()
+            assert loop._plan_attrs_task is not None
+            await loop._plan_attrs_task
+
+            # hydrate used the dedicated plan task, leaving _experiments_task free.
+            pre_experiments_task = loop._experiments_task
+            assert pre_experiments_task is None
+
+            # so start_initialize_experiments is NOT a no-op.
+            loop.start_initialize_experiments()
+            experiments_task = loop._experiments_task
+            assert experiments_task is not None
+            await experiments_task
 
 
 class TestInitDurationMsProperty:
@@ -688,3 +863,152 @@ class TestActGatesOnExperiments:
 
             assert finished_init is True
             assert any(getattr(event, "content", None) == "hello" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_start_initialize_experiments_arms_new_session_telemetry_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = build_test_agent_loop()
+    monkeypatch.setattr(loop, "initialize_experiments", AsyncMock())
+    try:
+        loop.start_initialize_experiments()
+        assert loop._pending_new_session_telemetry is True
+        assert loop._deferred_new_session_telemetry is False
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_deferred_new_session_telemetry_emitted_once_on_first_use(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = build_test_agent_loop()
+    monkeypatch.setattr(loop, "initialize_experiments", AsyncMock())
+    emit = MagicMock()
+    monkeypatch.setattr(loop, "emit_new_session_telemetry", emit)
+    try:
+        loop.start_initialize_experiments(defer_new_session_telemetry=True)
+        assert loop._pending_new_session_telemetry is False
+        assert loop._deferred_new_session_telemetry is True
+        emit.assert_not_called()
+
+        loop._emit_deferred_new_session_telemetry()
+        loop._emit_deferred_new_session_telemetry()
+        emit.assert_called_once_with()
+        assert loop._deferred_new_session_telemetry is False
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resume_drops_deferred_new_session_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = build_test_agent_loop()
+    monkeypatch.setattr(loop, "initialize_experiments", AsyncMock())
+    emit = MagicMock()
+    monkeypatch.setattr(loop, "emit_new_session_telemetry", emit)
+    try:
+        loop.start_initialize_experiments(defer_new_session_telemetry=True)
+        loop._reset_session_scoped_state()
+        assert loop._deferred_new_session_telemetry is False
+        loop._emit_deferred_new_session_telemetry()
+        emit.assert_not_called()
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_direct_new_session_emit_consumes_deferred_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = build_test_agent_loop()
+    monkeypatch.setattr(loop, "initialize_experiments", AsyncMock())
+    send = MagicMock()
+    monkeypatch.setattr(loop.telemetry_client, "send_new_session", send)
+    try:
+        loop.start_initialize_experiments(defer_new_session_telemetry=True)
+        # A direct emit (e.g. /new or /clear via _reset_session) consumes the
+        # deferred flag, so act()'s later flush cannot double-emit.
+        loop.emit_new_session_telemetry()
+        assert loop._deferred_new_session_telemetry is False
+        loop._emit_deferred_new_session_telemetry()
+        send.assert_called_once()
+    finally:
+        await loop.aclose()
+
+
+# --- cancelled init must not emit a half-initialized new_session (root fix) ---
+
+
+@pytest.mark.asyncio
+async def test_cancelled_experiments_task_skips_new_session_emit() -> None:
+    # Rapid start/stop cancels the experiments task mid-init; wait_until_ready
+    # must NOT emit vibe.new_session against the half-initialized session.
+    loop = build_test_agent_loop()
+    calls: list[int] = []
+    with patch.object(loop, "emit_new_session_telemetry", lambda: calls.append(1)):
+
+        async def _never() -> None:
+            await asyncio.sleep(3600)
+
+        task = asyncio.create_task(_never())
+        loop._experiments_task = task
+        loop._pending_new_session_telemetry = True
+        task.cancel()
+        try:
+            await loop.wait_until_ready()
+        finally:
+            await loop.aclose()
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_experiments_task_skips_ready_emit() -> None:
+    # A cancelled init must emit neither new_session nor a lone vibe.ready: a ready
+    # without a matching new_session carries the same missing segmentation the skip
+    # is meant to avoid, and the init duration must stay unrecorded.
+    loop = build_test_agent_loop()
+    ready_calls: list[int] = []
+    new_session_calls: list[int] = []
+    with (
+        patch.object(loop, "emit_ready_telemetry", lambda d: ready_calls.append(d)),
+        patch.object(
+            loop, "emit_new_session_telemetry", lambda: new_session_calls.append(1)
+        ),
+    ):
+
+        async def _never() -> None:
+            await asyncio.sleep(3600)
+
+        task = asyncio.create_task(_never())
+        loop._experiments_task = task
+        loop._pending_new_session_telemetry = True
+        loop._ready_telemetry_pending = True
+        task.cancel()
+        try:
+            await loop.wait_until_ready()
+        finally:
+            await loop.aclose()
+    assert ready_calls == []
+    assert new_session_calls == []
+    assert loop._last_init_duration_ms is None
+
+
+@pytest.mark.asyncio
+async def test_completed_experiments_task_emits_new_session() -> None:
+    loop = build_test_agent_loop()
+    calls: list[int] = []
+    with patch.object(loop, "emit_new_session_telemetry", lambda: calls.append(1)):
+
+        async def _done() -> None:
+            return None
+
+        loop._experiments_task = asyncio.create_task(_done())
+        loop._pending_new_session_telemetry = True
+        try:
+            await loop.wait_until_ready()
+        finally:
+            await loop.aclose()
+    assert calls == [1]

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import shutil
+from typing import Literal
 
 from vibe.core.utils.shell import shell_executable
 
@@ -32,10 +33,12 @@ def _shell_argv(command: str) -> list[str]:
 @dataclass(frozen=True)
 class BubblewrapBackend:
     executable: str
-    network: str = "none"
+    network: Literal["none", "host"] = "none"
 
     @classmethod
-    def detect(cls, network: str = "none") -> BubblewrapBackend | None:
+    def detect(
+        cls, network: Literal["none", "host"] = "none"
+    ) -> BubblewrapBackend | None:
         executable = shutil.which("bwrap")
         return cls(executable, network) if executable else None
 
@@ -88,10 +91,12 @@ class BubblewrapBackend:
 @dataclass(frozen=True)
 class FirejailBackend:
     executable: str
-    network: str = "none"
+    network: Literal["none", "host"] = "none"
 
     @classmethod
-    def detect(cls, network: str = "none") -> FirejailBackend | None:
+    def detect(
+        cls, network: Literal["none", "host"] = "none"
+    ) -> FirejailBackend | None:
         executable = shutil.which("firejail")
         return cls(executable, network) if executable else None
 

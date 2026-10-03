@@ -6,7 +6,7 @@ import sys
 import tomllib
 
 REQUIRED_SCRIPTS = {
-    "omv": "vibe.cli.entrypoint:main",
+    "omv": "vibe.cli.launcher:main",
     "omv-acp": "vibe.acp.entrypoint:main",
     "omv-app-server": "vibe.app_server.stdio:main",
 }

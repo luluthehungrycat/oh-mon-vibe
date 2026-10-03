@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, ClassVar, Literal
@@ -7,23 +8,27 @@ from typing import Any, ClassVar, Literal
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Container, Vertical
+from textual.containers import Container, Horizontal, Vertical
 from textual.content import Content
 from textual.message import Message
+from textual.timer import Timer
 from textual.widgets import OptionList
 from textual.widgets.option_list import Option
 
-from vibe.app_server.models import SavedSessionSummary
+from vibe.app_server.models import PublicSession, SavedSessionSummary
 from vibe.cli.textual_ui.shortcut_hints import SHORTCUT_STYLE, shortcut, shortcut_hint
 from vibe.cli.textual_ui.widgets.navigable_option_list import NavigableOptionList
 from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
+from vibe.cli.textual_ui.widgets.spinner_text import SpinnerText
 
 _SECONDS_PER_MINUTE = 60
 _SECONDS_PER_HOUR = 3600
 _SECONDS_PER_DAY = 86400
 _SECONDS_PER_WEEK = 604800
+_PREVIEW_DEBOUNCE_SECONDS = 0.1
 _DELETE_FEEDBACK_STYLE = "bold"
 _DeleteStateKind = Literal["confirmation", "feedback", "pending"]
+type _PickerSession = PublicSession | SavedSessionSummary
 
 
 @dataclass(frozen=True)
@@ -32,28 +37,56 @@ class _DeleteState:
     option_id: str
 
 
-def _format_relative_time(iso_time: str | None) -> str:
-    if not iso_time:
-        return "unknown"
+def _session_datetime(timestamp: int | str | None) -> datetime | None:
     try:
-        dt = datetime.fromisoformat(iso_time.replace("Z", "+00:00"))
-        now = datetime.now(UTC)
-        delta = now - dt
-        seconds = int(delta.total_seconds())
+        if isinstance(timestamp, int):
+            return datetime.fromtimestamp(timestamp / 1000, UTC)
+        if isinstance(timestamp, str):
+            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            return (
+                parsed.replace(tzinfo=UTC)
+                if parsed.tzinfo is None
+                else parsed.astimezone(UTC)
+            )
+    except (OverflowError, OSError, ValueError):
+        return None
+    return None
 
-        if seconds < _SECONDS_PER_MINUTE:
-            return "just now"
-        for threshold, divisor, unit in [
-            (_SECONDS_PER_HOUR, _SECONDS_PER_MINUTE, "m"),
-            (_SECONDS_PER_DAY, _SECONDS_PER_HOUR, "h"),
-            (_SECONDS_PER_WEEK, _SECONDS_PER_DAY, "d"),
-            (float("inf"), _SECONDS_PER_WEEK, "w"),
-        ]:
-            if seconds < threshold:
-                return f"{seconds // divisor}{unit} ago"
-    except (ValueError, OSError):
-        pass
+
+def _format_relative_time(timestamp: int | str | None) -> str:
+    if (dt := _session_datetime(timestamp)) is None:
+        return "unknown"
+
+    seconds = int((datetime.now(UTC) - dt).total_seconds())
+    if seconds < _SECONDS_PER_MINUTE:
+        return "just now"
+    for threshold, divisor, unit in [
+        (_SECONDS_PER_HOUR, _SECONDS_PER_MINUTE, "m"),
+        (_SECONDS_PER_DAY, _SECONDS_PER_HOUR, "h"),
+        (_SECONDS_PER_WEEK, _SECONDS_PER_DAY, "d"),
+        (float("inf"), _SECONDS_PER_WEEK, "w"),
+    ]:
+        if seconds < threshold:
+            return f"{seconds // divisor}{unit} ago"
     return "unknown"
+
+
+def _session_id(session: _PickerSession) -> str:
+    if isinstance(session, PublicSession):
+        return session.id
+    return session.session_id
+
+
+def _session_updated_at(session: _PickerSession) -> int | str | None:
+    if isinstance(session, PublicSession):
+        return session.updated_at
+    return session.end_time
+
+
+def _session_sort_key(session: _PickerSession) -> float:
+    if (updated_at := _session_datetime(_session_updated_at(session))) is None:
+        return 0
+    return updated_at.timestamp()
 
 
 def _build_header_text(cwd: str | None) -> Text:
@@ -63,12 +96,30 @@ def _build_header_text(cwd: str | None) -> Text:
     return text
 
 
-def _build_option_text(session: SavedSessionSummary, message: str) -> Content:
-    time_str = _format_relative_time(session.end_time)
-    session_id = session.short_id
-    return Content.assemble(
-        (f"{time_str:10}", "dim"), "  ", (f"{session_id}  ", "dim"), message
-    )
+def _session_harness_tag(session: _PickerSession) -> str | None:
+    """Return the harness provenance tag for a session, or ``None``.
+
+    Only ``PublicSession`` carries a ``harness`` field; legacy
+    ``SavedSessionSummary`` rows never have one.
+    """
+    if isinstance(session, PublicSession):
+        return session.harness
+    return None
+
+
+def _build_option_text(session: _PickerSession, message: str) -> Content:
+    time_str = _format_relative_time(_session_updated_at(session))
+    session_id = _session_id(session)[:8]
+    parts: list[tuple[str, str] | str] = [
+        (f"{time_str:10}", "dim"),
+        "  ",
+        (f"{session_id}  ", "dim"),
+    ]
+    harness = _session_harness_tag(session)
+    if harness is not None:
+        parts.append((f"[{harness}]  ", "dim"))
+    parts.append(message)
+    return Content.assemble(*parts)
 
 
 class SessionPickerApp(Container):
@@ -93,6 +144,13 @@ class SessionPickerApp(Container):
     class Cancelled(Message):
         pass
 
+    class SessionHighlighted(Message):
+        session_id: str | None
+
+        def __init__(self, session_id: str | None) -> None:
+            self.session_id = session_id
+            super().__init__()
+
     class SessionDeleteRequested(Message):
         option_id: str
         session_id: str
@@ -104,18 +162,26 @@ class SessionPickerApp(Container):
 
     def __init__(
         self,
-        sessions: list[SavedSessionSummary],
+        sessions: Sequence[_PickerSession],
         latest_messages: dict[str, str],
         current_session_id: str | None = None,
         cwd: str | None = None,
+        loading: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(id="sessionpicker-app", **kwargs)
-        self._sessions = sessions
+        self._sessions = list(sessions)
         self._latest_messages = latest_messages
         self._current_session_id = current_session_id
         self._cwd = cwd
+        self._loading = loading
+        self._preview_timer: Timer | None = None
+        self._pending_preview_session_id: str | None = None
         self._delete_state: _DeleteState | None = None
+        self._initial_highlighted: int | None = next(
+            (i for i, s in enumerate(sessions) if _session_id(s) == current_session_id),
+            None,
+        )
 
     @property
     def has_sessions(self) -> bool:
@@ -124,14 +190,16 @@ class SessionPickerApp(Container):
     def _option_list(self) -> OptionList:
         return self.query_one(OptionList)
 
-    def _session_by_option_id(
-        self, option_id: str | None
-    ) -> SavedSessionSummary | None:
+    def _session_by_option_id(self, option_id: str | None) -> _PickerSession | None:
         if option_id is None:
             return None
 
         return next(
-            (session for session in self._sessions if session.option_id == option_id),
+            (
+                session
+                for session in self._sessions
+                if _session_id(session) == option_id
+            ),
             None,
         )
 
@@ -142,18 +210,18 @@ class SessionPickerApp(Container):
 
         return str(option.id)
 
-    def _highlighted_session(self) -> SavedSessionSummary | None:
+    def _highlighted_session(self) -> _PickerSession | None:
         return self._session_by_option_id(self._highlighted_option_id())
 
-    def _session_message(self, session: SavedSessionSummary) -> str:
-        return self._latest_messages.get(session.option_id, "(empty session)")
+    def _session_message(self, session: _PickerSession) -> str:
+        return self._latest_messages.get(_session_id(session), "(empty session)")
 
-    def _normal_option_text(self, session: SavedSessionSummary) -> Content:
+    def _normal_option_text(self, session: _PickerSession) -> Content:
         return _build_option_text(session, self._session_message(session))
 
-    def _option_text(self, session: SavedSessionSummary) -> Content:
+    def _option_text(self, session: _PickerSession) -> Content:
         state = self._delete_state
-        if state is None or state.option_id != session.option_id:
+        if state is None or state.option_id != _session_id(session):
             return self._normal_option_text(session)
         match state.kind:
             case "confirmation":
@@ -163,28 +231,28 @@ class SessionPickerApp(Container):
             case "pending":
                 return self._delete_pending_option_text(session)
 
-    def _delete_confirmation_option_text(self, session: SavedSessionSummary) -> Content:
+    def _delete_confirmation_option_text(self, session: _PickerSession) -> Content:
         return _build_option_text(session, "") + Content.assemble(
             "Press ", ("d", SHORTCUT_STYLE), " again to delete"
         )
 
-    def _delete_feedback_option_text(self, session: SavedSessionSummary) -> Content:
+    def _delete_feedback_option_text(self, session: _PickerSession) -> Content:
         return _build_option_text(session, "") + Content.styled(
             self._delete_feedback_message(session), _DELETE_FEEDBACK_STYLE
         )
 
-    def _delete_feedback_message(self, session: SavedSessionSummary) -> str:
-        if session.session_id == self._current_session_id:
+    def _delete_feedback_message(self, session: _PickerSession) -> str:
+        if _session_id(session) == self._current_session_id:
             return "Can't delete current session"
 
         return "Can't delete session"
 
-    def _delete_pending_option_text(self, session: SavedSessionSummary) -> Content:
+    def _delete_pending_option_text(self, session: _PickerSession) -> Content:
         return _build_option_text(session, "") + Content("Deleting...")
 
-    def _restore_option_text(self, session: SavedSessionSummary) -> None:
+    def _restore_option_text(self, session: _PickerSession) -> None:
         self._option_list().replace_option_prompt(
-            session.option_id, self._normal_option_text(session)
+            _session_id(session), self._normal_option_text(session)
         )
 
     def _delete_state_matches(
@@ -199,6 +267,29 @@ class SessionPickerApp(Container):
     def _delete_is_pending(self) -> bool:
         return self._delete_state is not None and self._delete_state.kind == "pending"
 
+    def _cancel_pending_preview(self) -> None:
+        if self._preview_timer is not None:
+            self._preview_timer.stop()
+            self._preview_timer = None
+        self._pending_preview_session_id = None
+
+    def _schedule_preview(self, session_id: str | None) -> None:
+        self._cancel_pending_preview()
+        if session_id is None:
+            self.post_message(self.SessionHighlighted(session_id=None))
+            return
+        self._pending_preview_session_id = session_id
+        self._preview_timer = self.set_timer(
+            _PREVIEW_DEBOUNCE_SECONDS, self._flush_preview
+        )
+
+    def _flush_preview(self) -> None:
+        session_id = self._pending_preview_session_id
+        self._preview_timer = None
+        self._pending_preview_session_id = None
+        if session_id is not None:
+            self.post_message(self.SessionHighlighted(session_id=session_id))
+
     def _clear_delete_state(self) -> None:
         state = self._delete_state
         if state is None:
@@ -209,36 +300,47 @@ class SessionPickerApp(Container):
             self._restore_option_text(session)
 
     def _show_delete_state(
-        self, session: SavedSessionSummary, kind: _DeleteStateKind, prompt: Content
+        self, session: _PickerSession, kind: _DeleteStateKind, prompt: Content
     ) -> None:
         self._clear_delete_state()
-        self._delete_state = _DeleteState(kind=kind, option_id=session.option_id)
-        self._option_list().replace_option_prompt(session.option_id, prompt)
+        session_id = _session_id(session)
+        self._delete_state = _DeleteState(kind=kind, option_id=session_id)
+        self._option_list().replace_option_prompt(session_id, prompt)
 
     def remove_session(self, option_id: str) -> bool:
         session = self._session_by_option_id(option_id)
         if session is None:
             return False
 
-        self._sessions = [s for s in self._sessions if s.option_id != option_id]
+        self._sessions = [
+            session for session in self._sessions if _session_id(session) != option_id
+        ]
         self._latest_messages.pop(option_id, None)
         if self._delete_state_matches(option_id):
             self._delete_state = None
-        self._option_list().remove_option(option_id)
+        option_list = self._option_list()
+        option_list.remove_option(option_id)
+        # Textual doesn't fire OptionHighlighted when the highlight moves due to
+        # removal, so notify the app manually.
+        option = option_list.highlighted_option
+        new_id = (
+            str(option.id) if option is not None and option.id is not None else None
+        )
+        self._schedule_preview(new_id)
         return True
 
     def add_sessions(
-        self, sessions: list[SavedSessionSummary], latest_messages: dict[str, str]
+        self, sessions: list[PublicSession], latest_messages: dict[str, str]
     ) -> None:
-        existing = {s.option_id for s in self._sessions}
-        new_sessions = [s for s in sessions if s.option_id not in existing]
+        existing = {_session_id(session) for session in self._sessions}
+        new_sessions = [
+            session for session in sessions if _session_id(session) not in existing
+        ]
         if not new_sessions:
             return
 
         self._sessions = sorted(
-            [*self._sessions, *new_sessions],
-            key=lambda s: s.end_time or "",
-            reverse=True,
+            [*self._sessions, *new_sessions], key=_session_sort_key, reverse=True
         )
         self._latest_messages.update(latest_messages)
 
@@ -246,16 +348,39 @@ class SessionPickerApp(Container):
         highlighted = self._highlighted_option_id()
         option_list.clear_options()
         option_list.add_options([
-            Option(self._option_text(session), id=session.option_id)
+            Option(self._option_text(session), id=_session_id(session))
             for session in self._sessions
         ])
         self._refresh_header()
         if highlighted is None:
             return
         for index, session in enumerate(self._sessions):
-            if session.option_id == highlighted:
+            if _session_id(session) == highlighted:
                 option_list.highlighted = index
                 return
+
+    def load_sessions(
+        self, sessions: list[PublicSession], latest_messages: dict[str, str]
+    ) -> None:
+        """Populate the picker after initial mount. Highlights current session if present."""
+        if not self.is_mounted:
+            return
+        if self._loading:
+            self._loading = False
+            loading = self.query_one("#sessionpicker-loading", Horizontal)
+            loading.query_one(SpinnerText).set_pending(False)
+            loading.display = False
+        self.add_sessions(sessions, latest_messages)
+        option_list = self._option_list()
+        if option_list.highlighted is not None:
+            return
+        target_id = self._current_session_id
+        for index, session in enumerate(self._sessions):
+            if target_id is not None and _session_id(session) == target_id:
+                option_list.highlighted = index
+                return
+        if self._sessions:
+            option_list.highlighted = 0
 
     def _refresh_header(self) -> None:
         header = self.query_one(".sessionpicker-header", NoMarkupStatic)
@@ -270,14 +395,23 @@ class SessionPickerApp(Container):
 
     def compose(self) -> ComposeResult:
         options = [
-            Option(self._normal_option_text(session), id=session.option_id)
+            Option(self._normal_option_text(session), id=_session_id(session))
             for session in self._sessions
         ]
         with Vertical(id="sessionpicker-content"):
             yield NoMarkupStatic(
                 _build_header_text(self._cwd), classes="sessionpicker-header"
             )
-            yield NavigableOptionList(*options, id="sessionpicker-options")
+            if self._loading:
+                with Horizontal(id="sessionpicker-loading"):
+                    yield SpinnerText(classes="sessionpicker-loading-indicator")
+                    yield NoMarkupStatic(
+                        "Loading sessions…", classes="sessionpicker-loading-status"
+                    )
+            option_list = NavigableOptionList(*options, id="sessionpicker-options")
+            if self._initial_highlighted is not None:
+                option_list.highlighted = self._initial_highlighted
+            yield option_list
             yield NoMarkupStatic(
                 shortcut_hint(
                     f"{shortcut('↑↓/jk')} Navigate  {shortcut('Enter')} Select  "
@@ -287,7 +421,15 @@ class SessionPickerApp(Container):
             )
 
     def on_mount(self) -> None:
-        self.query_one(OptionList).focus()
+        if self._loading:
+            self.query_one(SpinnerText).set_pending(True)
+        option_list = self.query_one(OptionList)
+        option_list.focus()
+        option = option_list.highlighted_option
+        initial_id = (
+            str(option.id) if option is not None and option.id is not None else None
+        )
+        self._schedule_preview(initial_id)
 
     def on_option_list_option_highlighted(
         self, event: OptionList.OptionHighlighted
@@ -298,6 +440,7 @@ class SessionPickerApp(Container):
         option_id = str(event.option.id) if event.option.id is not None else None
         if self._delete_state is not None and self._delete_state.option_id != option_id:
             self._clear_delete_state()
+        self._schedule_preview(option_id)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if self._delete_is_pending():
@@ -308,6 +451,7 @@ class SessionPickerApp(Container):
             if self._delete_state_matches(option_id, "confirmation"):
                 return
 
+            self._cancel_pending_preview()
             self.post_message(
                 self.SessionSelected(option_id=option_id, session_id=option_id)
             )
@@ -320,6 +464,7 @@ class SessionPickerApp(Container):
             self._clear_delete_state()
             return
 
+        self._cancel_pending_preview()
         self.post_message(self.Cancelled())
 
     def action_request_delete(self) -> None:
@@ -330,23 +475,26 @@ class SessionPickerApp(Container):
         if session is None:
             return
 
-        if session.session_id == self._current_session_id:
+        session_id = _session_id(session)
+        if session_id == self._current_session_id:
             self._show_delete_state(
                 session, "feedback", self._delete_feedback_option_text(session)
             )
             return
 
-        if self._delete_state_matches(session.option_id, "confirmation"):
+        if self._delete_state_matches(session_id, "confirmation"):
             self._show_delete_state(
                 session, "pending", self._delete_pending_option_text(session)
             )
+            self._cancel_pending_preview()
             self.post_message(
-                self.SessionDeleteRequested(
-                    option_id=session.option_id, session_id=session.session_id
-                )
+                self.SessionDeleteRequested(option_id=session_id, session_id=session_id)
             )
             return
 
         self._show_delete_state(
             session, "confirmation", self._delete_confirmation_option_text(session)
         )
+
+    def on_unmount(self) -> None:
+        self._cancel_pending_preview()

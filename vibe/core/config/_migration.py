@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+from vibe.core.agents.models import BuiltinAgentName
 from vibe.core.config.layer import (
     ConfigLayer,
     EmptyLayerError,
@@ -12,6 +13,7 @@ from vibe.core.config.layer import (
 )
 from vibe.core.config.layers._base import BaseTomlConfigLayer
 from vibe.core.config.patch import ConfigPatch, ReplaceOperationPatch
+from vibe.core.utils import name_matches
 
 # One-shot id: syncs an existing bash allowlist up to the current default
 # read-only commands once, so users keep the ability to remove any of them.
@@ -20,6 +22,8 @@ BASH_READ_ONLY_MIGRATION = "bash_read_only_defaults_v1"
 # Old tool name -> new tool name. The new tools replaced these in-place, so
 # existing user configs keyed by the old names need their settings moved over.
 RENAMED_TOOLS: dict[str, str] = {"read": "read_file", "search_replace": "edit"}
+
+RENAMED_AGENTS: dict[str, str] = {"default": "ask"}
 
 # Options on the old tool that have no equivalent on the new one; dropped on migrate.
 DROPPED_TOOL_OPTIONS: dict[str, tuple[str, ...]] = {
@@ -62,8 +66,9 @@ def migrate_config(data: dict[str, Any]) -> bool:
     changed |= _migrate_bash_allowlist(data)
     changed |= _migrate_bash_read_only(data)
     changed |= _migrate_model_renames(data)
-    changed |= _migrate_devstral_small_thinking(data)
+    changed |= _migrate_removed_devstral_small(data)
     changed |= _migrate_renamed_tools(data)
+    changed |= _migrate_renamed_agents(data)
     return changed
 
 
@@ -150,30 +155,52 @@ def _migrate_model_renames(data: dict[str, Any]) -> bool:
     return changed
 
 
-def _migrate_devstral_small_thinking(data: dict[str, Any]) -> bool:
-    """Force devstral-small to thinking='off'; it has no reasoning support.
+def _migrate_removed_devstral_small(data: dict[str, Any]) -> bool:
+    """Drop incomplete ``devstral-small`` overrides left behind by its removal.
 
-    Stale configs that carried a non-'off' thinking level made the backend send
-    a ``reasoning_effort`` the model rejects with an API error.
+    Sparse entries (missing ``name``/``provider``) relied on the default layer
+    to fill in identity; without it they fail validation on load. Complete
+    entries are kept.
     """
-    models = data.get("models", [])
-    if isinstance(models, dict):
-        model_entries = models.values()
-    elif isinstance(models, list):
-        model_entries = models
+    alias = "devstral-small"
+    name = "devstral-small-latest"
+
+    def is_devstral_small(model: Any, *, key: str | None = None) -> bool:
+        if not isinstance(model, dict):
+            return False
+        resolved = key or model.get("alias")
+        return resolved == alias or model.get("name") == name
+
+    models = data.get("models")
+    if isinstance(models, list):
+        before = len(models)
+        models[:] = [
+            m for m in models if not (is_devstral_small(m) and _is_sparse_model(m))
+        ]
+        dropped = len(models) != before
+        if dropped and not models:
+            del data["models"]
+    elif isinstance(models, dict):
+        before = len(models)
+        for key in list(models):
+            if is_devstral_small(models[key], key=key) and _is_sparse_model(
+                models[key]
+            ):
+                del models[key]
+        dropped = len(models) != before
+        if dropped and not models:
+            del data["models"]
     else:
         return False
 
-    changed = False
-    for model in model_entries:
-        if not isinstance(model, dict):
-            continue
-        if model.get("name") == "devstral-small-latest" and (
-            model.get("thinking") != "off"
-        ):
-            model["thinking"] = "off"
-            changed = True
-    return changed
+    if dropped and data.get("active_model") == alias:
+        data["active_model"] = ""
+    return dropped
+
+
+def _is_sparse_model(model: Any) -> bool:
+    """A model entry missing name or provider; cannot stand alone without defaults."""
+    return isinstance(model, dict) and not (model.get("name") and model.get("provider"))
 
 
 def _rekey_model_entry(
@@ -212,3 +239,44 @@ def _migrate_renamed_tools(data: dict[str, Any]) -> bool:
             changed = True
 
     return changed
+
+
+def _migrate_renamed_agents(data: dict[str, Any]) -> bool:
+    changed = False
+
+    default_agent = data.get("default_agent")
+    if isinstance(default_agent, str) and default_agent in RENAMED_AGENTS:
+        data["default_agent"] = RENAMED_AGENTS[default_agent]
+        changed = True
+
+    for list_key in ("enabled_agents", "disabled_agents", "installed_agents"):
+        names = data.get(list_key)
+        if not isinstance(names, list):
+            continue
+        renamed = [
+            RENAMED_AGENTS.get(name, name) if isinstance(name, str) else name
+            for name in names
+        ]
+        if renamed != names:
+            data[list_key] = renamed
+            changed = True
+
+    if "default_agent" not in data:
+        ask = RENAMED_AGENTS["default"]
+        if _agent_filters_exclude(
+            data, BuiltinAgentName.ACCEPT_EDITS
+        ) and not _agent_filters_exclude(data, ask):
+            data["default_agent"] = ask
+            changed = True
+
+    return changed
+
+
+def _agent_filters_exclude(data: dict[str, Any], agent: str) -> bool:
+    enabled = data.get("enabled_agents")
+    if isinstance(enabled, list) and enabled:
+        return not name_matches(agent, enabled)
+    disabled = data.get("disabled_agents")
+    if isinstance(disabled, list):
+        return name_matches(agent, disabled)
+    return False

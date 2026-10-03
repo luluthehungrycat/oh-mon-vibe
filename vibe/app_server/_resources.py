@@ -2,36 +2,59 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any, cast
 
 from pydantic import JsonValue
 
 from vibe.app_server._account import AccountController, AccountGateway
+from vibe.app_server._admin_config import (
+    refresh_admin_layer,
+    report_admin_config_outcome,
+)
 from vibe.app_server._config_introspect import (
     HIDDEN_SETTINGS,
     POPULAR_SETTINGS,
     build_field_wires,
     collect_layer_values,
 )
+from vibe.app_server._config_write import (
+    config_write_ops_to_patches,
+    config_write_targets,
+    model_config_write_ops,
+)
 from vibe.app_server._dispatch import DispatchResult, RequestFailure, method_not_found
 from vibe.app_server._execution import SessionExecution
 from vibe.app_server._identity import IdentityController, IdentityGateway
 from vibe.app_server._model import ProtocolModel, validate_wire
-from vibe.app_server._narration import NarrationService
+from vibe.app_server._narration import NarrationContext, NarrationService
 from vibe.app_server._projection import (
     project_agents,
     project_config,
     project_connectors,
     project_debug_logs,
     project_diagnostics,
+    project_installed_skills,
     project_mcp,
     project_session_log,
     project_skills,
     project_stats,
     project_tools,
 )
+from vibe.app_server._session_model import (
+    active_model_override_write_requested,
+    set_session_active_model_override,
+    with_session_active_model_write,
+)
+from vibe.app_server._skills_service import SkillsController
 from vibe.app_server.config import ProxySettingsView
-from vibe.app_server.models import AccountView, IdentityView, MCPState, ScheduledLoop
+from vibe.app_server.models import (
+    AccountView,
+    IdentityView,
+    MCPState,
+    ScheduledLoop,
+    SkillSummary,
+)
 from vibe.app_server.protocol import (
     AccountReadParams,
     AccountReadResponse,
@@ -41,16 +64,15 @@ from vibe.app_server.protocol import (
     ConfigFieldsReadParams,
     ConfigFieldsReadResponse,
     ConfigMutationResponse,
-    ConfigPatchOpWire,
-    ConfigPatchParams,
-    ConfigPatchResponse,
     ConfigProxyReadParams,
     ConfigProxyReadResponse,
     ConfigProxyWriteParams,
     ConfigReadParams,
     ConfigReadResponse,
     ConfigReloadParams,
-    ConfigThinkingWriteParams,
+    ConfigWriteOpWire,
+    ConfigWriteParams,
+    ConfigWriteResponse,
     ConnectorAuthReadParams,
     ConnectorAuthReadResponse,
     ConnectorRefreshParams,
@@ -75,24 +97,13 @@ from vibe.app_server.protocol import (
     LoopsDeleteResponse,
     LoopsListParams,
     LoopsListResponse,
-    MCPAddParams,
-    MCPAddResponse,
-    MCPAuthUrlParams,
-    MCPLoginParams,
-    MCPLogoutParams,
-    MCPReadParams,
-    MCPReadResponse,
-    MCPRefreshParams,
-    MCPToggleParams,
+    ModelConfigWriteParams,
     NarrationSummarizeParams,
     NarrationSummarizeResponse,
     ProtocolErrorCode,
-    RuntimeMutationResponse,
     RuntimeReadParams,
     RuntimeReadResponse,
     RuntimeSnapshot,
-    SkillsListParams,
-    SkillsListResponse,
     StatsReadParams,
     StatsReadResponse,
     TelemetryRecordParams,
@@ -100,22 +111,13 @@ from vibe.app_server.protocol import (
     ToolsListResponse,
 )
 from vibe.core.agent_loop import AgentLoop
+from vibe.core.config import VibeConfigSchema
 from vibe.core.config.admin_config import (
+    MANAGED_CONFIG_TIMEOUT,
     AdminConfigApplyResult,
     AdminConfigOutcome,
-    fetch_managed_config,
 )
-from vibe.core.config.layers.admin import AdminConfigLayer
-from vibe.core.config.layers.overrides import OverridesLayer
-from vibe.core.config.mcp_servers import MCPServerAddError, persist_oauth_mcp_server
-from vibe.core.config.orchestrator import ConfigPatchValidationError
-from vibe.core.config.patch import (
-    AddOperationPatch,
-    PatchOp,
-    RemoveOperationPatch,
-    escape_json_pointer_token,
-)
-from vibe.core.config.types import ConcurrencyConflictError
+from vibe.core.config.orchestrator import ConfigOrchestrator, ConfigPatchValidationError
 from vibe.core.feedback import (
     record_feedback_asked,
     record_feedback_given,
@@ -131,16 +133,58 @@ from vibe.core.proxy_setup import (
     set_proxy_var,
     unset_proxy_var,
 )
-from vibe.core.tools.mcp_settings import persist_mcp_toggle
 from vibe.core.types import Role, ScheduledLoop as CoreScheduledLoop
-from vibe.observability.logging import logger
-from vibe.utils.api_keys import resolve_api_key
+from vibe.feedback import FEEDBACK_SNOOZED_COOLDOWN_SECONDS
+from vibe.observability.logging import logger, set_config_log_level
 
-_ADMIN_FETCH_FAILURES = frozenset({
-    AdminConfigOutcome.FETCH_FAILED,
-    AdminConfigOutcome.PARSE_FAILED,
-    AdminConfigOutcome.APPLY_FAILED,
-})
+
+class _LegacySkillsHost:
+    """``SkillsHost`` over the legacy agent loop.
+
+    A skill change is picked up by reloading the loop, which re-walks the search
+    paths; the snapshot is re-projected afterwards so the client sees the new
+    catalogue in the same response.
+    """
+
+    def __init__(
+        self,
+        agent_loop: AgentLoop,
+        execution: SessionExecution,
+        runtime_snapshot: Callable[[], RuntimeSnapshot],
+        require_session: Callable[[str], None],
+    ) -> None:
+        self._agent_loop = agent_loop
+        self._execution = execution
+        self._runtime_snapshot = runtime_snapshot
+        self._require_session = require_session
+
+    @property
+    def config(self) -> VibeConfigSchema:
+        return self._agent_loop.config
+
+    @property
+    def config_orchestrator(self) -> ConfigOrchestrator[VibeConfigSchema]:
+        return self._agent_loop.config_orchestrator
+
+    @property
+    def skill_roots(self) -> list[Path]:
+        return self._agent_loop.harness_files.project_roots
+
+    def require_idle(self) -> None:
+        self._execution.require_idle()
+
+    def require_session(self, session_id: str) -> None:
+        self._require_session(session_id)
+
+    def list_skills(self) -> list[SkillSummary]:
+        return project_skills(self._agent_loop)
+
+    def installed_skills(self) -> list[SkillSummary]:
+        return project_installed_skills(self._agent_loop)
+
+    async def refresh(self) -> RuntimeSnapshot:
+        await self._agent_loop.reload_with_initial_messages(reload_hooks=True)
+        return self._runtime_snapshot()
 
 
 class ResourceRequestHandler:
@@ -150,16 +194,30 @@ class ResourceRequestHandler:
         execution: SessionExecution,
         notify: Callable[[str, ProtocolModel], Awaitable[None]],
         account_gateway: AccountGateway | None = None,
+        current_event_id: Callable[[str], int] | None = None,
         identity_gateway: IdentityGateway | None = None,
     ) -> None:
         self._agent_loop = agent_loop
         self._execution = execution
         self._notify = notify
+        self._current_event_id = current_event_id or (lambda _session_id: 0)
         self._account = AccountController(agent_loop, account_gateway)
         self._identity = IdentityController(agent_loop, identity_gateway)
         self._loops = LoopManager(agent_loop.session_logger)
         self._logs = LogReader()
-        self._narration = NarrationService(agent_loop)
+        self._narration = NarrationService(
+            lambda: NarrationContext(
+                config=agent_loop.config,
+                launch_context=agent_loop.launch_context,
+                parent_session_id=agent_loop.parent_session_id,
+                user_plan=agent_loop.user_plan,
+            )
+        )
+        self._skills = SkillsController(
+            _LegacySkillsHost(
+                agent_loop, execution, self.runtime_snapshot, self._require_session
+            )
+        )
         self._mcp_discovery_errors: dict[str, str] = {}
         self.restore_loops()
 
@@ -176,12 +234,12 @@ class ResourceRequestHandler:
                 result = await self._dispatch_config(method, raw_params)
             case "agents":
                 result = await self._dispatch_agents(method, raw_params)
-            case "skills" | "tools" | "stats" | "diagnostics":
+            case "skills":
+                result = await self._skills.dispatch(method, raw_params)
+            case "tools" | "stats" | "diagnostics":
                 result = self._dispatch_catalog(method, raw_params)
             case "connectors":
                 result = await self._dispatch_connectors(method, raw_params)
-            case "mcp":
-                result = await self._dispatch_mcp(method, raw_params)
             case "loops":
                 result = await self._dispatch_loops(method, raw_params)
             case "narration":
@@ -236,7 +294,6 @@ class ResourceRequestHandler:
         issues, hooks_count = project_diagnostics(self._agent_loop)
         return RuntimeSnapshot(
             config=project_config(self._agent_loop),
-            base_config=project_config(self._agent_loop, base=True),
             active_agent=active,
             agents=agents,
             skills=project_skills(self._agent_loop),
@@ -247,6 +304,7 @@ class ResourceRequestHandler:
             hooks_count=hooks_count,
             connectors=project_connectors(self._agent_loop),
             mcp=self._mcp_state(),
+            bypass_tool_permissions=self._agent_loop.bypass_tool_permissions,
         )
 
     def _mcp_state(self) -> MCPState:
@@ -287,27 +345,25 @@ class ResourceRequestHandler:
                     validate_wire(ConfigReadParams, raw_params)
                 )
                 runtime_updated = False
+            case "config/write" | "config/model/write":
+                write_params = (
+                    validate_wire(ConfigWriteParams, raw_params)
+                    if method == "config/write"
+                    else self._model_config_write_params(
+                        validate_wire(ModelConfigWriteParams, raw_params)
+                    )
+                )
+                write_response = await self._config_write(write_params)
+                response = write_response
+                runtime_updated = write_response.applied
             case "config/fields/read":
                 response = await self._config_fields_read(
                     validate_wire(ConfigFieldsReadParams, raw_params)
                 )
                 runtime_updated = False
-            case "config/patch":
-                patch_response = await self._config_patch(
-                    validate_wire(ConfigPatchParams, raw_params)
-                )
-                response = patch_response
-                runtime_updated = not patch_response.rejected and not (
-                    patch_response.failures
-                )
             case "config/reload":
                 response = await self._config_reload(
                     validate_wire(ConfigReloadParams, raw_params)
-                )
-                runtime_updated = True
-            case "config/thinking/write":
-                response = await self._config_thinking_write(
-                    validate_wire(ConfigThinkingWriteParams, raw_params)
                 )
                 runtime_updated = True
             case "config/proxy/read":
@@ -361,12 +417,10 @@ class ResourceRequestHandler:
         self, method: str, raw_params: dict[str, Any]
     ) -> DispatchResult:
         match method:
-            case "skills/list":
-                response: ProtocolModel = self._skills_list(
-                    validate_wire(SkillsListParams, raw_params)
-                )
             case "tools/list":
-                response = self._tools_list(validate_wire(ToolsListParams, raw_params))
+                response: ProtocolModel = self._tools_list(
+                    validate_wire(ToolsListParams, raw_params)
+                )
             case "stats/read":
                 response = self._stats_read(validate_wire(StatsReadParams, raw_params))
             case "diagnostics/list":
@@ -404,42 +458,6 @@ class ResourceRequestHandler:
                 raise method_not_found(method)
         return DispatchResult(response, runtime_updated=runtime_updated)
 
-    async def _dispatch_mcp(
-        self, method: str, raw_params: dict[str, Any]
-    ) -> DispatchResult:
-        match method:
-            case "mcp/read":
-                response: ProtocolModel = self._mcp_read(
-                    validate_wire(MCPReadParams, raw_params)
-                )
-                runtime_updated = False
-            case "mcp/refresh":
-                response = await self._mcp_refresh(
-                    validate_wire(MCPRefreshParams, raw_params)
-                )
-                runtime_updated = True
-            case "mcp/toggle":
-                response = await self._mcp_toggle(
-                    validate_wire(MCPToggleParams, raw_params)
-                )
-                runtime_updated = True
-            case "mcp/add":
-                response = await self._mcp_add(validate_wire(MCPAddParams, raw_params))
-                runtime_updated = True
-            case "mcp/logout":
-                response = await self._mcp_logout(
-                    validate_wire(MCPLogoutParams, raw_params)
-                )
-                runtime_updated = True
-            case "mcp/login":
-                response = await self._mcp_login(
-                    validate_wire(MCPLoginParams, raw_params)
-                )
-                runtime_updated = True
-            case _:
-                raise method_not_found(method)
-        return DispatchResult(response, runtime_updated=runtime_updated)
-
     async def _dispatch_loops(
         self, method: str, raw_params: dict[str, Any]
     ) -> DispatchResult:
@@ -452,7 +470,6 @@ class ResourceRequestHandler:
                         loops=[_project_loop(loop) for loop in self._loops.loops]
                     )
                 case "loops/create":
-                    self._execution.require_idle()
                     params = validate_wire(LoopsCreateParams, raw_params)
                     self._require_session(params.session_id)
                     response = LoopsCreateResponse(
@@ -461,14 +478,12 @@ class ResourceRequestHandler:
                         )
                     )
                 case "loops/delete":
-                    self._execution.require_idle()
                     params = validate_wire(LoopsDeleteParams, raw_params)
                     self._require_session(params.session_id)
                     response = LoopsDeleteResponse(
                         loop=_project_loop(await self._loops.delete(params.loop_id))
                     )
                 case "loops/clear":
-                    self._execution.require_idle()
                     params = validate_wire(LoopsClearParams, raw_params)
                     self._require_session(params.session_id)
                     response = LoopsClearResponse(count=await self._loops.clear())
@@ -519,7 +534,8 @@ class ResourceRequestHandler:
                             user_messages + params.pending_user_messages
                         ),
                         cache_store=self._agent_loop.cache_store,
-                    )
+                    ),
+                    snooze_duration_seconds=FEEDBACK_SNOOZED_COOLDOWN_SECONDS,
                 )
             case "feedback/record":
                 params = validate_wire(FeedbackRecordParams, raw_params)
@@ -539,42 +555,94 @@ class ResourceRequestHandler:
     def _config_read(self, params: ConfigReadParams) -> ConfigReadResponse:
         if params.session_id is not None:
             self._require_session(params.session_id)
-        return self._config_response()
+        config = project_config(self._agent_loop)
+        skills_count = sum(
+            1 for skill in project_skills(self._agent_loop) if skill.source != "builtin"
+        )
+        _, hooks_count = project_diagnostics(self._agent_loop)
+        mcp_servers_total = len(self._agent_loop.config.mcp_servers)
+        mcp_servers_enabled = sum(
+            1 for server in self._agent_loop.config.mcp_servers if not server.disabled
+        )
+        return ConfigReadResponse(
+            config=config,
+            skills_count=skills_count,
+            hooks_count=hooks_count,
+            mcp_servers_total=mcp_servers_total,
+            mcp_servers_enabled=mcp_servers_enabled,
+        )
 
-    async def _config_patch(self, params: ConfigPatchParams) -> ConfigPatchResponse:
+    def _model_config_write_params(
+        self, params: ModelConfigWriteParams
+    ) -> ConfigWriteParams:
+        """Lower a model pick onto this backend's generic write.
+
+        The legacy backend applies configuration synchronously, so a pick keeps
+        the idle-only contract here; only the Unified backend can park one.
+        """
+        try:
+            ops = model_config_write_ops(
+                self._agent_loop.config,
+                model_alias=params.model_alias,
+                reasoning_effort=params.reasoning_effort,
+            )
+        except ValueError as exc:
+            raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, str(exc)) from exc
+        return ConfigWriteParams(
+            session_id=params.session_id,
+            ops=ops,
+            reason="model configuration",
+            reload_runtime=True,
+        )
+
+    async def _config_write(self, params: ConfigWriteParams) -> ConfigWriteResponse:
         self._execution.require_idle()
         self._require_session(params.session_id)
-        operations: list[PatchOp] = []
-        for op in params.ops:
-            if op.op == "set":
-                operations.append(
-                    AddOperationPatch(
-                        path=op.path, value=op.value, target_layer_name=op.target_layer
-                    )
-                )
-            else:
-                operations.append(
-                    RemoveOperationPatch(
-                        path=op.path, target_layer_name=op.target_layer
-                    )
-                )
+        session_model_pinned = self._agent_loop.session_logger.active_model is not None
+        update_session_override = (
+            session_model_pinned and active_model_override_write_requested(params.ops)
+        )
+        ops = (
+            with_session_active_model_write(params.ops)
+            if update_session_override
+            else params.ops
+        )
+        durable_aliases = (
+            await self._agent_loop.config_orchestrator.durable_model_aliases()
+        )
+        operations = config_write_ops_to_patches(
+            self._agent_loop.config, ops, durable_model_aliases=durable_aliases
+        )
         try:
             failures = await self._agent_loop.config_orchestrator.apply_patch(
                 operations, reason=params.reason
             )
         except (ConfigPatchValidationError, ValueError):
-            return ConfigPatchResponse(runtime=self.runtime_snapshot(), rejected=True)
+            return ConfigWriteResponse(runtime=self.runtime_snapshot(), rejected=True)
         if failures:
-            return ConfigPatchResponse(
+            return ConfigWriteResponse(
                 runtime=self.runtime_snapshot(),
                 failures=[str(failure) for failure in failures],
             )
+        if update_session_override:
+            active_model = self._agent_loop.config.get_active_model().alias
+            failures = await set_session_active_model_override(
+                self._agent_loop.config_orchestrator,
+                active_model,
+                reason="normalize session active model",
+            )
+            if failures:
+                return ConfigWriteResponse(
+                    runtime=self.runtime_snapshot(),
+                    failures=[str(failure) for failure in failures],
+                )
+        # The config tier is latched once per process at session start, so without
+        # this a written log_level only takes effect after a restart.
+        set_config_log_level(self._agent_loop.config.log_level)
         if params.reload_runtime:
             self._clear_mcp_discovery_errors()
             await self._agent_loop.reload_with_initial_messages(reload_hooks=True)
-        else:
-            self._agent_loop.agent_manager.invalidate_config()
-        return ConfigPatchResponse(
+        return ConfigWriteResponse(
             runtime=self.runtime_snapshot(),
             stripped_history_images=(
                 self._agent_loop.count_history_images_unsupported_by_active_model()
@@ -587,8 +655,11 @@ class ResourceRequestHandler:
         self._execution.require_idle()
         self._require_session(params.session_id)
         # Best-effort: an admin-fetch failure must never break the user's reload.
+        # asyncio.timeout caps the full retry budget so /reload stays responsive;
+        # startup still uses the uncapped retry policy via apply_admin_config().
         try:
-            self._report_admin_config_outcome(await self._refresh_admin_layer())
+            async with asyncio.timeout(MANAGED_CONFIG_TIMEOUT * 1.5):
+                self._report_admin_config_outcome(await self._refresh_admin_layer())
         except Exception as exc:
             logger.debug("Admin config refresh failed on reload", exc_info=exc)
         if params.reload_runtime:
@@ -622,108 +693,10 @@ class ResourceRequestHandler:
         return True
 
     def _report_admin_config_outcome(self, result: AdminConfigApplyResult) -> None:
-        """Emit telemetry and warning logs for an admin-config refresh outcome.
-
-        Shared by both refresh paths so ``/reload`` reports the same as startup.
-        Silent outcomes (no API key, disabled) emit nothing.
-        """
-        telemetry = self._agent_loop.telemetry_client
-        if result.applied:
-            telemetry.send_admin_config_applied(
-                outcome=AdminConfigOutcome.APPLIED, enforced_keys=result.enforced_keys
-            )
-            return
-        if result.outcome in _ADMIN_FETCH_FAILURES:
-            logger.warning(
-                "Admin-managed config not applied outcome=%s error=%s",
-                result.outcome.value,
-                result.error,
-            )
-            telemetry.send_admin_config_applied(
-                outcome=result.outcome, error=result.error
-            )
+        report_admin_config_outcome(result, telemetry=self._agent_loop.telemetry_client)
 
     async def _refresh_admin_layer(self) -> AdminConfigApplyResult:
-        """Fetch org-enforced config, validate it, and load it into the layer.
-
-        Parseable TOML that fails merged-config validation is rolled back so it
-        never stays in the live layer; otherwise it would re-break every later
-        ``reload`` and config edit for the session. On success the merged config
-        is already refreshed. Returns the outcome for the caller to report.
-        """
-        config = self._agent_loop.config
-        provider = config.get_mistral_provider()
-        api_key = resolve_api_key(provider.api_key_env_var) if provider else None
-        if not api_key:
-            return AdminConfigApplyResult(AdminConfigOutcome.NO_API_KEY)
-
-        fetched = await fetch_managed_config(config.vibe_base_url, api_key)
-        if fetched.error is not None:
-            return AdminConfigApplyResult(
-                AdminConfigOutcome.FETCH_FAILED, error=fetched.error
-            )
-        managed = fetched.config
-        if managed is None or not managed.is_enabled or managed.toml is None:
-            return AdminConfigApplyResult(AdminConfigOutcome.DISABLED)
-
-        try:
-            layer = self._agent_loop.config_orchestrator.get_layer(
-                AdminConfigLayer.NAME
-            )
-        except KeyError:
-            layer = None
-        if not isinstance(layer, AdminConfigLayer):
-            return AdminConfigApplyResult(
-                AdminConfigOutcome.APPLY_FAILED, error="admin layer unavailable"
-            )
-        return await self._load_admin_layer(layer, managed.toml)
-
-    async def _load_admin_layer(
-        self, layer: AdminConfigLayer, toml_text: str
-    ) -> AdminConfigApplyResult:
-        orchestrator = self._agent_loop.config_orchestrator
-        previous = layer.snapshot()
-        try:
-            layer.load_managed_toml(toml_text)
-        except Exception as exc:
-            logger.warning("Failed to load admin-managed config", exc_info=exc)
-            return AdminConfigApplyResult(
-                AdminConfigOutcome.PARSE_FAILED, error=str(exc)
-            )
-
-        try:
-            await orchestrator.reload()
-        except Exception as exc:
-            layer.restore(previous)
-            await orchestrator.reload()
-            logger.warning("Admin-managed config failed validation", exc_info=exc)
-            return AdminConfigApplyResult(
-                AdminConfigOutcome.APPLY_FAILED, error=str(exc)
-            )
-
-        return AdminConfigApplyResult(
-            AdminConfigOutcome.APPLIED, enforced_keys=layer.enforced_keys
-        )
-
-    async def _config_thinking_write(
-        self, params: ConfigThinkingWriteParams
-    ) -> ConfigMutationResponse:
-        self._execution.require_idle()
-        self._require_session(params.session_id)
-        model = self._agent_loop.config.get_active_model()
-        value = model.model_dump(mode="json")
-        value["thinking"] = params.level
-        failures = await self._agent_loop.config_orchestrator.set_field(
-            f"/models/{escape_json_pointer_token(model.alias)}", value
-        )
-        if failures:
-            failure = failures[0]
-            raise RequestFailure(
-                ProtocolErrorCode.INTERNAL_ERROR,
-                f"Failed to update configuration: {failure}",
-            ) from failure
-        self._agent_loop.agent_manager.invalidate_config()
-        return self._config_mutation_response()
+        return await refresh_admin_layer(self._agent_loop.config_orchestrator)
 
     async def _config_proxy_read(
         self, params: ConfigProxyReadParams
@@ -760,7 +733,6 @@ class ResourceRequestHandler:
         orchestrator = self._agent_loop.config_orchestrator
         config = orchestrator.config
         layer_values = await collect_layer_values(orchestrator.layers)
-        # Per-tool config editing is not exposed in the settings screen yet.
         fields = [
             wire
             for wire in build_field_wires(
@@ -771,32 +743,27 @@ class ResourceRequestHandler:
         return ConfigFieldsReadResponse(fields=fields, targets=self._config_targets())
 
     def _config_targets(self) -> list[str]:
-        orchestrator = self._agent_loop.config_orchestrator
-        names = {layer.name for layer in orchestrator.layers}
-        writable = orchestrator.writable_layer_name
-        targets = [writable]
-        if OverridesLayer.NAME in names and OverridesLayer.NAME not in targets:
-            targets.append(OverridesLayer.NAME)
-        return targets
+        return config_write_targets(self._agent_loop.config_orchestrator)
 
     def _agents_list(self, params: AgentsListParams) -> AgentsListResponse:
-        self._require_session(params.session_id)
+        if params.session_id is not None:
+            self._require_session(params.session_id)
         active, agents = project_agents(self._agent_loop)
         return AgentsListResponse(active=active, agents=agents)
 
     async def _agent_install(
         self, params: AgentInstallParams, *, install: bool
     ) -> AgentsListResponse:
-        installed = list(self._agent_loop.base_config.installed_agents)
+        installed = list(self._agent_loop.config.installed_agents)
         if install and params.agent_name not in installed:
             installed.append(params.agent_name)
         if not install:
             installed = [name for name in installed if name != params.agent_name]
-        response = await self._config_patch(
-            ConfigPatchParams(
+        response = await self._config_write(
+            ConfigWriteParams(
                 session_id=params.session_id,
                 ops=[
-                    ConfigPatchOpWire(
+                    ConfigWriteOpWire(
                         op="set",
                         path="/installed_agents",
                         value=cast(JsonValue, installed),
@@ -812,10 +779,6 @@ class ResourceRequestHandler:
             )
         active, agents = project_agents(self._agent_loop)
         return AgentsListResponse(active=active, agents=agents)
-
-    def _skills_list(self, params: SkillsListParams) -> SkillsListResponse:
-        self._require_session(params.session_id)
-        return SkillsListResponse(skills=project_skills(self._agent_loop))
 
     def _tools_list(self, params: ToolsListParams) -> ToolsListResponse:
         self._require_session(params.session_id)
@@ -875,110 +838,6 @@ class ResourceRequestHandler:
         await self._agent_loop.refresh_system_prompt()
         return ConnectorRefreshResponse(
             tool_count=len(tools), runtime=self.runtime_snapshot()
-        )
-
-    def _mcp_read(self, params: MCPReadParams) -> MCPReadResponse:
-        self._require_session(params.session_id)
-        return MCPReadResponse(mcp=self._mcp_state())
-
-    async def _mcp_refresh(self, params: MCPRefreshParams) -> RuntimeMutationResponse:
-        self._execution.require_idle()
-        self._require_session(params.session_id)
-        self._clear_mcp_discovery_errors()
-        await self._agent_loop.wait_until_ready()
-        await self._agent_loop.tool_manager.refresh_remote_tools_async()
-        await self._agent_loop.refresh_system_prompt()
-        return RuntimeMutationResponse(runtime=self.runtime_snapshot())
-
-    async def _mcp_toggle(self, params: MCPToggleParams) -> RuntimeMutationResponse:
-        self._execution.require_idle()
-        self._require_session(params.session_id)
-        self._clear_mcp_discovery_errors()
-        try:
-            await persist_mcp_toggle(
-                self._agent_loop.config_orchestrator,
-                name=params.name,
-                is_connector=params.source == "connector",
-                disabled=params.disabled,
-                tool_name=params.tool_name,
-            )
-        except ConcurrencyConflictError as exc:
-            raise RequestFailure(ProtocolErrorCode.CONFLICT, str(exc)) from exc
-        await self._agent_loop.refresh_config()
-        return RuntimeMutationResponse(runtime=self.runtime_snapshot())
-
-    async def _mcp_add(self, params: MCPAddParams) -> MCPAddResponse:
-        self._execution.require_idle()
-        self._require_session(params.session_id)
-        self._clear_mcp_discovery_errors()
-        try:
-            result = await persist_oauth_mcp_server(
-                self._agent_loop.config_orchestrator,
-                url=params.url,
-                name=params.name,
-                scopes=params.scopes,
-                transport=params.transport,
-            )
-        except ConcurrencyConflictError as exc:
-            raise RequestFailure(ProtocolErrorCode.CONFLICT, str(exc)) from exc
-        except MCPServerAddError as exc:
-            raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, str(exc)) from exc
-        await self._agent_loop.refresh_config()
-        await self._agent_loop.tool_manager.refresh_remote_tools_async()
-        await self._agent_loop.refresh_system_prompt()
-        return MCPAddResponse(
-            name=result.server.name,
-            url=result.server.url,
-            created=result.created,
-            runtime=self.runtime_snapshot(),
-        )
-
-    async def _mcp_logout(self, params: MCPLogoutParams) -> RuntimeMutationResponse:
-        self._execution.require_idle()
-        self._require_session(params.session_id)
-        self._clear_mcp_discovery_errors()
-        registry = self._agent_loop.mcp_registry
-        if registry is None:
-            raise RequestFailure(
-                ProtocolErrorCode.NOT_FOUND, "No MCP servers configured"
-            )
-        try:
-            await registry.logout(params.name)
-        except ValueError as exc:
-            raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, str(exc)) from exc
-        await self._agent_loop.tool_manager.refresh_remote_tools_async()
-        await self._agent_loop.refresh_system_prompt()
-        return RuntimeMutationResponse(runtime=self.runtime_snapshot())
-
-    async def _mcp_login(self, params: MCPLoginParams) -> RuntimeMutationResponse:
-        self._execution.require_idle()
-        self._require_session(params.session_id)
-        self._clear_mcp_discovery_errors()
-        registry = self._agent_loop.mcp_registry
-        if registry is None:
-            raise RequestFailure(
-                ProtocolErrorCode.NOT_FOUND, "No MCP servers configured"
-            )
-
-        async def on_url(url: str) -> None:
-            await self._notify(
-                "mcp/authUrl", MCPAuthUrlParams(name=params.name, url=url)
-            )
-
-        try:
-            await registry.login(params.name, on_url=on_url)
-        except ValueError as exc:
-            raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, str(exc)) from exc
-        await self._agent_loop.refresh_system_prompt()
-        return RuntimeMutationResponse(runtime=self.runtime_snapshot())
-
-    def _config_response(self) -> ConfigReadResponse:
-        return ConfigReadResponse(
-            config=project_config(self._agent_loop),
-            base_config=project_config(self._agent_loop, base=True),
-            stripped_history_images=(
-                self._agent_loop.count_history_images_unsupported_by_active_model()
-            ),
         )
 
     def _config_mutation_response(self) -> ConfigMutationResponse:

@@ -16,14 +16,20 @@ def build_test_app_config(
     voice_mode_enabled: bool = False,
     narrator_enabled: bool = False,
     show_thinking_nodes: bool = False,
+    show_subagent_status_list: bool = True,
 ) -> ConfigView:
     return ConfigView(
         active_model=ModelConfigView(
-            name="test-model", alias="test-model", thinking="off", supports_images=False
+            name="test-model",
+            alias="test-model",
+            thinking="off",
+            supports_images=False,
+            display_name="test-model",
         ),
         active_model_pinned=True,
         default_model_alias="test-model",
         theme="textual-dark",
+        log_level=None,
         disable_welcome_banner_animation=False,
         autocopy_to_clipboard=True,
         file_watcher_for_autocomplete=False,
@@ -32,15 +38,18 @@ def build_test_app_config(
         voice_mode_enabled=voice_mode_enabled,
         narrator_enabled=narrator_enabled,
         show_thinking_nodes=show_thinking_nodes,
+        show_subagent_status_list=show_subagent_status_list,
+        worktree_limit=15,
         enable_update_checks=True,
         enable_notifications=True,
-        vibe_code_enabled=True,
+        experimental_enable_tab_status=False,
         models=[
             ModelConfigView(
                 name="test-model",
                 alias="test-model",
                 thinking="off",
                 supports_images=False,
+                display_name="test-model",
             )
         ],
         transcribe_models=["test-transcribe"],

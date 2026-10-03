@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 from rich import print as rprint
+from rich.markup import escape
 
 from vibe import __version__
 from vibe.cli.session_exit import print_session_resume_message
@@ -24,8 +25,9 @@ from vibe.cli.update_notifier import (
 )
 from vibe.core.config import MissingAPIKeyError, VibeConfigSchema, load_dotenv_values
 from vibe.core.config.default_orchestrator import build_default_orchestrator
+from vibe.core.config.layer import ConfigStorageError
 from vibe.core.config.orchestrator import ConfigOrchestrator
-from vibe.core.paths import HISTORY_FILE
+from vibe.core.paths import HISTORY_FILE, bootstrap_vibe_home
 from vibe.core.telemetry.build_metadata import build_launch_context
 from vibe.core.telemetry.types import LaunchContext
 from vibe.observability.logging import logger
@@ -74,11 +76,31 @@ def _format_config_validation_error(exc: ValidationError) -> str:
     return "\n".join(lines)
 
 
-def load_config_orchestrator_or_exit(
-    *, interactive: bool
-) -> ConfigOrchestrator[VibeConfigSchema]:
+def load_config_orchestrator_or_exit() -> ConfigOrchestrator[VibeConfigSchema]:
     try:
         return asyncio.run(build_default_orchestrator())
+    except ValidationError as e:
+        rprint(f"[yellow]{_format_config_validation_error(e)}[/]")
+        sys.exit(1)
+    except ConfigStorageError as e:
+        rprint(
+            f"[yellow]Cannot {e.operation} the Vibe config file at {e.path}: "
+            f"{e.__cause__}.\nVibe needs read/write access to it. If it is managed "
+            "read-only (e.g. symlinked from the Nix store), make it writable or set "
+            "VIBE_HOME to a writable directory.[/]"
+        )
+        sys.exit(1)
+    except ValueError as e:
+        rprint(f"[yellow]{escape(str(e))}[/]")
+        sys.exit(1)
+
+
+def require_api_key_or_onboard(
+    orchestrator: ConfigOrchestrator[VibeConfigSchema], *, interactive: bool
+) -> ConfigOrchestrator[VibeConfigSchema]:
+    try:
+        orchestrator.config.require_active_provider_api_key()
+        return orchestrator
     except MissingAPIKeyError as e:
         if not interactive:
             print(
@@ -90,23 +112,17 @@ def load_config_orchestrator_or_exit(
 
         from vibe.setup.onboarding import run_onboarding
 
-        return run_onboarding(launch_context=_build_cli_launch_context())
-    except ValidationError as e:
-        rprint(f"[yellow]{_format_config_validation_error(e)}[/]")
-        sys.exit(1)
-    except ValueError as e:
-        rprint(f"[yellow]{e}[/]")
-        sys.exit(1)
+        return run_onboarding(
+            launch_context=_build_cli_launch_context(), orchestrator=orchestrator
+        )
 
 
-def bootstrap_config_files() -> None:
-    history_file = HISTORY_FILE.path
-    if not history_file.exists():
-        try:
-            history_file.parent.mkdir(parents=True, exist_ok=True)
-            history_file.write_text("Hello Vibe!\n", "utf-8")
-        except Exception as e:
-            rprint(f"[yellow]Could not create history file: {e}[/]")
+def _agent_selection(args: argparse.Namespace) -> tuple[str | None, bool]:
+    from vibe.core.agents.models import BuiltinAgentName
+
+    if args.auto_approve and not args.agent:
+        return BuiltinAgentName.AUTO_APPROVE, False
+    return args.agent, args.auto_approve
 
 
 def _session_intent(
@@ -150,10 +166,13 @@ def _run_programmatic_mode(args: argparse.Namespace, stdin_prompt: str | None) -
         sys.exit(1)
     output_format = OutputFormat(args.output if hasattr(args, "output") else "text")
 
+    agent, auto_approve = _agent_selection(args)
     try:
         session_intent = _session_intent(args, allow_picker=False)
         final_response = run_programmatic(
             harness_options=LocalHarnessOptions(
+                experimental_harness=args.experimental_harness,
+                legacy_harness=args.legacy_harness,
                 client=ClientDescriptor(
                     info=ClientInfo(
                         name="vibe_programmatic",
@@ -169,8 +188,8 @@ def _run_programmatic_mode(args: argparse.Namespace, stdin_prompt: str | None) -
                 session_options=SessionOptions(
                     cwd=str(Path.cwd()),
                     workspace_roots=list(args.add_dir),
-                    agent=args.agent,
-                    auto_approve=args.auto_approve,
+                    agent=agent,
+                    auto_approve=auto_approve,
                     enabled_tools=args.enabled_tools,
                     disabled_tools=[
                         *(args.disabled_tools or ()),
@@ -224,8 +243,19 @@ def _run_interactive_mode(
     )
     from vibe.cli.textual_ui.app import StartupOptions, run_textual_ui
 
+    # --worktree runs in a checkout Vibe just made from the repo the user
+    # launched from, and --trust is the user saying so outright. Both grant the
+    # workspace session trust when the session is built, so prompting first
+    # would ask about a decision already taken - and for --worktree it would
+    # ask again for every new worktree, which is one per session.
+    trust_workspace = bool(args.trust or args.worktree)
+
+    agent, auto_approve = _agent_selection(args)
+
     harness = LocalHarness(
         LocalHarnessOptions(
+            experimental_harness=args.experimental_harness,
+            legacy_harness=args.legacy_harness,
             client=ClientDescriptor(
                 info=ClientInfo(
                     name="vibe_tui",
@@ -241,11 +271,11 @@ def _run_interactive_mode(
             session_options=SessionOptions(
                 cwd=str(Path.cwd()),
                 workspace_roots=list(args.add_dir),
-                agent=args.agent,
-                auto_approve=args.auto_approve,
+                agent=agent,
+                auto_approve=auto_approve,
                 enabled_tools=args.enabled_tools,
                 disabled_tools=list(args.disabled_tools or ()),
-                trust_workspace=bool(args.trust or args.worktree),
+                trust_workspace=trust_workspace,
             ),
             session=_session_intent(args, allow_picker=True),
         )
@@ -262,7 +292,11 @@ def _run_interactive_mode(
                 is_resuming_session=(
                     args.continue_session or isinstance(args.resume, str)
                 ),
-                prompt_for_workspace_trust=True,
+                prompt_for_workspace_trust=not trust_workspace,
+                resume_session_id=(
+                    args.resume if isinstance(args.resume, str) else None
+                ),
+                continue_latest=bool(args.continue_session),
             ),
         )
     except AppServerResponseError as exc:
@@ -383,26 +417,32 @@ def run_cli(args: argparse.Namespace) -> None:
     sentry_enabled = False
 
     load_dotenv_values()
-    bootstrap_config_files()
+    bootstrap_vibe_home()
 
     if args.setup:
         from vibe.setup.onboarding import run_onboarding
 
-        run_onboarding(launch_context=_build_cli_launch_context())
+        orchestrator = load_config_orchestrator_or_exit()
+        run_onboarding(
+            launch_context=_build_cli_launch_context(), orchestrator=orchestrator
+        )
         sys.exit(0)
 
     try:
         update_cache_repository = FileSystemUpdateCacheRepository()
         if getattr(args, "check_upgrade", False):
-            from vibe.setup.update_prompt import load_update_prompt_theme
+            from vibe.cli.theme import resolve_theme_name
 
+            config = load_config_orchestrator_or_exit().config
             _run_check_upgrade(
-                update_cache_repository, theme=load_update_prompt_theme()
+                update_cache_repository, theme=resolve_theme_name(config.theme)
             )
             sys.exit(0)
 
         is_interactive = args.prompt is None
-        orchestrator = load_config_orchestrator_or_exit(interactive=is_interactive)
+        orchestrator = require_api_key_or_onboard(
+            load_config_orchestrator_or_exit(), interactive=is_interactive
+        )
         config = orchestrator.config
         if is_interactive:
             _maybe_run_startup_update_prompt(config, update_cache_repository)

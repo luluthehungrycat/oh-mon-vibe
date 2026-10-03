@@ -5,6 +5,7 @@ from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, ConfigDict
 
+from vibe.core.experiments.active import ExperimentSurface
 from vibe.utils import AgentEntrypoint
 from vibe.utils.terminal import TerminalEmulator
 
@@ -45,6 +46,20 @@ class LaunchContext(BaseModel):
 TelemetryCallType = Literal["main_call", "secondary_call"]
 
 
+class ExperimentAssignment(BaseModel):
+    experiment_id: str
+    experiment_name: str
+    variation_name: str
+    variation_id: int | None = None
+    # GrowthBook result payload for the assignment. `in_experiment` confirms a
+    # genuine exposure; `hash_attribute`/`hash_value` record the unit GrowthBook
+    # actually bucketed on (used to verify the randomization unit).
+    in_experiment: bool | None = None
+    hash_attribute: str | None = None
+    hash_value: str | None = None
+    feature_id: str | None = None
+
+
 class TelemetryBaseMetadata(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
@@ -53,18 +68,36 @@ class TelemetryBaseMetadata(BaseModel):
     client_name: str | None = None
     client_version: str | None = None
     os: str | None = None
+    arch: str | None = None
     os_version: str | None = None
     version: str | None = None
     terminal_emulator: TerminalEmulator | None = None
     session_id: str | None = None
     parent_session_id: str | None = None
     experiments: dict[str, str] | None = None
+    experiment_assignments: list[ExperimentAssignment] | None = None
+    # DEPRECATED: prefer ``experiment_attributes`` (planName/planType). This is a
+    # display label from the account-panel path, set asynchronously and often
+    # absent on early events; it does not reliably reflect the GrowthBook
+    # bucketing plan. Kept for backward compatibility with existing consumers.
     user_plan: str | None = None
+    # The exact attribute snapshot sent to GrowthBook for bucketing (see
+    # ExperimentAttributes), gathered as one self-describing object rather than
+    # flattened. Emitted on the exposure event so warehouse analysis can segment
+    # on the same dimensions GrowthBook assigns on (e.g. planName, planType) and
+    # verify the randomization unit (userId). Keeps GrowthBook's own attribute
+    # names. Distinct from ``user_plan``, a display label from the account panel.
+    experiment_attributes: dict[str, Any] | None = None
+    # The backend that produced the event: "legacy" (AgentLoop) or "unified"
+    # (harness). Set statically per client so it rides every event regardless of
+    # Mistral key / experiments state, unlike ``experiment_attributes.harness``.
+    harness_backend: ExperimentSurface | None = None
 
 
 class TelemetryRequestMetadata(TelemetryBaseMetadata):
     call_type: TelemetryCallType
     call_source: str = "vibe_code"
+    host_kind: Literal["local"] = "local"
     message_id: str | None = None
 
 

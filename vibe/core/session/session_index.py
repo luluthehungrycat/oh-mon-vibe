@@ -24,9 +24,16 @@ MESSAGES_FILENAME = "messages.jsonl"
 class SessionInfo(TypedDict):
     session_id: str
     cwd: str
+    # Where the session started, when that differs from where it sits now.
+    # The listing has to offer a moved session from both, so one cannot do.
+    origin_directory: str | None
     parent_session_id: str | None
     title: str | None
+    start_time: str | None
     end_time: str | None
+    bumped_at: str | None
+    pinned_at: str | None
+    updated_at: str
 
 
 @dataclass
@@ -43,7 +50,13 @@ def _convert_to_utc_iso(date_str: str) -> str:
     return dt.astimezone(UTC).isoformat()
 
 
-def _build_info(metadata: dict[str, Any]) -> SessionInfo | None:
+def _mtime_to_utc_iso(mtime_ns: int) -> str:
+    return datetime.fromtimestamp(mtime_ns / 1_000_000_000, UTC).isoformat()
+
+
+def _build_info(
+    metadata: dict[str, Any], fallback_updated_at: str
+) -> SessionInfo | None:
     """Build a listing entry from raw meta.json, or None if it lacks a session id."""
     session_id = metadata.get("session_id")
     if not session_id:
@@ -60,13 +73,40 @@ def _build_info(metadata: dict[str, Any]) -> SessionInfo | None:
             end_time = _convert_to_utc_iso(end_time)
         except (ValueError, OSError):
             end_time = None
+    start_time = metadata.get("start_time")
+    if start_time:
+        try:
+            start_time = _convert_to_utc_iso(start_time)
+        except (ValueError, OSError):
+            start_time = None
+    bumped_at = metadata.get("bumped_at")
+    if bumped_at:
+        try:
+            bumped_at = _convert_to_utc_iso(bumped_at)
+        except (ValueError, OSError):
+            bumped_at = None
+    pinned_at = metadata.get("pinned_at")
+    if pinned_at:
+        try:
+            pinned_at = _convert_to_utc_iso(pinned_at)
+        except (ValueError, OSError):
+            pinned_at = None
+
+    origin_directory = metadata.get("origin_directory")
 
     return {
         "session_id": session_id,
         "cwd": session_cwd,
+        "origin_directory": (
+            origin_directory if isinstance(origin_directory, str) else None
+        ),
         "parent_session_id": metadata.get("parent_session_id"),
         "title": metadata.get("title"),
+        "start_time": start_time,
         "end_time": end_time,
+        "bumped_at": bumped_at,
+        "pinned_at": pinned_at,
+        "updated_at": end_time or start_time or fallback_updated_at,
     }
 
 
@@ -79,12 +119,28 @@ def _entry_from_payload(payload: Any) -> _Entry | None:
     if not isinstance(mtime_ns, int) or not isinstance(session_id, str):
         return None
     cwd = payload.get("cwd")
+    origin_directory = payload.get("origin_directory")
     info: SessionInfo = {
         "session_id": session_id,
         "cwd": cwd if isinstance(cwd, str) else "",
+        "origin_directory": (
+            origin_directory if isinstance(origin_directory, str) else None
+        ),
         "parent_session_id": payload.get("parent_session_id"),
         "title": payload.get("title"),
+        "start_time": payload.get("start_time"),
         "end_time": payload.get("end_time"),
+        "bumped_at": (
+            payload["bumped_at"] if isinstance(payload.get("bumped_at"), str) else None
+        ),
+        "pinned_at": (
+            payload["pinned_at"] if isinstance(payload.get("pinned_at"), str) else None
+        ),
+        "updated_at": (
+            payload["updated_at"]
+            if isinstance(payload.get("updated_at"), str) and payload["updated_at"]
+            else _mtime_to_utc_iso(mtime_ns)
+        ),
     }
     return _Entry(mtime_ns=mtime_ns, info=info)
 
@@ -115,15 +171,25 @@ class SessionIndex:
                 SessionInfo(
                     session_id=entry.info["session_id"],
                     cwd=entry.info["cwd"],
+                    origin_directory=entry.info["origin_directory"],
                     parent_session_id=entry.info["parent_session_id"],
                     title=entry.info["title"],
+                    start_time=entry.info["start_time"],
                     end_time=entry.info["end_time"],
+                    bumped_at=entry.info["bumped_at"],
+                    pinned_at=entry.info["pinned_at"],
+                    updated_at=entry.info["updated_at"],
                 )
                 for entry in self._entries.values()
             ]
         if cwd is None:
             return result
-        return [info for info in result if info["cwd"] == cwd]
+        # Either directory, matching SessionLoader._session_reaches.
+        # Filtering on the current one alone would drop a moved session
+        # from the listing at the directory the user started it in.
+        return [
+            info for info in result if cwd in {info["cwd"], info["origin_directory"]}
+        ]
 
     def _reconcile(self) -> None:
         """Sync the in-memory cache with the session dirs via cheap stat checks."""
@@ -184,7 +250,7 @@ class SessionIndex:
         # load_session would reject, so keep it out of the listing.
         if msg_size == 0 and metadata.get("total_messages") != 0:
             return None
-        info = _build_info(metadata)
+        info = _build_info(metadata, _mtime_to_utc_iso(mtime_ns))
         if info is None:
             return None
         return _Entry(mtime_ns=mtime_ns, info=info)

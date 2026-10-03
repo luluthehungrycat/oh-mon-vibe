@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum, auto
-from typing import Annotated, Literal
+from functools import cache
+from typing import Annotated, Literal, Self
 
-from pydantic import Field, JsonValue, TypeAdapter
+from pydantic import Field, JsonValue, TypeAdapter, model_validator
 
 from vibe.agents import AgentSafety, AgentType
 from vibe.app_server._effect_models import (
+    MANUAL_SHELL_TOOL_NAME as MANUAL_SHELL_TOOL_NAME,
     EffectDetail as EffectDetail,
+    FileEditEffectBatchInput as FileEditEffectBatchInput,
+    FileEditEffectChange as FileEditEffectChange,
     FileEditEffectDetail as FileEditEffectDetail,
     FileEditEffectInput as FileEditEffectInput,
     FileEditEffectOccurrence as FileEditEffectOccurrence,
@@ -24,6 +28,7 @@ from vibe.app_server._effect_models import (
     FileWriteEffectInput as FileWriteEffectInput,
     FileWriteEffectOutput as FileWriteEffectOutput,
     GenericEffectDetail as GenericEffectDetail,
+    ProcessEffectDetail as ProcessEffectDetail,
     ShellEffectDetail as ShellEffectDetail,
     ShellEffectInput as ShellEffectInput,
     ShellEffectOutput as ShellEffectOutput,
@@ -47,6 +52,8 @@ from vibe.app_server._effect_models import (
     WebSearchEffectInput as WebSearchEffectInput,
     WebSearchEffectOutput as WebSearchEffectOutput,
     WebSearchEffectSource as WebSearchEffectSource,
+    WorktreeEffectDetail as WorktreeEffectDetail,
+    WorktreeEffectInput as WorktreeEffectInput,
     effect_input_json as effect_input_json,
 )
 from vibe.app_server._model import ProtocolModel
@@ -196,6 +203,96 @@ ContentBlock = Annotated[
 ]
 
 
+class MessageAnnotations(ProtocolModel):
+    vibe_user_display_content: UserDisplayContent | None = Field(
+        default=None,
+        alias="vibe.userDisplayContent",
+        exclude_if=lambda value: value is None,
+    )
+
+
+class SessionTextContentBlock(ProtocolModel):
+    type: Literal["text"] = "text"
+    text: str = ""
+
+
+class SessionImageContentBlock(ProtocolModel):
+    type: Literal["image"] = "image"
+    uri: str
+    media_type: str | None = None
+    alt_text: str | None = None
+
+
+class SessionResourceLinkContentBlock(ProtocolModel):
+    type: Literal["resource_link"] = "resource_link"
+    uri: str
+    name: str | None = None
+    title: str | None = None
+    description: str | None = None
+    media_type: str | None = None
+    size: int | None = Field(default=None, ge=0)
+
+
+class SessionEmbeddedResourceContentBlock(ProtocolModel):
+    type: Literal["embedded_resource"] = "embedded_resource"
+    uri: str
+    media_type: str | None = None
+    text: str | None = None
+    blob: str | None = None
+
+    @model_validator(mode="after")
+    def validate_content(self) -> Self:
+        if (self.text is None) == (self.blob is None):
+            raise ValueError("Embedded resources require exactly one of text or blob")
+        return self
+
+
+SessionContentBlock = Annotated[
+    SessionTextContentBlock
+    | SessionImageContentBlock
+    | SessionResourceLinkContentBlock
+    | SessionEmbeddedResourceContentBlock,
+    Field(discriminator="type"),
+]
+
+
+class TurnContextInputEntry(ProtocolModel):
+    role: Literal["context"] = "context"
+    entry_id: str | None = None
+    content: list[SessionContentBlock] = Field(min_length=1)
+    annotations: MessageAnnotations = Field(default_factory=MessageAnnotations)
+
+    @property
+    def input(self) -> list[SessionContentBlock]:
+        return self.content
+
+
+class TurnUserInputEntry(ProtocolModel):
+    role: Literal["user"] = "user"
+    entry_id: str | None = None
+    content: list[SessionContentBlock] = Field(min_length=1)
+    annotations: MessageAnnotations = Field(default_factory=MessageAnnotations)
+
+    @property
+    def input(self) -> list[SessionContentBlock]:
+        return self.content
+
+
+TurnInputEntry = Annotated[
+    TurnContextInputEntry | TurnUserInputEntry, Field(discriminator="role")
+]
+
+
+def validate_turn_input_entries(entries: list[TurnInputEntry]) -> None:
+    user_positions = [
+        index for index, entry in enumerate(entries) if entry.role == "user"
+    ]
+    if len(user_positions) > 1:
+        raise ValueError("Turn input accepts at most one user entry")
+    if user_positions and user_positions[0] != len(entries) - 1:
+        raise ValueError("The user entry must be the final turn input entry")
+
+
 class ApprovalDecisionType(StrEnum):
     APPROVE = auto()
     APPROVE_FOR_SESSION = auto()
@@ -216,6 +313,9 @@ class ApprovalCallbackDetail(ProtocolModel):
         default_factory=lambda: list(ApprovalDecisionType)
     )
     related_entry_id: str | None = None
+    # Why approval is being requested (e.g. smart approve's risk reason); shown in the
+    # approval dialog. None for the static per-tool permission gate.
+    reason: str | None = None
 
 
 class UserInputCallbackDetail(ProtocolModel):
@@ -269,6 +369,12 @@ class PublicRetryCategory(StrEnum):
     UNKNOWN = auto()
 
 
+class PublicRetryState(ProtocolModel):
+    turn_id: str
+    category: PublicRetryCategory
+    detail: str
+
+
 class TurnErrorCode(StrEnum):
     RATE_LIMIT = auto()
     CONTEXT_TOO_LONG = auto()
@@ -277,7 +383,10 @@ class TurnErrorCode(StrEnum):
     INVALID_IMAGE_ATTACHMENT = auto()
     IMAGES_NOT_SUPPORTED = auto()
     COMPACTION_FAILED = auto()
+    INCOMPLETE_STREAM = auto()
     BACKEND_ERROR = auto()
+    INVALID_MODEL = auto()
+    INVALID_API_KEY = auto()
     INTERNAL_ERROR = auto()
 
 
@@ -373,7 +482,7 @@ class VibeCodeProject(ProtocolModel):
     is_read_only: bool = False
 
 
-class VibeCodeProjectLink(ProtocolModel):
+class RemoteProjectLink(ProtocolModel):
     repo_root: str
     repo_url: str
     project_id: str
@@ -384,7 +493,7 @@ class VibeCodePickerContext(ProtocolModel):
     repo_root: str
     repo_url: str
     repo_name: str
-    saved_link: VibeCodeProjectLink | None = None
+    saved_link: RemoteProjectLink | None = None
 
 
 class VibeCodeGitInfo(ProtocolModel):
@@ -475,21 +584,146 @@ class AgentSummary(ProtocolModel):
     agent_type: AgentType
 
 
+class RegistryRefView(ProtocolModel):
+    skill_id: str
+    version: int
+    alias: str | None = None
+
+
 class SkillSummary(ProtocolModel):
     name: str
     description: str
     prompt: str
     user_invocable: bool = True
-    source: Literal["builtin", "local", "registry"] = "local"
+    source: Literal["builtin", "local", "registry", "plugin"] = "local"
+    scope: Literal["builtin", "global", "project"] = "global"
+    registry: RegistryRefView | None = None
+    enabled: bool = True
+    locked: bool = False
+
+
+class SkillCatalogEntry(ProtocolModel):
+    name: str
+    skill_id: str
+    description: str
+    latest_version: int
+    sharing_scope: str = ""
+
+
+class SkillVersionView(ProtocolModel):
+    version: int
+    aliases: list[str] = Field(default_factory=list)
+
+
+class SkillUpdateView(ProtocolModel):
+    name: str
+    current_version: int
+    latest_version: int
+
+
+class SkillDetailView(ProtocolModel):
+    name: str
+    skill_id: str
+    version: int
+    body: str
+    description: str = ""
+    created_by: str = ""
+    created_at: str = ""
+    last_modified_at: str = ""
+    sharing_scope: str = ""
+    latest_version: int = 0
+    version_created_at: str = ""
+    aliases: list[str] = Field(default_factory=list)
+    notes: str = ""
 
 
 class ToolSummary(ProtocolModel):
     name: str
+    is_custom: bool = False
+
+
+# The closed set the App Server contract declares. Vibe never emits "unknown";
+# it is here so a component kind Vibe does not model still round-trips.
+type PluginComponentKind = Literal[
+    "skill",
+    "knowledge",
+    "library",
+    "mcp_server",
+    "connector",
+    "hook",
+    "agent",
+    "subagent",
+    "tool",
+    "unknown",
+]
+
+
+class PluginComponent(ProtocolModel):
+    kind: PluginComponentKind
+    name: str
+    # Absolute, and joined against the plugin root at read time. The snapshot
+    # stores a portable reference; absolute paths never enter a digested
+    # artifact. A component with no file on disk has no source path.
+    source_path: str | None = None
+    config: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class PluginInfo(ProtocolModel):
+    workdir: str | None = None
+    components: list[PluginComponent] = Field(default_factory=list)
+    raw: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+# Mirrors of the closed sets Core declares, restated because a client reading a
+# response must not have to import the resolution stack that produced it.
+# `test_the_catalogue_mirrors_every_closed_set_core_declares` holds them equal.
+type PluginSourceFormat = Literal[
+    "agent_plugins_1_0", "claude_code", "codex", "kimi_code", "opencode"
+]
+type PluginRouteStatus = Literal["live", "stale", "unavailable"]
+type PluginScope = Literal["builtin", "global", "project"]
+
+
+# The Vibe-owned catalogue behind /plugins. It carries no component config, so
+# an MCP env value, a header value and a URL query have no route into it.
+class PluginCatalogComponent(ProtocolModel):
+    kind: PluginComponentKind
+    name: str
+    # Populated for tools alone, and only once a route has drifted: absent
+    # means live, the convention plugin/info already uses.
+    status: PluginRouteStatus | None = None
+
+
+class PluginCatalogEntry(ProtocolModel):
+    name: str
+    version: str | None = None
+    source_format: PluginSourceFormat
+    manifest_digest: str
+    # Everything below comes off the descriptor, which a pinned entry this
+    # resolve dropped does not have.
+    description: str = ""
+    author: str | None = None
+    scope: PluginScope | None = None
+    content_sha256: str | None = None
+    pinned_root: str | None = None
+    installed_root: str | None = None
+    components: list[PluginCatalogComponent] = Field(default_factory=list)
+    drifted: int = 0
+
+
+class PluginCatalogDropped(ProtocolModel):
+    file: str
+    message: str
+
+
+class PluginCatalogState(ProtocolModel):
+    plugins: list[PluginCatalogEntry] = Field(default_factory=list)
+    dropped: list[PluginCatalogDropped] = Field(default_factory=list)
 
 
 class ConnectorCounts(ProtocolModel):
     connected: int = 0
-    total: int = 0
+    total: int | None = None
 
 
 class MCPSourceKind(StrEnum):
@@ -514,15 +748,30 @@ class MCPToolSummary(ProtocolModel):
 
 class MCPSourceSummary(ProtocolModel):
     name: str
+    # Human label to render; `name` stays the stable id used for keying, toggles,
+    # and option ids. Connectors set this to their bootstrap display_name (already
+    # title-or-name); it defaults to `name` when a producer omits it (servers).
+    display_name: str = ""
     kind: MCPSourceKind
     transport: str
+
+    @model_validator(mode="after")
+    def _default_display_name(self) -> Self:
+        if not self.display_name:
+            self.display_name = self.name
+        return self
+
     status: MCPSourceStatus
     tools: list[MCPToolSummary] = Field(default_factory=list)
+    error: str | None = None
+    plugin_name: str | None = None
 
 
 class MCPState(ProtocolModel):
     sources: list[MCPSourceSummary] = Field(default_factory=list)
     discovery_errors: dict[str, str] = Field(default_factory=dict)
+    connector_error: str | None = None
+    manage_connectors_url: str | None = None
 
     @property
     def needs_auth(self) -> list[str]:
@@ -589,14 +838,21 @@ class CompletedEffectState(ProtocolModel):
     output_text: str = ""
     duration_ms: float = 0.0
     display: EffectResultDisplay
+    decision: Literal["execute", "skip"] | None = None
+    approval_type: Literal["always", "never", "ask"] | None = None
+    approval_source: Literal["config", "smart", "user", "bypass", "never"] | None = None
 
 
 class FailedEffectState(ProtocolModel):
     status: Literal["failed"] = "failed"
     error: PublicError
+    output: JsonValue = None
     output_text: str = ""
     duration_ms: float = 0.0
     display: EffectResultDisplay
+    decision: Literal["execute", "skip"] | None = None
+    approval_type: Literal["always", "never", "ask"] | None = None
+    approval_source: Literal["config", "smart", "user", "bypass", "never"] | None = None
 
 
 class CancelledEffectState(ProtocolModel):
@@ -605,12 +861,18 @@ class CancelledEffectState(ProtocolModel):
     output_text: str = ""
     duration_ms: float = 0.0
     display: EffectResultDisplay | None = None
+    decision: Literal["execute", "skip"] | None = None
+    approval_type: Literal["always", "never", "ask"] | None = None
+    approval_source: Literal["config", "smart", "user", "bypass", "never"] | None = None
 
 
 class SkippedEffectState(ProtocolModel):
     status: Literal["skipped"] = "skipped"
     reason: str
     display: EffectResultDisplay
+    decision: Literal["execute", "skip"] | None = None
+    approval_type: Literal["always", "never", "ask"] | None = None
+    approval_source: Literal["config", "smart", "user", "bypass", "never"] | None = None
 
 
 EffectState = Annotated[
@@ -806,11 +1068,14 @@ PublicHistoryEntry = Annotated[
     Field(discriminator="type"),
 ]
 
-_PUBLIC_HISTORY_ENTRY_ADAPTER = TypeAdapter(PublicHistoryEntry)
+
+@cache
+def _public_history_entry_adapter() -> TypeAdapter[PublicHistoryEntry]:
+    return TypeAdapter(PublicHistoryEntry)
 
 
 def validate_history_entry(value: object) -> PublicHistoryEntry:
-    return _PUBLIC_HISTORY_ENTRY_ADAPTER.validate_python(
+    return _public_history_entry_adapter().validate_python(
         value, by_alias=True, by_name=False
     )
 
@@ -870,11 +1135,48 @@ class PublicSession(ProtocolModel):
     status: PublicSessionStatus
     created_at: int
     updated_at: int
+    bumped_at: int | None = None
+    pinned_at: int | None = None
     cwd: str | None = None
     workspace_roots: list[str] = Field(default_factory=list)
+    # What this session runs; ``None`` follows the current default.
     model: str | None = None
+    reasoning_effort: str | None = None
     agent: AgentSummary | None = None
     token_usage: TokenUsage | None = None
+    context_usage: TokenUsage | None = None
+    harness: Literal["legacy", "unified"] | None = None
+
+
+class PublicChildSession(ProtocolModel):
+    id: str
+    name: str
+    agent_type: str
+    status: PublicSessionStatus
+    token_usage: TokenUsage = Field(default_factory=TokenUsage)
+    context_usage: TokenUsage | None = None
+    created_at: int
+    updated_at: int
+
+
+class PublicQueuedTurn(ProtocolModel):
+    id: str
+    created_at: int
+    entries: list[TurnInputEntry] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_entries(self) -> Self:
+        validate_turn_input_entries(self.entries)
+        return self
+
+
+TURN_QUEUE_MAX_ITEMS = 32
+
+
+class PublicTurnQueue(ProtocolModel):
+    items: list[PublicQueuedTurn] = Field(default_factory=list)
+    paused: bool = False
+    max_items: int = Field(default=TURN_QUEUE_MAX_ITEMS, ge=1, strict=True)
 
 
 class PublicTurn(ProtocolModel):
@@ -885,15 +1187,27 @@ class PublicTurn(ProtocolModel):
     completed_at: int | None = None
     error: PublicError | None = None
     stop_reason: PublicTurnStopReason | None = None
+    queue_item_id: str | None = None
 
 
 class PublicSessionState(ProtocolModel):
     format: Literal["vibe.public-session-state/v1"] = "vibe.public-session-state/v1"
     event_id: int = Field(ge=0, strict=True)
     session: PublicSession
-    history: PublicHistoryPage
-    active_callbacks: list[PublicCallbackEntry]
-    latest_turn: PublicTurn | None
+    is_quiescent: bool | None = None
+    history: list[PublicHistoryEntry] | None = None
+    history_before_cursor: str | None = None
+    turns: list[PublicTurn] | None = None
+    active_callbacks: list[PublicCallbackEntry] = Field(default_factory=list)
+    child_sessions: list[PublicChildSession] = Field(default_factory=list)
+    turn_queue: PublicTurnQueue = Field(default_factory=PublicTurnQueue)
+    retrying: PublicRetryState | None = None
+
+    @property
+    def latest_turn(self) -> PublicTurn | None:
+        if not self.turns:
+            return None
+        return self.turns[-1]
 
 
 class JsonPatchOperation(ProtocolModel):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from http import HTTPStatus
 import json
 from typing import Any
@@ -9,6 +10,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from vibe.core.types import AvailableTool, LLMMessage, StrToolChoice
+from vibe.utils.api_keys import ApiKeyOrigin
 
 _CONTEXT_TOO_LONG_SUBSTRINGS = (
     "context too long",
@@ -22,6 +24,8 @@ _CONTEXT_TOO_LONG_SUBSTRINGS = (
 )
 
 _RESPONSE_TOO_LONG_SUBSTRINGS = ("max_tokens_exceeded", "finish_reason=length")
+
+_INVALID_MODEL_SUBSTRINGS = ("invalid_model",)
 
 
 class ErrorDetail(BaseModel):
@@ -38,6 +42,44 @@ class PayloadSummary(BaseModel):
     tool_choice: StrToolChoice | AvailableTool | None
 
 
+@dataclass(frozen=True, slots=True)
+class ModelCall:
+    """The call a backend was making when it failed.
+
+    All three builders need the same eight values; only the failure differs.
+    """
+
+    provider: str
+    endpoint: str
+    model: str
+    messages: Sequence[LLMMessage]
+    temperature: float
+    has_tools: bool
+    tool_choice: StrToolChoice | AvailableTool | None
+    # Where the credential came from, for the one error where that is the
+    # actionable part. ``None`` when nothing was resolved.
+    api_key_origin: ApiKeyOrigin | None = None
+
+    def payload_summary(self) -> PayloadSummary:
+        return PayloadSummary(
+            model=self.model,
+            message_count=len(self.messages),
+            approx_chars=sum(len(m.content or "") for m in self.messages),
+            temperature=self.temperature,
+            has_tools=self.has_tools,
+            tool_choice=self.tool_choice,
+        )
+
+
+class IncompleteStreamError(RuntimeError):
+    def __init__(self, provider: str, model: str) -> None:
+        self.provider = provider
+        self.model = model
+        super().__init__(
+            f"Model stream from {provider} ({model}) ended without a finish reason."
+        )
+
+
 class BackendError(RuntimeError):
     def __init__(
         self,
@@ -51,6 +93,7 @@ class BackendError(RuntimeError):
         parsed_error: str | None,
         model: str,
         payload_summary: PayloadSummary,
+        api_key_origin: ApiKeyOrigin | None = None,
     ) -> None:
         self.provider = provider
         self.endpoint = endpoint
@@ -61,6 +104,7 @@ class BackendError(RuntimeError):
         self.parsed_error = parsed_error
         self.model = model
         self.payload_summary = payload_summary
+        self.api_key_origin = api_key_origin
         super().__init__(self._fmt())
 
     @property
@@ -77,12 +121,34 @@ class BackendError(RuntimeError):
         body = (self.body_text or "").lower()
         return any(s in body for s in _RESPONSE_TOO_LONG_SUBSTRINGS)
 
+    @property
+    def is_invalid_model(self) -> bool:
+        if self.status != HTTPStatus.BAD_REQUEST:
+            return False
+        body = (self.body_text or "").lower()
+        return any(s in body for s in _INVALID_MODEL_SUBSTRINGS)
+
     def _fmt(self) -> str:
         if self.status == HTTPStatus.UNAUTHORIZED:
-            return "Invalid API key. Please check your API key and try again."
+            origin = (
+                f" (from {self.api_key_origin.describe()})"
+                if self.api_key_origin
+                else ""
+            )
+            return f"Invalid API key{origin}. Please check your API key and try again."
 
         if self.status == HTTPStatus.TOO_MANY_REQUESTS:
             return "Rate limit exceeded. Please wait a moment before trying again."
+
+        if self.is_invalid_model:
+            lines = [
+                f"Model '{self.model}' is not available on {self.provider}.",
+                "Switch to another configured model with /model, "
+                "or fix the model name with /config.",
+            ]
+            if self.parsed_error:
+                lines.append(f"Provider message: {self.parsed_error}")
+            return "\n".join(lines)
 
         rid = self.headers.get("x-request-id") or self.headers.get("request-id")
         if self.status:
@@ -137,18 +203,23 @@ class ErrorResponse(BaseModel):
 
 class BackendErrorBuilder:
     @classmethod
+    def build_stream_error(
+        cls, call: ModelCall, *, status: int | None, error_type: str, error_message: str
+    ) -> BackendError:
+        return cls._build(
+            call,
+            status=status,
+            reason=error_type,
+            headers=None,
+            body_text=json.dumps({
+                "error": {"type": error_type, "message": error_message}
+            }),
+            parsed_error=error_message,
+        )
+
+    @classmethod
     def build_http_error(
-        cls,
-        *,
-        provider: str,
-        endpoint: str,
-        error: Exception,
-        response: httpx.Response,
-        model: str,
-        messages: Sequence[LLMMessage],
-        temperature: float,
-        has_tools: bool,
-        tool_choice: StrToolChoice | AvailableTool | None,
+        cls, call: ModelCall, *, error: Exception, response: httpx.Response
     ) -> BackendError:
         """Build a BackendError from an HTTP error.
 
@@ -157,45 +228,49 @@ class BackendErrorBuilder:
         """
         body_text = cls._read_response_body(response, error)
 
-        return BackendError(
-            provider=provider,
-            endpoint=endpoint,
+        return cls._build(
+            call,
             status=response.status_code,
             reason=response.reason_phrase,
             headers=response.headers,
             body_text=body_text,
             parsed_error=cls._parse_provider_error(body_text),
-            model=model,
-            payload_summary=cls._payload_summary(
-                model, messages, temperature, has_tools, tool_choice
-            ),
         )
 
     @classmethod
     def build_request_error(
-        cls,
-        *,
-        provider: str,
-        endpoint: str,
-        error: httpx.RequestError,
-        model: str,
-        messages: Sequence[LLMMessage],
-        temperature: float,
-        has_tools: bool,
-        tool_choice: StrToolChoice | AvailableTool | None,
+        cls, call: ModelCall, *, error: httpx.RequestError | httpx.StreamError
     ) -> BackendError:
-        return BackendError(
-            provider=provider,
-            endpoint=endpoint,
+        return cls._build(
+            call,
             status=None,
             reason=str(error) or repr(error),
             headers={},
             body_text=None,
             parsed_error="Network error",
-            model=model,
-            payload_summary=cls._payload_summary(
-                model, messages, temperature, has_tools, tool_choice
-            ),
+        )
+
+    @staticmethod
+    def _build(
+        call: ModelCall,
+        *,
+        status: int | None,
+        reason: str | None,
+        headers: Mapping[str, str] | None,
+        body_text: str | None,
+        parsed_error: str | None,
+    ) -> BackendError:
+        return BackendError(
+            provider=call.provider,
+            endpoint=call.endpoint,
+            status=status,
+            reason=reason,
+            headers=headers,
+            body_text=body_text,
+            parsed_error=parsed_error,
+            model=call.model,
+            payload_summary=call.payload_summary(),
+            api_key_origin=call.api_key_origin,
         )
 
     @staticmethod
@@ -219,21 +294,3 @@ class BackendErrorBuilder:
             return error_model.primary_message
         except (json.JSONDecodeError, ValidationError):
             return None
-
-    @staticmethod
-    def _payload_summary(
-        model_name: str,
-        messages: Sequence[LLMMessage],
-        temperature: float,
-        has_tools: bool,
-        tool_choice: StrToolChoice | AvailableTool | None,
-    ) -> PayloadSummary:
-        total_chars = sum(len(m.content or "") for m in messages)
-        return PayloadSummary(
-            model=model_name,
-            message_count=len(messages),
-            approx_chars=total_chars,
-            temperature=temperature,
-            has_tools=has_tools,
-            tool_choice=tool_choice,
-        )

@@ -27,14 +27,22 @@ class PermissionStore:
         self._tool_permissions: dict[str, ToolPermission] = {}
         self.lock = asyncio.Lock()
 
+    def reset(self) -> None:
+        """Drop all session-scoped approvals so they never leak across sessions."""
+        self._rules.clear()
+        self._tool_permissions.clear()
+
     def add_rule(self, rule: ApprovedRule) -> None:
         self._rules.append(rule)
 
     def covers(self, tool_name: str, rp: RequiredPermission) -> bool:
+        def matches(rule: ApprovedRule) -> bool:
+            if rp.literal:
+                return rule.session_pattern == rp.invocation_pattern
+            return wildcard_match(rp.invocation_pattern, rule.session_pattern)
+
         return any(
-            rule.tool_name == tool_name
-            and rule.scope == rp.scope
-            and wildcard_match(rp.invocation_pattern, rule.session_pattern)
+            rule.tool_name == tool_name and rule.scope == rp.scope and matches(rule)
             for rule in self._rules
         )
 

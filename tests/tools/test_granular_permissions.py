@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import glob
 import os
+from pathlib import Path
 
 import pytest
 
@@ -33,6 +35,8 @@ from vibe.core.tools.permissions import (
     RequiredPermission,
     wildcard_match,
 )
+from vibe.core.tools.utils import DEFAULT_SENSITIVE_PATTERNS, matches_sensitive_pattern
+from vibe.utils import paths
 
 
 class TestBashGranularPermissions:
@@ -151,6 +155,33 @@ class TestBashGranularPermissions:
         bash = self._bash()
         (self.workdir / "subdir").mkdir()
         result = bash.resolve_permission(BashArgs(command="mkdir subdir/child"))
+        assert isinstance(result, PermissionContext)
+        outside = [
+            rp
+            for rp in result.required_permissions
+            if rp.scope is PermissionScope.OUTSIDE_DIRECTORY
+        ]
+        assert len(outside) == 0
+
+    def test_the_boundary_comes_from_the_session_not_the_process(
+        self, tmp_path, monkeypatch
+    ):
+        # Every other test here chdirs the process into the session directory,
+        # so a tool reading the boundary off the process rather than off its own
+        # workspace still looks right. Under the app server the two differ, and
+        # then a file the session owns is judged foreign.
+        session = tmp_path / "session"
+        (session / "subdir").mkdir(parents=True)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        config = BashToolConfig()
+        bash = Bash(config_getter=lambda: config, state=BaseToolState(), cwd=session)
+
+        result = bash.resolve_permission(
+            BashArgs(command=f"mkdir {session / 'subdir' / 'child'}")
+        )
+
         assert isinstance(result, PermissionContext)
         outside = [
             rp
@@ -357,6 +388,36 @@ class TestReadGranularPermissions:
         result = tool.resolve_permission(ReadFileArgs(file_path="credentials.json"))
         assert isinstance(result, PermissionContext)
 
+    def test_sensitive_env_file_scopes_session_pattern_to_full_path(self):
+        # The session grant must be scoped to this file's full resolved path,
+        # not its bare name, otherwise approving one sensitive file covers a
+        # same-named file in another directory.
+        (self.workdir / ".env").touch()
+        tool = self._read()
+        result = tool.resolve_permission(ReadFileArgs(file_path=".env"))
+        assert isinstance(result, PermissionContext)
+        sensitive = [
+            rp
+            for rp in result.required_permissions
+            if rp.scope is PermissionScope.FILE_PATTERN
+        ]
+        assert len(sensitive) == 1
+        expected = str((self.workdir / ".env").resolve())
+        assert sensitive[0].invocation_pattern == expected
+        assert sensitive[0].session_pattern == glob.escape(expected)
+
+    def test_sensitive_case_insensitive_and_variants_flagged(self):
+        tool = self._read()
+        for name in [".ENV", ".Env", ".env~", ".envrc", ".env.LOCAL"]:
+            result = tool.resolve_permission(ReadFileArgs(file_path=name))
+            assert isinstance(result, PermissionContext), name
+            sensitive = [
+                rp
+                for rp in result.required_permissions
+                if rp.scope is PermissionScope.FILE_PATTERN
+            ]
+            assert len(sensitive) == 1, name
+
 
 class TestWriteFileGranularPermissions:
     @pytest.fixture(autouse=True)
@@ -436,6 +497,34 @@ class TestGrepGranularPermissions:
             if rp.scope is PermissionScope.FILE_PATTERN
         ]
         assert len(sensitive) == 1
+
+
+class TestSensitivePatternMatching:
+    @pytest.mark.parametrize(
+        "path", ["/wd/.ENV", "/wd/.Env", "/wd/.env", "/wd/sub/.env"]
+    )
+    def test_case_insensitive_match(self, path):
+        assert matches_sensitive_pattern(path, DEFAULT_SENSITIVE_PATTERNS)
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/wd/.env~",
+            "/wd/.envrc",
+            "/wd/.env.local",
+            "/wd/.env.PRODUCTION",
+            "/wd/.envrc.local",
+            "/wd/.envrc~",
+        ],
+    )
+    def test_variant_names_match(self, path):
+        assert matches_sensitive_pattern(path, DEFAULT_SENSITIVE_PATTERNS)
+
+    @pytest.mark.parametrize(
+        "path", ["/wd/main.py", "/wd/environment.txt", "/wd/readme.md"]
+    )
+    def test_non_sensitive_not_matched(self, path):
+        assert not matches_sensitive_pattern(path, DEFAULT_SENSITIVE_PATTERNS)
 
 
 class TestApprovalFlowSimulation:
@@ -559,21 +648,58 @@ class TestApprovalFlowSimulation:
         uncovered = [rp for rp in cmd_perms if not self._is_covered("bash", rp, rules)]
         assert len(uncovered) == 1
 
-    def test_read_sensitive_approved_covers_subsequent(self):
+    def test_read_sensitive_approved_covers_same_file(self):
+        env_path = str((Path.cwd() / ".env").resolve())
         rules = [
             ApprovedRule(
                 tool_name="read",
                 scope=PermissionScope.FILE_PATTERN,
-                session_pattern="*",
+                session_pattern=glob.escape(env_path),
             )
         ]
         rp = RequiredPermission(
             scope=PermissionScope.FILE_PATTERN,
-            invocation_pattern=".env.production",
-            session_pattern="*",
-            label="reading sensitive files (read)",
+            invocation_pattern=env_path,
+            session_pattern=glob.escape(env_path),
+            label="accessing sensitive files (read)",
         )
         assert self._is_covered("read", rp, rules)
+
+    def test_read_sensitive_approved_does_not_cover_other_sensitive(self):
+        env_path = str((Path.cwd() / ".env").resolve())
+        prod_path = str((Path.cwd() / ".env.production").resolve())
+        rules = [
+            ApprovedRule(
+                tool_name="read",
+                scope=PermissionScope.FILE_PATTERN,
+                session_pattern=glob.escape(env_path),
+            )
+        ]
+        rp = RequiredPermission(
+            scope=PermissionScope.FILE_PATTERN,
+            invocation_pattern=prod_path,
+            session_pattern=glob.escape(prod_path),
+            label="accessing sensitive files (read)",
+        )
+        assert not self._is_covered("read", rp, rules)
+
+    def test_read_sensitive_approved_does_not_cover_same_name_other_dir(self):
+        a_path = str((Path.cwd() / "service-a" / ".env").resolve())
+        b_path = str((Path.cwd() / "service-b" / ".env").resolve())
+        rules = [
+            ApprovedRule(
+                tool_name="read",
+                scope=PermissionScope.FILE_PATTERN,
+                session_pattern=glob.escape(a_path),
+            )
+        ]
+        rp = RequiredPermission(
+            scope=PermissionScope.FILE_PATTERN,
+            invocation_pattern=b_path,
+            session_pattern=glob.escape(b_path),
+            label="accessing sensitive files (read)",
+        )
+        assert not self._is_covered("read", rp, rules)
 
     def test_different_tool_rule_doesnt_cover(self):
         rules = [
@@ -596,7 +722,7 @@ class TestWebFetchPermissions:
     def _make_webfetch(self) -> WebFetch:
         return WebFetch(config_getter=lambda: WebFetchConfig(), state=BaseToolState())
 
-    def test_returns_url_pattern_with_domain(self):
+    def test_returns_url_pattern_with_origin(self):
         wf = self._make_webfetch()
         result = wf.resolve_permission(
             WebFetchArgs(url="https://docs.python.org/3/library")
@@ -605,51 +731,51 @@ class TestWebFetchPermissions:
         assert len(result.required_permissions) == 1
         rp = result.required_permissions[0]
         assert rp.scope is PermissionScope.URL_PATTERN
-        assert rp.invocation_pattern == "docs.python.org"
-        assert rp.session_pattern == "docs.python.org"
-        assert "docs.python.org" in rp.label
+        assert rp.invocation_pattern == "https://docs.python.org"
+        assert rp.session_pattern == "https://docs.python.org"
+        assert "https://docs.python.org" in rp.label
 
     def test_http_url(self):
         wf = self._make_webfetch()
         result = wf.resolve_permission(WebFetchArgs(url="http://example.com/page"))
         assert isinstance(result, PermissionContext)
         rp = result.required_permissions[0]
-        assert rp.invocation_pattern == "example.com"
+        assert rp.invocation_pattern == "http://example.com"
 
     def test_url_without_scheme(self):
         wf = self._make_webfetch()
         result = wf.resolve_permission(WebFetchArgs(url="github.com/anthropics"))
         assert isinstance(result, PermissionContext)
         rp = result.required_permissions[0]
-        assert rp.invocation_pattern == "github.com"
+        assert rp.invocation_pattern == "https://github.com"
 
     def test_url_with_port(self):
         wf = self._make_webfetch()
         result = wf.resolve_permission(WebFetchArgs(url="http://localhost:8080/api"))
         assert isinstance(result, PermissionContext)
         rp = result.required_permissions[0]
-        assert rp.invocation_pattern == "localhost:8080"
+        assert rp.invocation_pattern == "http://localhost:8080"
 
     def test_url_without_scheme_with_port(self):
         wf = self._make_webfetch()
         result = wf.resolve_permission(WebFetchArgs(url="example.com:3000/path"))
         assert isinstance(result, PermissionContext)
         rp = result.required_permissions[0]
-        assert rp.invocation_pattern == "example.com:3000"
+        assert rp.invocation_pattern == "https://example.com:3000"
 
     def test_different_domains_not_covered(self):
         rules = [
             ApprovedRule(
                 tool_name="web_fetch",
                 scope=PermissionScope.URL_PATTERN,
-                session_pattern="docs.python.org",
+                session_pattern="https://docs.python.org",
             )
         ]
         rp = RequiredPermission(
             scope=PermissionScope.URL_PATTERN,
-            invocation_pattern="evil.com",
-            session_pattern="evil.com",
-            label="fetching from evil.com",
+            invocation_pattern="https://evil.com",
+            session_pattern="https://evil.com",
+            label="fetching from https://evil.com",
         )
         covered = any(
             rule.tool_name == "web_fetch"
@@ -664,14 +790,14 @@ class TestWebFetchPermissions:
             ApprovedRule(
                 tool_name="web_fetch",
                 scope=PermissionScope.URL_PATTERN,
-                session_pattern="docs.python.org",
+                session_pattern="https://docs.python.org",
             )
         ]
         rp = RequiredPermission(
             scope=PermissionScope.URL_PATTERN,
-            invocation_pattern="docs.python.org",
-            session_pattern="docs.python.org",
-            label="fetching from docs.python.org",
+            invocation_pattern="https://docs.python.org",
+            session_pattern="https://docs.python.org",
+            label="fetching from https://docs.python.org",
         )
         covered = any(
             rule.tool_name == "web_fetch"
@@ -686,7 +812,7 @@ class TestWebFetchPermissions:
         result = wf.resolve_permission(WebFetchArgs(url="//cdn.example.com/lib.js"))
         assert isinstance(result, PermissionContext)
         rp = result.required_permissions[0]
-        assert rp.invocation_pattern == "cdn.example.com"
+        assert rp.invocation_pattern == "https://cdn.example.com"
 
     def test_config_permission_always_honored(self):
         wf = WebFetch(
@@ -706,14 +832,56 @@ class TestWebFetchPermissions:
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.NEVER
 
-    def test_config_permission_ask_falls_through_to_domain(self):
+    def test_config_permission_ask_falls_through_to_origin(self):
         wf = WebFetch(
             config_getter=lambda: WebFetchConfig(permission=ToolPermission.ASK),
             state=BaseToolState(),
         )
         result = wf.resolve_permission(WebFetchArgs(url="https://example.com"))
         assert isinstance(result, PermissionContext)
-        assert result.required_permissions[0].invocation_pattern == "example.com"
+        assert (
+            result.required_permissions[0].invocation_pattern == "https://example.com"
+        )
+
+    def test_different_schemes_have_different_permission_scopes(self):
+        wf = self._make_webfetch()
+
+        https_result = wf.resolve_permission(
+            WebFetchArgs(url="https://example.com/page")
+        )
+        http_result = wf.resolve_permission(WebFetchArgs(url="http://example.com/page"))
+
+        assert isinstance(https_result, PermissionContext)
+        assert isinstance(http_result, PermissionContext)
+        assert (
+            https_result.required_permissions[0].invocation_pattern
+            != http_result.required_permissions[0].invocation_pattern
+        )
+
+    def test_unicode_host_uses_httpx_idna_origin(self):
+        wf = self._make_webfetch()
+
+        unicode_result = wf.resolve_permission(WebFetchArgs(url="https://faß.example"))
+        punycode_result = wf.resolve_permission(
+            WebFetchArgs(url="https://xn--fa-hia.example")
+        )
+        ascii_result = wf.resolve_permission(WebFetchArgs(url="https://fass.example"))
+
+        assert isinstance(unicode_result, PermissionContext)
+        assert isinstance(punycode_result, PermissionContext)
+        assert isinstance(ascii_result, PermissionContext)
+        assert (
+            unicode_result.required_permissions[0].invocation_pattern
+            == "https://xn--fa-hia.example"
+        )
+        assert (
+            unicode_result.required_permissions[0].invocation_pattern
+            == punycode_result.required_permissions[0].invocation_pattern
+        )
+        assert (
+            unicode_result.required_permissions[0].invocation_pattern
+            != ascii_result.required_permissions[0].invocation_pattern
+        )
 
 
 class TestCollectOutsideDirs:
@@ -802,7 +970,7 @@ class TestCollectOutsideDirs:
         monkeypatch.setattr(bash_module, "is_windows", lambda: False)
         seen_paths: list[str] = []
 
-        def is_within_workdir(path: str) -> bool:
+        def is_within_workdir(path: str, **_kwargs) -> bool:
             seen_paths.append(path)
             return False
 
@@ -816,11 +984,12 @@ class TestCollectOutsideDirs:
     def test_git_bash_drive_path_normalized_before_workdir_check(self, monkeypatch):
         seen_paths: list[str] = []
 
-        def is_within_workdir(path: str) -> bool:
+        def is_within_workdir(path: str, **_kwargs) -> bool:
             seen_paths.append(path)
             return False
 
         monkeypatch.setattr(bash_module, "is_windows", lambda: True)
+        monkeypatch.setattr(paths, "is_windows", lambda: True)
         monkeypatch.setattr(bash_module, "is_path_within_workdir", is_within_workdir)
 
         dirs = _collect_outside_dirs(["cat /c/Users/victim/secret.txt"])
@@ -835,6 +1004,8 @@ class TestCollectOutsideDirs:
         # Backslash paths are a Windows concern; a POSIX shell would consume the
         # backslashes as escapes, so detection only applies under is_windows().
         monkeypatch.setattr(bash_module, "is_windows", lambda: True)
-        monkeypatch.setattr(bash_module, "is_path_within_workdir", lambda _: False)
+        monkeypatch.setattr(
+            bash_module, "is_path_within_workdir", lambda _, **_kwargs: False
+        )
         dirs = _collect_outside_dirs([f"cat {path}"])
         assert len(dirs) >= 1

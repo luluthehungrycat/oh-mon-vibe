@@ -2,16 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar
-
-from textual.app import App, ComposeResult
-from textual.binding import Binding, BindingType
-from textual.containers import CenterMiddle
 
 from vibe.app_server.host import AppServerHost
-from vibe.app_server.models import SavedSessionSummary
 from vibe.app_server.session import AppServerSession
-from vibe.cli.textual_ui.widgets.session_picker import SessionPickerApp
 from vibe.setup.trusted_folders.trust_folder_dialog import (
     TrustDialogQuitException,
     TrustFolderApp,
@@ -22,66 +15,74 @@ from vibe.setup.trusted_folders.trust_folder_dialog import (
 class OpenedTextualSession:
     session: AppServerSession
     resumed: bool
+    showed_trust_prompt: bool = False
+    showed_resume_picker: bool = False
+    resume_session_id: str | None = None
+    continue_latest: bool = False
 
 
 @dataclass(frozen=True, slots=True)
-class _PickerResult:
+class SessionOpenPlan:
+    method: str  # "open" | "start" | "resume"
     session_id: str | None = None
-    aborted: bool = False
+    resumed: bool = False
+    showed_trust_prompt: bool = False
+    showed_resume_picker: bool = False
+    resume_session_id: str | None = None
+    continue_latest: bool = False
 
 
-class _StartupSessionPicker(App[_PickerResult]):
-    CSS_PATH = "app.tcss"
-    BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("ctrl+c", "abort", show=False, priority=True),
-        Binding("ctrl+q", "abort", show=False, priority=True),
-    ]
+async def resolve_session_open_plan(
+    host: AppServerHost,
+    *,
+    prompt_for_workspace_trust: bool,
+    show_resume_picker: bool,
+    initially_resuming: bool,
+    resume_session_id: str | None = None,
+) -> SessionOpenPlan | None:
+    showed_trust_prompt = False
+    try:
+        if prompt_for_workspace_trust:
+            trust_granted, showed_trust_prompt = await _resolve_workspace_trust(host)
+            if not trust_granted:
+                await host.close()
+                return None
 
-    def __init__(
-        self, host: AppServerHost, sessions: list[SavedSessionSummary], cwd: str | None
-    ) -> None:
-        super().__init__()
-        self._host = host
-        self._sessions = sessions
-        self._cwd = cwd
-
-    def compose(self) -> ComposeResult:
-        with CenterMiddle():
-            yield SessionPickerApp(
-                sessions=self._sessions,
-                latest_messages={
-                    session.session_id: session.preview for session in self._sessions
-                },
-                cwd=self._cwd,
+        if not show_resume_picker and not initially_resuming:
+            return SessionOpenPlan(
+                method="open",
+                resumed=initially_resuming,
+                showed_trust_prompt=showed_trust_prompt,
             )
 
-    def action_abort(self) -> None:
-        self.exit(result=_PickerResult(aborted=True))
+        # When --resume (picker), --resume <id>, or --continue is used, start a
+        # fresh session in the background. Empty sessions are never persisted to
+        # disk, so no orphan files are created if the user picks an existing
+        # session or cancels. For --resume <id> and --continue, the fresh
+        # session renders instantly and the actual resume happens in-app via the
+        # auto-resume descriptor, reusing the fast in-place rebind path.
+        return SessionOpenPlan(
+            method="start",
+            showed_trust_prompt=showed_trust_prompt,
+            showed_resume_picker=show_resume_picker,
+            resume_session_id=resume_session_id if initially_resuming else None,
+            continue_latest=(initially_resuming and resume_session_id is None),
+        )
+    except BaseException:
+        await host.close()
+        raise
 
-    def on_session_picker_app_session_selected(
-        self, event: SessionPickerApp.SessionSelected
-    ) -> None:
-        self.exit(result=_PickerResult(session_id=event.session_id))
 
-    def on_session_picker_app_cancelled(
-        self, event: SessionPickerApp.Cancelled
-    ) -> None:
-        del event
-        self.exit(result=_PickerResult())
-
-    async def on_session_picker_app_session_delete_requested(
-        self, event: SessionPickerApp.SessionDeleteRequested
-    ) -> None:
-        picker = self.query_one(SessionPickerApp)
-        try:
-            await self._host.delete_session(event.session_id)
-        except Exception as exc:
-            picker.clear_pending_delete(event.option_id)
-            self.notify(str(exc), severity="error", markup=False)
-            return
-        picker.remove_session(event.option_id)
-        if not picker.has_sessions:
-            self.exit(result=_PickerResult())
+async def _execute_session_open_plan(
+    host: AppServerHost, plan: SessionOpenPlan
+) -> AppServerSession:
+    if plan.method == "open":
+        return await host.open_session()
+    if plan.method == "start":
+        return await host.start_session()
+    # method == "resume"
+    assert plan.session_id is not None
+    return await host.resume_session(plan.session_id)
 
 
 async def open_textual_session(
@@ -90,45 +91,34 @@ async def open_textual_session(
     prompt_for_workspace_trust: bool,
     show_resume_picker: bool,
     initially_resuming: bool,
+    resume_session_id: str | None = None,
 ) -> OpenedTextualSession | None:
-    try:
-        if prompt_for_workspace_trust and not await _resolve_workspace_trust(host):
-            await host.close()
-            return None
-
-        if not show_resume_picker:
-            return OpenedTextualSession(
-                session=await host.open_session(), resumed=initially_resuming
-            )
-
-        sessions = await host.list_sessions(host.cwd)
-        if not sessions:
-            return OpenedTextualSession(
-                session=await host.start_session(), resumed=False
-            )
-        result = await _StartupSessionPicker(host, sessions, host.cwd).run_async(
-            inline=True
-        )
-        if result is None or result.aborted:
-            await host.close()
-            return None
-        if result.session_id is None:
-            return OpenedTextualSession(
-                session=await host.start_session(), resumed=False
-            )
-        return OpenedTextualSession(
-            session=await host.resume_session(result.session_id), resumed=True
-        )
-    except BaseException:
-        await host.close()
-        raise
+    plan = await resolve_session_open_plan(
+        host,
+        prompt_for_workspace_trust=prompt_for_workspace_trust,
+        show_resume_picker=show_resume_picker,
+        initially_resuming=initially_resuming,
+        resume_session_id=resume_session_id,
+    )
+    if plan is None:
+        return None
+    session = await _execute_session_open_plan(host, plan)
+    return OpenedTextualSession(
+        session=session,
+        resumed=plan.resumed,
+        showed_trust_prompt=plan.showed_trust_prompt,
+        showed_resume_picker=plan.showed_resume_picker,
+        resume_session_id=plan.resume_session_id,
+        continue_latest=plan.continue_latest,
+    )
 
 
-async def _resolve_workspace_trust(host: AppServerHost) -> bool:
+async def _resolve_workspace_trust(host: AppServerHost) -> tuple[bool, bool]:
+    """Returns (trust_granted, prompt_shown)."""
     status = await host.trust_status(host.cwd)
     details = status.details
     if details is None:
-        return True
+        return True, False
     dialog = TrustFolderApp(
         cwd=Path(details.cwd),
         repo_root=Path(details.repo_root) if details.repo_root is not None else None,
@@ -141,8 +131,8 @@ async def _resolve_workspace_trust(host: AppServerHost) -> bool:
     try:
         decision = await dialog.run_trust_dialog_async()
     except TrustDialogQuitException:
-        return False
+        return False, True
     if decision is None:
-        return False
+        return False, True
     await host.decide_trust(decision, cwd=details.cwd)
-    return True
+    return True, True

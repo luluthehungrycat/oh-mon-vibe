@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC
 import os
@@ -13,6 +12,7 @@ from keyring.errors import KeyringError
 from vibe.acp.exceptions import ConfigurationError, InternalError, InvalidRequestError
 from vibe.core.config import ProviderConfig, load_dotenv_values
 from vibe.core.config._defaults import (
+    DEFAULT_CONSOLE_BASE_URL,
     DEFAULT_MISTRAL_BROWSER_AUTH_API_BASE_URL,
     DEFAULT_MISTRAL_BROWSER_AUTH_BASE_URL,
 )
@@ -27,13 +27,18 @@ from vibe.setup.auth import (
     assess_auth_state,
 )
 from vibe.setup.auth.api_key_persistence import (
+    ProviderCredentialsPersistRequest,
+    ProviderCredentialsPersistResult,
     persist_api_key,
-    persist_provider_to_config,
+    persist_provider_credentials,
     remove_api_key,
     resolve_api_key_provider,
 )
+from vibe.setup.auth.whoami import resolve_tenant_domains
 from vibe.setup.onboarding.context import (
     OnboardingContext,
+    browser_auth_account_base,
+    browser_auth_requires_origin_rewrite,
     is_valid_custom_domain,
     resolve_browser_auth_urls,
 )
@@ -61,7 +66,12 @@ class ApiKeyPersister(Protocol):
 type OnboardingContextLoader = Callable[[], OnboardingContext]
 type BrowserSignInServiceFactory = Callable[[ProviderConfig], BrowserSignInServicePort]
 type ApiKeyRemover = Callable[[ProviderConfig], None]
-type ProviderPersister = Callable[[ProviderConfig], bool]
+type CredentialsPersister = Callable[
+    [ProviderCredentialsPersistRequest], Awaitable[ProviderCredentialsPersistResult]
+]
+type TenantDomainResolver = Callable[
+    [ProviderConfig, str, str, str], Awaitable[tuple[ProviderConfig, str]]
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +87,31 @@ def _custom_domain_of(provider: ProviderConfig) -> str | None:
     return base_url
 
 
+def _account_base_of(provider: ProviderConfig) -> str | None:
+    """CLI-reachable console origin for account calls, or None for the default.
+
+    Handles four cases: (1) default console without split → None, (2) custom
+    domain without split → the custom domain origin, (3) custom domain with
+    split → the connector origin, (4) default console with split → the
+    connector origin. Cases 2–4 all need a non-None result so /whoami and plan
+    lookups target the host the CLI can actually reach.
+    """
+    custom = _custom_domain_of(provider)
+    if custom is None and not provider.browser_auth_allow_origin_rewrite:
+        return None
+    browser_base = provider.browser_auth_base_url
+    api_base = provider.browser_auth_api_base_url
+    if not browser_base or not api_base:
+        return custom or browser_base
+    return browser_auth_account_base(browser_base, api_base)
+
+
+async def _default_credentials_persister(
+    request: ProviderCredentialsPersistRequest,
+) -> ProviderCredentialsPersistResult:
+    return await persist_provider_credentials(request)
+
+
 class AcpAuthController:
     def __init__(
         self,
@@ -85,14 +120,16 @@ class AcpAuthController:
         service_factory: BrowserSignInServiceFactory | None = None,
         api_key_persister: ApiKeyPersister = persist_api_key,
         api_key_remover: ApiKeyRemover = remove_api_key,
-        provider_persister: ProviderPersister = persist_provider_to_config,
+        credentials_persister: CredentialsPersister = _default_credentials_persister,
+        tenant_domain_resolver: TenantDomainResolver = resolve_tenant_domains,
         environ_before_dotenv_load: Mapping[str, str] | None = None,
     ) -> None:
         self._load_context = context_loader or OnboardingContext.load
         self._service_factory = service_factory or self._build_service
         self._persist_api_key = api_key_persister
         self._remove_api_key = api_key_remover
-        self._persist_provider = provider_persister
+        self._persist_credentials_impl = credentials_persister
+        self._resolve_tenant_domains = tenant_domain_resolver
         self._initial_environment = dict(
             environ_before_dotenv_load
             if environ_before_dotenv_load is not None
@@ -233,18 +270,56 @@ class AcpAuthController:
         self, provider: ProviderConfig, api_key: str
     ) -> dict[str, str]:
         custom_domain = _custom_domain_of(provider)
-        meta = {
+        meta: dict[str, str] = {
             "persistResult": self._persist_api_key(
                 resolve_api_key_provider(provider),
                 api_key,
                 custom_domain=custom_domain is not None,
             )
         }
-        if provider == self._load_context().provider:
+        context = self._load_context()
+        # Use the CLI-reachable connector origin (not the browser-only console)
+        # for /whoami and the persisted console URL, so split-horizon tenant
+        # resolution hits a host the CLI can reach.
+        account_base = _account_base_of(provider)
+        desired_console = account_base or DEFAULT_CONSOLE_BASE_URL
+        desired_vibe_base_url = context.vibe_base_url
+        # Skip the persist round-trip only when the provider is unchanged AND
+        # the console URL is already aligned. A split-horizon provider set in
+        # config.toml without a signInTarget override still needs the console
+        # URL aligned to the connector origin — checking provider equality
+        # alone would skip that and leave /whoami pointing at a stale host.
+        if provider == context.provider and desired_console == context.console_base_url:
             return meta
-        # Writing config.toml is blocking file I/O; keep it off the ACP event loop.
-        persisted = await asyncio.to_thread(self._persist_provider, provider)
-        return {**meta, "persistProviderResult": "completed" if persisted else "failed"}
+        # Only fetch tenant domains for on-prem consoles — the public Mistral
+        # console has no per-tenant redirection to discover.
+        if account_base is not None:
+            provider, desired_vibe_base_url = await self._resolve_tenant_domains(
+                provider, desired_console, api_key, context.vibe_base_url
+            )
+
+        request = ProviderCredentialsPersistRequest(
+            provider=provider,
+            console_base_url=(
+                desired_console if desired_console != context.console_base_url else None
+            ),
+            vibe_base_url=(
+                desired_vibe_base_url
+                if desired_vibe_base_url != context.vibe_base_url
+                else None
+            ),
+        )
+        result = await self._persist_credentials_impl(request)
+        meta["persistProviderResult"] = "completed" if result.provider else "failed"
+        if result.console_base_url is not None:
+            meta["persistConsoleBaseUrlResult"] = (
+                "completed" if result.console_base_url else "failed"
+            )
+        if result.vibe_base_url is not None:
+            meta["persistVibeBaseUrlResult"] = (
+                "completed" if result.vibe_base_url else "failed"
+            )
+        return meta
 
     def _resolve_sign_in_provider(self, arguments: dict[str, Any]) -> ProviderConfig:
         provider = self._enabled_provider()
@@ -258,6 +333,7 @@ class AcpAuthController:
                     "browser_auth_api_base_url": (
                         DEFAULT_MISTRAL_BROWSER_AUTH_API_BASE_URL
                     ),
+                    "browser_auth_allow_origin_rewrite": False,
                 }
             )
         if target != SIGN_IN_TARGET_CUSTOM:
@@ -265,11 +341,28 @@ class AcpAuthController:
         domain = arguments.get("domain")
         if not isinstance(domain, str) or not is_valid_custom_domain(domain):
             raise InvalidRequestError(f"Invalid custom sign-in domain: {domain!r}")
-        base_url, api_base_url = resolve_browser_auth_urls(domain)
+        # apiBaseUrl is the browser-auth /api sign-in base, not the /v1 LLM API
+        # base. Callers behind a split-horizon proxy pass the CLI-reachable host
+        # here; absent (or empty), it is derived as domain/api (prior behavior). A
+        # non-string value is a client bug and is rejected rather than ignored.
+        api_base_raw = arguments.get("apiBaseUrl")
+        if api_base_raw is not None and not isinstance(api_base_raw, str):
+            raise InvalidRequestError(
+                f"Invalid custom sign-in API base URL: {api_base_raw!r}"
+            )
+        api_base_arg = api_base_raw.strip() if isinstance(api_base_raw, str) else None
+        if api_base_arg and not is_valid_custom_domain(api_base_arg):
+            raise InvalidRequestError(
+                f"Invalid custom sign-in API base URL: {api_base_arg!r}"
+            )
+        base_url, api_base_url = resolve_browser_auth_urls(domain, api_base_arg or None)
         return provider.model_copy(
             update={
                 "browser_auth_base_url": base_url,
                 "browser_auth_api_base_url": api_base_url,
+                "browser_auth_allow_origin_rewrite": (
+                    browser_auth_requires_origin_rewrite(base_url, api_base_url)
+                ),
             }
         )
 
@@ -298,5 +391,9 @@ class AcpAuthController:
         if browser_url is None or api_url is None:
             raise ConfigurationError("Browser sign-in requires both browser auth URLs")
         return BrowserSignInService(
-            HttpBrowserSignInGateway(browser_base_url=browser_url, api_base_url=api_url)
+            HttpBrowserSignInGateway(
+                browser_base_url=browser_url,
+                api_base_url=api_url,
+                allow_origin_rewrite=provider.browser_auth_allow_origin_rewrite,
+            )
         )

@@ -6,6 +6,7 @@ import pytest
 
 import vibe.cli.autocompletion.completers as completers_module
 from vibe.cli.autocompletion.completers import PathCompleter
+from vibe.cli.autocompletion.file_indexer.store import IndexEntry, build_ascii_mask
 from vibe.cli.autocompletion.fuzzy import fuzzy_match as real_fuzzy_match
 
 
@@ -66,11 +67,17 @@ def test_fuzzy_matches_word_boundaries_preferred(file_tree: Path) -> None:
     assert "@src/models.py" in results
 
 
-def test_fuzzy_matches_empty_pattern_shows_all(file_tree: Path) -> None:
-    results = PathCompleter().get_completions("@", cursor_pos=1)
+def test_bare_at_lists_current_directory_without_workspace_discovery(
+    file_tree: Path,
+) -> None:
+    completer = PathCompleter()
 
-    assert "@README.md" in results
-    assert "@src/" in results
+    assert completer.get_completions("@", cursor_pos=1) == [
+        "@config/",
+        "@README.md",
+        "@src/",
+    ]
+    assert completer._indexer.stats.rebuilds == 0
 
 
 def test_fuzzy_matches_hidden_files_only_with_dot(file_tree: Path) -> None:
@@ -114,6 +121,36 @@ def test_fuzzy_matches_multiple_files_with_same_pattern(file_tree: Path) -> None
 def test_fuzzy_matches_no_results_when_no_match(file_tree: Path) -> None:
     completer = PathCompleter()
     assert completer.get_completions("@xyz123", cursor_pos=7) == []
+
+
+def test_searches_entries_beyond_the_former_fixed_scan_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entries = [
+        IndexEntry(
+            rel=f"generated/file_{index}.txt",
+            rel_lower=f"generated/file_{index}.txt",
+            name=f"file_{index}.txt",
+            path=Path(f"generated/file_{index}.txt"),
+            is_dir=False,
+            ascii_mask=build_ascii_mask(f"generated/file_{index}.txt"),
+        )
+        for index in range(32_000)
+    ]
+    entries.append(
+        IndexEntry(
+            rel="src/needle.py",
+            rel_lower="src/needle.py",
+            name="needle.py",
+            path=Path("src/needle.py"),
+            is_dir=False,
+            ascii_mask=build_ascii_mask("src/needle.py"),
+        )
+    )
+    completer = PathCompleter()
+    monkeypatch.setattr(completer._indexer, "get_index", lambda *_: entries)
+
+    assert "@src/needle.py" in completer.get_completions("@needle", cursor_pos=7)
 
 
 def test_fuzzy_matches_directory_traversal(file_tree: Path) -> None:
@@ -311,6 +348,34 @@ def test_exact_path_query_ranks_children_ahead_of_unrelated_fuzzy_matches(
     )
 
 
+def test_prioritizes_exact_path_prefix_before_fuzzy_search_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def make_entry(rel: str, *, is_dir: bool = False) -> IndexEntry:
+        return IndexEntry(
+            rel=rel,
+            rel_lower=rel.lower(),
+            name=Path(rel).name,
+            path=Path(rel),
+            is_dir=is_dir,
+            ascii_mask=build_ascii_mask(rel.lower()),
+        )
+
+    entries = [
+        make_entry("tools/flake8/alembic-loop/build/lib/flake8_alembic_loop.py"),
+        make_entry("cloud-api-client/.speakeasy/cloud-api-codegen-overlay.yaml"),
+        make_entry("vibe/tests/cli/test_audio_config_boundary.py"),
+        make_entry("ts", is_dir=True),
+        make_entry("ts/apps/cloud/AGENTS.md"),
+    ]
+    completer = PathCompleter(max_entries_to_process=3)
+    monkeypatch.setattr(completer._indexer, "get_index", lambda *_: entries)
+
+    results = completer.get_completions("@ts/cloudA", cursor_pos=10)
+
+    assert results[0] == "@ts/apps/cloud/AGENTS.md"
+
+
 def test_skips_fuzzy_scoring_for_entries_missing_required_query_characters(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -348,3 +413,105 @@ def test_non_ascii_queries_still_match_when_ascii_prefilter_is_disabled(
     results = PathCompleter().get_completions("@café", cursor_pos=5)
 
     assert results == ["@café.txt"]
+
+
+def test_trailing_slash_on_nonexistent_prefix_keeps_picker_alive(
+    file_tree: Path,
+) -> None:
+    # "cor" is not a real directory (the real dir is "core"), but fuzzy-matches
+    # paths under "core/". The trailing slash is kept as a literal anchor so
+    # only paths where "cor" precedes a directory boundary survive.
+    results = PathCompleter().get_completions("@cor/", cursor_pos=5)
+
+    assert results
+    assert "@src/core/logger.py" in results
+    assert all(result.startswith("@src/core/") for result in results)
+
+
+def test_trailing_slash_on_real_prefix_still_lists_immediate_children(
+    file_tree: Path,
+) -> None:
+    results = PathCompleter().get_completions("@src/", cursor_pos=5)
+
+    assert "@src/main.py" in results
+    assert "@src/core/" in results
+
+
+def test_slash_only_partial_does_not_flood_picker(file_tree: Path) -> None:
+    # "@/" has no non-slash content to anchor on; the fuzzy fallback must skip
+    # it instead of matching every indexed path that contains a separator.
+    results = PathCompleter().get_completions("@/", cursor_pos=2)
+
+    assert results == []
+
+
+def test_trailing_slash_on_empty_real_dir_returns_empty_not_fuzzy_noise(
+    file_tree: Path,
+) -> None:
+    # src/utils is a real indexed directory with no children. The picker must
+    # return an empty list rather than falling back to fuzzy and surfacing
+    # unrelated paths that happen to contain "utils" as a substring.
+    results = PathCompleter().get_completions("@src/utils/", cursor_pos=11)
+
+    assert results == []
+
+
+@pytest.fixture()
+def nested_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "README.md").write_text("", encoding="utf-8")
+    (tmp_path / "sibling").mkdir()
+    (tmp_path / "sibling" / "note.txt").write_text("", encoding="utf-8")
+    (tmp_path / "sibling" / "nested").mkdir()
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.chdir(project)
+    return tmp_path
+
+
+def test_parent_directory_traversal_lists_siblings(nested_project: Path) -> None:
+    results = PathCompleter().get_completions("@../", cursor_pos=4)
+
+    assert "@../sibling/" in results
+    assert "@../project/" in results
+
+
+def test_parent_directory_segment_drills_into_sibling(nested_project: Path) -> None:
+    results = PathCompleter().get_completions("@../sibling/", cursor_pos=12)
+
+    assert "@../sibling/note.txt" in results
+    assert "@../sibling/nested/" in results
+
+
+def test_grandparent_traversal_lists_entries(nested_project: Path) -> None:
+    results = PathCompleter().get_completions("@../../", cursor_pos=7)
+
+    assert results
+    assert all(result.startswith("@../../") for result in results)
+
+
+def test_parent_dot_suffix_lists_hidden_files(nested_project: Path) -> None:
+    results = PathCompleter().get_completions("@../.", cursor_pos=5)
+
+    assert "@../.env" in results
+    assert all(not r.startswith("@../.") or r == "@../.env" for r in results)
+
+
+def test_windows_backslash_in_parent_traversal_is_normalized(
+    nested_project: Path,
+) -> None:
+    # On Windows a user may type @..\ instead of @../. The completer must
+    # normalize the backslash so parent traversal still works. The test is
+    # runnable on Linux/macOS because normalization happens before any
+    # filesystem call.
+    results = PathCompleter().get_completions("@..\\", cursor_pos=4)
+
+    assert "@../sibling/" in results
+    assert "@../project/" in results
+
+
+def test_windows_backslash_drills_into_sibling(nested_project: Path) -> None:
+    results = PathCompleter().get_completions("@..\\sibling\\", cursor_pos=12)
+
+    assert "@../sibling/note.txt" in results
+    assert "@../sibling/nested/" in results

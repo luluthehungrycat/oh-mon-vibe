@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Callable
 import signal
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 from textual.app import WINDOWS
@@ -32,6 +32,14 @@ def qm() -> QuitManager:
     mock_app.query_one.side_effect = Exception("not mounted")
     mock_app.set_timer.return_value = MagicMock()
     return QuitManager(mock_app)
+
+
+class _SessionReadyApp:
+    """Warm-path base: app_server is set so the cold-path force-quit guard is skipped."""
+
+    @pytest.fixture(autouse=True)
+    def _set_app_server(self, app: VibeApp) -> None:
+        app._app_server = MagicMock()
 
 
 class TestQuitManager:
@@ -90,7 +98,7 @@ class TestQuitManager:
         assert qm.confirm_key is None
 
 
-class TestActionInterruptOrQuit:
+class TestActionInterruptOrQuit(_SessionReadyApp):
     def test_clears_input_when_has_value(self, app: VibeApp) -> None:
         mock_container = MagicMock()
         mock_container.value = "some text"
@@ -132,6 +140,31 @@ class TestActionInterruptOrQuit:
         mock_interrupt.assert_called_once()
         mock_confirm.assert_not_called()
 
+    def test_does_not_interrupt_during_atomic_steer(self, app: VibeApp) -> None:
+        queue_type = type(app._queue)
+        with (
+            patch.object(app, "_get_chat_input", return_value=None),
+            patch.object(app, "_try_interrupt_no_job_steps", return_value=False),
+            patch.object(
+                queue_type,
+                "has_removable",
+                new_callable=PropertyMock,
+                return_value=False,
+            ),
+            patch.object(
+                queue_type,
+                "atomic_steer_in_flight",
+                new_callable=PropertyMock,
+                return_value=True,
+            ),
+            patch.object(app, "_try_interrupt_running_job") as mock_interrupt,
+            patch.object(app._quit_manager, "request_confirmation") as mock_confirm,
+        ):
+            app.action_interrupt_or_quit()
+
+        mock_interrupt.assert_not_called()
+        mock_confirm.assert_not_called()
+
     def test_requests_confirmation_when_nothing_to_interrupt(
         self, app: VibeApp
     ) -> None:
@@ -145,7 +178,32 @@ class TestActionInterruptOrQuit:
         mock_confirm.assert_called_once_with("Ctrl+C", "")
 
 
-class TestActionDeleteRightOrQuit:
+def test_interrupt_settle_waits_for_atomic_steer(app: VibeApp) -> None:
+    queue_type = type(app._queue)
+    app._begin_interrupt_settle()
+
+    with (
+        patch.object(app, "_agent_job_active", return_value=False),
+        patch.object(
+            queue_type, "has_removable", new_callable=PropertyMock, return_value=False
+        ),
+        patch.object(
+            queue_type,
+            "atomic_steer_in_flight",
+            new_callable=PropertyMock,
+            return_value=True,
+        ),
+        patch.object(
+            queue_type, "paused", new_callable=PropertyMock, return_value=False
+        ),
+    ):
+        app._maybe_settle_interrupt()
+
+    assert app._interrupt_pending
+    assert not app._interrupt_settled.is_set()
+
+
+class TestActionDeleteRightOrQuit(_SessionReadyApp):
     def test_deletes_right_when_input_has_value(self, app: VibeApp) -> None:
         mock_input = MagicMock()
         mock_container = MagicMock()
@@ -184,9 +242,13 @@ class TestActionDeleteRightOrQuit:
         mock_confirm.assert_called_once_with("Ctrl+D", "")
 
     def test_shows_queue_warning_when_queue_non_empty(self, app: VibeApp) -> None:
-        app._input_queue.append_prompt("queued")
         with (
             patch.object(app, "_get_chat_input", return_value=None),
+            patch.object(
+                app._queue,
+                "quit_warning_extra",
+                return_value="1 queued message will be discarded",
+            ),
             patch.object(app._quit_manager, "request_confirmation") as mock_confirm,
         ):
             app.action_delete_right_or_quit()
@@ -200,6 +262,7 @@ class TestActionDeleteRightOrQuit:
         app = build_test_vibe_app(
             config=build_test_vibe_config(ask_confirmation_on_exit=False)
         )
+        app._app_server = MagicMock()
         config = build_test_app_config().model_copy(
             update={"ask_confirmation_on_exit": False}
         )
@@ -231,24 +294,14 @@ async def test_shutdown_cleanup_cancels_in_flight_tasks(app: VibeApp) -> None:
 
 
 @pytest.mark.asyncio
-async def test_shutdown_disables_future_queue_drains(app: VibeApp) -> None:
-    app._input_queue.append_prompt("queued")
-
-    await app._begin_shutdown()
-
-    with patch("vibe.cli.textual_ui.message_queue.asyncio.create_task") as create_task:
-        app._queue.start_drain_if_needed()
-
-    create_task.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_begin_shutdown_stops_the_input_queue(app: VibeApp) -> None:
+async def test_begin_shutdown_stops_the_side_channel(app: VibeApp) -> None:
     await app.prepare()
-    with patch.object(app._queue, "shutdown", new_callable=AsyncMock) as queue_shutdown:
+    with patch.object(
+        app._side_channel, "shutdown", new_callable=AsyncMock
+    ) as side_channel_shutdown:
         await app._begin_shutdown()
 
-    queue_shutdown.assert_awaited_once()
+    side_channel_shutdown.assert_awaited_once()
     await app.shutdown_cleanup()
 
 

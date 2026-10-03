@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from vibe.app_server._execution import SessionExecution
 from vibe.app_server._model import ProtocolModel
@@ -21,10 +22,15 @@ from vibe.app_server.models import (
     PublicHistoryEntry,
     PublicSessionState,
     PublicTurn,
+    PublicTurnQueue,
     PublicTurnStatus,
     TextContentBlock,
 )
-from vibe.app_server.protocol import TurnInterruptParams, TurnStartParams
+from vibe.app_server.protocol import (
+    CallbackResultError,
+    TurnInterruptParams,
+    TurnStartParams,
+)
 from vibe.core.agent_loop import AgentLoop
 from vibe.core.session.saved_sessions import delete_saved_session
 from vibe.core.subagents import (
@@ -36,7 +42,7 @@ from vibe.core.subagents import (
 )
 from vibe.core.tools.base import InvokeContext
 from vibe.core.tools.io_port import ToolIOPort
-from vibe.core.types import BaseEvent, Role, ToolStreamEvent
+from vibe.core.types import BaseEvent, ChildSessionLink, Role, ToolStreamEvent
 from vibe.observability.logging import logger
 
 type Notify = Callable[[str, ProtocolModel], Awaitable[None]]
@@ -84,6 +90,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):
         self._root: SessionRuntime | None = None
         self._children: dict[str, SessionRuntime] = {}
         self._child_links: dict[str, tuple[SessionRuntime, str]] = {}
+        self._ensure_child_lock = asyncio.Lock()
 
     def bind_root(self, runtime: SessionRuntime) -> None:
         if self._root is not None:
@@ -94,8 +101,70 @@ class SessionRuntimeRegistry(SubagentRunnerPort):
         if self._root is runtime:
             self._root = None
 
-    def has_child(self, session_id: str) -> bool:
-        return session_id in self._children
+    def references_child(self, session_id: str) -> bool:
+        return (
+            session_id in self._children
+            or self._resolve_child_link(session_id) is not None
+        )
+
+    async def ensure_child(self, session_id: str) -> bool:
+        if session_id in self._children:
+            return True
+        async with self._ensure_child_lock:
+            if session_id in self._children:
+                return True
+            resolved = self._resolve_child_link(session_id)
+            if resolved is None:
+                return False
+            parent_runtime, root_agent_loop, child_dir, link = resolved
+            child: AgentLoop | None = None
+            try:
+                child = await self._runtime_factory.resume_child(
+                    root_agent_loop, link.agent, link.session_id, child_dir
+                )
+                runtime = self._build_child_runtime(
+                    child, base_history=project_history(child)
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to ensure child session session_id=%s path=%s",
+                    session_id,
+                    child_dir,
+                    exc_info=exc,
+                )
+                if child is not None:
+                    await self._discard_child(child)
+                return False
+            self._children[child.session_id] = runtime
+            self._child_links[child.session_id] = (parent_runtime, link.tool_call_id)
+        return True
+
+    def _resolve_child_link(
+        self, session_id: str
+    ) -> tuple[SessionRuntime, AgentLoop, Path, ChildSessionLink] | None:
+        parent_runtime = self._root
+        if parent_runtime is None:
+            return None
+        root_agent_loop = parent_runtime.agent_loop
+        metadata = root_agent_loop.session_logger.session_metadata
+        parent_dir = root_agent_loop.session_logger.session_dir
+        if metadata is None or parent_dir is None:
+            return None
+        parent_root = parent_dir.resolve()
+        link = next(
+            (
+                link
+                for link in metadata.child_sessions
+                if link.session_id == session_id and link.relative_path is not None
+            ),
+            None,
+        )
+        if link is None or link.relative_path is None:
+            return None
+        child_dir = (parent_dir / link.relative_path).resolve()
+        if not child_dir.is_relative_to(parent_root) or not child_dir.is_dir():
+            return None
+        return parent_runtime, root_agent_loop, child_dir, link
 
     def child_belongs_to(self, session_id: str, root_session_id: str) -> bool:
         child = self._children.get(session_id)
@@ -115,7 +184,8 @@ class SessionRuntimeRegistry(SubagentRunnerPort):
         current_history: list[PublicHistoryEntry],
         callbacks: list[PublicCallbackEntry],
         active_turn: PublicTurn,
-        last_turn: PublicTurn | None = None,
+        completed_turns: list[PublicTurn],
+        turn_queue: PublicTurnQueue,
         history_limit: int = 200,
     ) -> SessionHandoff:
         runtime = self._require_child(old_session_id)
@@ -145,12 +215,15 @@ class SessionRuntimeRegistry(SubagentRunnerPort):
             history=runtime.history.base,
             current_history=current_history,
             callbacks=callbacks,
-            active_turn=active_turn,
-            last_turn=last_turn,
+            turns=[*completed_turns, active_turn],
+            retrying=None,
             history_limit=history_limit,
         )
         state = state.model_copy(
-            update={"event_id": self._event_watermark(new_session_id)}
+            update={
+                "event_id": self._event_watermark(new_session_id),
+                "turn_queue": turn_queue,
+            }
         )
         return SessionHandoff(
             old_session_id=old_session_id,
@@ -159,11 +232,35 @@ class SessionRuntimeRegistry(SubagentRunnerPort):
             session_log=project_session_log(runtime.agent_loop),
         )
 
-    def public_state(self, session_id: str, history_limit: int) -> PublicSessionState:
-        runtime = self._require_child(session_id)
+    def public_state(
+        self,
+        session_id: str,
+        history_limit: int,
+        *,
+        turns_limit: int | None = None,
+        include_history: bool = True,
+        include_turns: bool = True,
+    ) -> PublicSessionState:
+        return self._public_state(
+            self._require_child(session_id),
+            history_limit,
+            turns_limit=turns_limit,
+            include_history=include_history,
+            include_turns=include_turns,
+        )
+
+    def _public_state(
+        self,
+        runtime: SessionRuntime,
+        history_limit: int,
+        *,
+        turns_limit: int | None = None,
+        include_history: bool = True,
+        include_turns: bool = True,
+    ) -> PublicSessionState:
         callbacks = [
             entry
-            for entry in self.history(session_id)
+            for entry in runtime.history.all(runtime.turns.history)
             if isinstance(entry, PublicCallbackEntry)
         ]
         state = build_public_state(
@@ -171,15 +268,26 @@ class SessionRuntimeRegistry(SubagentRunnerPort):
             history=runtime.history.base,
             current_history=runtime.turns.history,
             callbacks=callbacks,
-            active_turn=runtime.turns.active_turn,
-            last_turn=runtime.turns.last_turn,
+            turns=runtime.turns.turns,
+            retrying=runtime.turns.retrying,
             history_limit=history_limit,
+            turns_limit=turns_limit,
+            include_history=include_history,
+            include_turns=include_turns,
         )
-        return state.model_copy(update={"event_id": self._event_watermark(session_id)})
+        return state.model_copy(
+            update={
+                "event_id": self._event_watermark(runtime.agent_loop.session_id),
+                "turn_queue": runtime.turns.queue_state,
+            }
+        )
 
     def history(self, session_id: str) -> list[PublicHistoryEntry]:
         runtime = self._require_child(session_id)
         return runtime.history.all(runtime.turns.history)
+
+    def turns(self, session_id: str) -> list[PublicTurn]:
+        return self._require_child(session_id).turns.turns
 
     def active_callbacks(self) -> list[PublicCallbackEntry]:
         return [
@@ -197,53 +305,14 @@ class SessionRuntimeRegistry(SubagentRunnerPort):
         )
 
     async def reject_callback(
-        self, session_id: str, callback_id: str, message: str
-    ) -> None:
-        await self._require_child(session_id).turns.reject_callback(
-            callback_id, message
+        self, session_id: str, callback_id: str, error: CallbackResultError
+    ) -> str:
+        return await self._require_child(session_id).turns.reject_callback(
+            callback_id, error
         )
 
-    async def restore_children(self, parent: AgentLoop) -> None:
-        await self._close_children()
-        metadata = parent.session_logger.session_metadata
-        parent_dir = parent.session_logger.session_dir
-        if metadata is None or parent_dir is None:
-            return
-        parent_root = parent_dir.resolve()
-        for link in metadata.child_sessions:
-            if link.relative_path is None:
-                continue
-            child_dir = (parent_dir / link.relative_path).resolve()
-            if not child_dir.is_relative_to(parent_root) or not child_dir.is_dir():
-                continue
-            child: AgentLoop | None = None
-            try:
-                child = await self._runtime_factory.resume_child(
-                    parent, link.agent, link.session_id, child_dir
-                )
-                runtime = self._build_child_runtime(
-                    child, base_history=project_history(child)
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Skipping child session session_id=%s path=%s",
-                    link.session_id,
-                    child_dir,
-                    exc_info=exc,
-                )
-                if child is not None:
-                    await self._discard_child(child)
-                continue
-            self._children[child.session_id] = runtime
-            parent_runtime = self._root
-            if parent_runtime is None:
-                await runtime.close()
-                self._children.pop(child.session_id, None)
-                raise RuntimeError("Cannot restore a child without a root runtime")
-            self._child_links[child.session_id] = (parent_runtime, link.tool_call_id)
-
     async def close(self) -> None:
-        await self._close_children()
+        await self.close_children()
 
     async def run(
         self, args: TaskArgs, ctx: InvokeContext
@@ -292,7 +361,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):
         response, start = runtime.turns.start(
             TurnStartParams(
                 session_id=child.session_id,
-                input=[TextContentBlock(text=prepare_subagent_prompt(args.task, ctx))],
+                message=[
+                    TextContentBlock(text=prepare_subagent_prompt(args.task, ctx))
+                ],
             )
         )
         start()
@@ -332,19 +403,27 @@ class SessionRuntimeRegistry(SubagentRunnerPort):
         event_sink: Callable[[BaseEvent], Awaitable[None]] | None = None,
     ) -> SessionRuntime:
         execution = SessionExecution()
+        history = SessionHistory(base_history or [])
+        runtime: SessionRuntime | None = None
+
+        def snapshot_state() -> PublicSessionState:
+            if runtime is None:
+                raise RuntimeError("Child session runtime is not bound")
+            return self._public_state(runtime, 200)
+
         turns = TurnController(
             child,
             self._notify_child,
             self._deliver_callback,
             execution,
             self,
-            self._tool_io,
-            event_sink,
-            self,
+            snapshot_state=snapshot_state,
+            tool_io=self._tool_io,
+            event_sink=event_sink,
+            session_coordinator=self,
         )
-        return SessionRuntime(
-            child, turns, execution, SessionHistory(base_history or [])
-        )
+        runtime = SessionRuntime(child, turns, execution, history)
+        return runtime
 
     def _runtime(self, session_id: str | None) -> SessionRuntime:
         if session_id is None:
@@ -363,10 +442,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):
             raise KeyError(session_id)
         return child
 
-    async def _close_children(self) -> None:
-        children = list(self._children.values())
-        self._children.clear()
-        self._child_links.clear()
+    async def close_children(self) -> None:
+        async with self._ensure_child_lock:
+            children = list(self._children.values())
+            self._children.clear()
+            self._child_links.clear()
         errors: list[BaseException] = []
         for runtime in children:
             try:

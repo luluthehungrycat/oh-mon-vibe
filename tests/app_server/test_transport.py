@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 from contextlib import suppress
 from io import BytesIO
 import json
 import socket
 from threading import Event
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -13,12 +15,12 @@ import pytest
 from tests.conftest import build_test_agent_loop
 from tests.stubs.app_server import build_test_app_server
 from vibe.app_server import stdio
+from vibe.app_server._legacy_composition import create_legacy_app_server
 from vibe.app_server._runtime import HarnessServer, RootOpenRequest
 from vibe.app_server.client import AppServerClient
 from vibe.app_server.events import HistoryEntryAdded
 from vibe.app_server.models import PublicMessageEntry
 from vibe.app_server.protocol import ClientCapabilities, ClientInfo
-from vibe.app_server.server import AppServer
 from vibe.app_server.session import AppServerSession
 from vibe.app_server.transport import (
     InvalidJsonRpcMessage,
@@ -58,6 +60,38 @@ class CountingWriter(BytesIO):
         super().flush()
 
 
+def test_stdio_main_neutralizes_stdout_after_serving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    neutralized = False
+
+    def run(coroutine: Any) -> None:
+        coroutine.close()
+
+    def neutralize_stdout() -> None:
+        nonlocal neutralized
+        neutralized = True
+
+    monkeypatch.setattr(
+        stdio,
+        "parse_arguments",
+        lambda: argparse.Namespace(experimental_harness=False, legacy_harness=False),
+    )
+    monkeypatch.setattr(stdio, "init_harness_files_manager", lambda *_: None)
+    monkeypatch.setattr(stdio, "init_file_logging", lambda _: None)
+    monkeypatch.setattr(stdio.asyncio, "run", run)
+    monkeypatch.setattr(stdio, "_neutralize_stdout", neutralize_stdout)
+    monkeypatch.setattr("vibe.core.config.load_dotenv_values", lambda: None)
+    monkeypatch.setattr(
+        "vibe.core.utils.windows_asyncio.silence_proactor_transport_teardown_warnings",
+        lambda: None,
+    )
+
+    stdio.main()
+
+    assert neutralized
+
+
 @pytest.mark.asyncio
 async def test_stdio_server_creates_the_harness_behind_its_transport(
     monkeypatch: pytest.MonkeyPatch,
@@ -73,8 +107,34 @@ async def test_stdio_server_creates_the_harness_behind_its_transport(
     assert call is not None
     args, kwargs = call
     assert isinstance(args[0], StdioJsonRpcTransport)
-    assert kwargs == {"transport_kind": "stdio"}
+    assert kwargs == {
+        "transport_kind": "stdio",
+        "experimental_harness": False,
+        "legacy_harness": False,
+    }
     harness.serve.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_stdio_server_forwards_experimental_harness_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = AsyncMock(spec=HarnessServer)
+    factory = AsyncMock(return_value=harness)
+    monkeypatch.setattr(stdio, "create_harness_server", factory)
+
+    await stdio.serve_stdio(
+        reader=BytesIO(), writer=BytesIO(), experimental_harness=True
+    )
+
+    call = factory.await_args
+    assert call is not None
+    _, kwargs = call
+    assert kwargs == {
+        "transport_kind": "stdio",
+        "experimental_harness": True,
+        "legacy_harness": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -224,6 +284,11 @@ async def test_stdio_transport_close_is_idempotent() -> None:
 @pytest.mark.asyncio
 async def test_stdio_server_uses_the_same_json_rpc_lifecycle() -> None:
     agent_loop = build_test_agent_loop()
+    client_socket, server_socket = socket.socketpair()
+    client_reader = client_socket.makefile("rb")
+    client_writer = client_socket.makefile("wb")
+    server_reader = server_socket.makefile("rb")
+    server_writer = server_socket.makefile("wb")
 
     async def open_root(_request: RootOpenRequest):
         return agent_loop
@@ -243,7 +308,7 @@ async def test_stdio_server_uses_the_same_json_rpc_lifecycle() -> None:
             "jsonrpc": "2.0",
             "id": "start",
             "method": "session/start",
-            "params": {"cwd": str(agent_loop.cwd)},
+            "params": {"agentConfig": {"cwd": str(agent_loop.cwd)}},
         },
         {
             "jsonrpc": "2.0",
@@ -252,19 +317,54 @@ async def test_stdio_server_uses_the_same_json_rpc_lifecycle() -> None:
             "params": {"sessionId": agent_loop.session_id},
         },
     ]
-    reader = BytesIO(
-        b"".join(json.dumps(message).encode() + b"\n" for message in input_messages)
-    )
-    output = BytesIO()
-
-    await AppServer(
-        StdioJsonRpcTransport(reader, output),
-        transport_kind="stdio",
+    server = create_legacy_app_server(
+        StdioJsonRpcTransport(server_reader, server_writer),
         open_root=open_root,
-    ).serve()
+        transport_kind="stdio",
+    )
+    serve_task = asyncio.create_task(server.serve())
 
-    responses = [json.loads(line) for line in output.getvalue().splitlines()]
-    assert responses[0]["result"]["capabilities"]["transports"] == ["stdio"]
+    async def send(message: dict[str, object]) -> None:
+        await asyncio.to_thread(
+            client_writer.write, json.dumps(message).encode() + b"\n"
+        )
+        await asyncio.to_thread(client_writer.flush)
+
+    async def receive() -> dict[str, Any]:
+        raw = await asyncio.wait_for(
+            asyncio.to_thread(client_reader.readline), timeout=2
+        )
+        return json.loads(raw)
+
+    try:
+        await send(input_messages[0])
+        responses = [await receive()]
+        await send(input_messages[1])
+        await send(input_messages[2])
+        responses.append(await receive())
+        await send(input_messages[3])
+        responses.append(await receive())
+        client_socket.shutdown(socket.SHUT_WR)
+        await asyncio.wait_for(serve_task, timeout=2)
+    finally:
+        if not serve_task.done():
+            serve_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await serve_task
+        for sock in (client_socket, server_socket):
+            with suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+        for stream in (client_reader, client_writer, server_reader, server_writer):
+            stream.close()
+        client_socket.close()
+        server_socket.close()
+
+    assert responses[0]["result"] == {
+        "serverInfo": {
+            "name": "omv-app-server",
+            "version": responses[0]["result"]["serverInfo"]["version"],
+        }
+    }
     assert responses[1]["result"]["state"]["session"]["id"] == (agent_loop.session_id)
     assert responses[2]["result"]["state"]["session"]["id"] == (agent_loop.session_id)
 
@@ -309,7 +409,7 @@ async def test_app_server_session_round_trips_a_turn_over_stdio() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stdio_session_start_applies_the_serialized_session_options() -> None:
+async def test_stdio_session_start_maps_agent_config_workdir_to_runtime_cwd() -> None:
     agent_loop = build_test_agent_loop()
     captured: list[RootOpenRequest] = []
 
@@ -338,18 +438,20 @@ async def test_stdio_session_start_applies_the_serialized_session_options() -> N
             "id": "start",
             "method": "session/start",
             "params": {
-                "cwd": "/workspace",
-                "workspaceRoots": ["/other"],
-                "agent": "plan",
-                "autoApprove": True,
-                "enabledTools": ["read_file"],
-                "disabledTools": ["bash"],
-                "maxTurns": 3,
-                "maxPrice": 2.5,
-                "maxSessionTokens": 1000,
-                "headless": True,
-                "trustWorkspace": True,
-                "mcpServers": [],
+                "agentConfig": {
+                    "workdir": "/workspace",
+                    "workspaceRoots": ["/other"],
+                    "agent": "plan",
+                    "autoApprove": True,
+                    "enabledTools": ["read_file"],
+                    "disabledTools": ["bash"],
+                    "maxTurns": 3,
+                    "maxPrice": 2.5,
+                    "maxSessionTokens": 1000,
+                    "headless": True,
+                    "trustWorkspace": True,
+                    "mcpServers": [],
+                }
             },
         },
     ]
@@ -357,20 +459,24 @@ async def test_stdio_session_start_applies_the_serialized_session_options() -> N
         b"".join(json.dumps(message).encode() + b"\n" for message in input_messages)
     )
 
-    await AppServer(
+    await create_legacy_app_server(
         StdioJsonRpcTransport(reader, BytesIO()),
-        transport_kind="stdio",
         open_root=open_root,
+        transport_kind="stdio",
     ).serve()
 
     assert len(captured) == 1
     request = captured[0]
     assert request.client_capabilities.client_tools == ["terminal"]
     options = request.options
-    assert options.model_dump(by_alias=False) == {
+    assert options.model_dump(
+        by_alias=False,
+        exclude={"completion", "sandbox", "instructions", "tools", "hooks"},
+    ) == {
+        "workdir": "/workspace",
         "cwd": "/workspace",
         "workspace_roots": ["/other"],
-        "local_workspace_selection": None,
+        "worktree": None,
         "agent": "plan",
         "auto_approve": True,
         "enabled_tools": ["read_file"],

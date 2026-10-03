@@ -89,9 +89,7 @@ def make_agent_loop(
     backend: FakeBackend,
     approval_handler: ApprovalRequestHandler | None = None,
 ) -> AgentLoop:
-    agent_name = (
-        BuiltinAgentName.AUTO_APPROVE if auto_approve else BuiltinAgentName.DEFAULT
-    )
+    agent_name = BuiltinAgentName.AUTO_APPROVE if auto_approve else BuiltinAgentName.ASK
     agent_loop = build_test_agent_loop(
         config=make_config(todo_permission=todo_permission),
         agent_name=agent_name,
@@ -401,11 +399,14 @@ async def test_tool_call_with_invalid_action() -> None:
 
     events = await act_and_collect_events(agent_loop, "What's my todo list?")
 
+    # `action` is a Literal, so an unknown one is rejected while parsing the
+    # arguments -- the call never reaches the tool and no ToolCallEvent is emitted.
     assert isinstance(events[0], UserMessageEvent)
-    assert isinstance(events[3], ToolResultEvent)
-    assert events[3].error is not None
-    assert events[3].result is None
-    assert "tool_error" in events[3].error.lower()
+    assert isinstance(events[2], ToolResultEvent)
+    assert events[2].error is not None
+    assert events[2].result is None
+    assert "tool_error" in events[2].error.lower()
+    assert "'read' or 'write'" in events[2].error
     assert agent_loop.stats.tool_calls_failed == 1
 
 

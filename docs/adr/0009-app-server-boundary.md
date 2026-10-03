@@ -60,7 +60,7 @@ session durability, or shared runtime:
 | Server or harness ownership | Client ownership |
 | --- | --- |
 | Root and child runtime construction | Widgets and layout |
-| Session identity, turns, and execution reservations | Keyboard and prompt editing |
+| Session identity, active and queued turns, turn ordering, and execution reservations | Keyboard and prompt editing |
 | Private session storage and public projections | Rendering public models |
 | Canonical cwd, workspace roots, trust, and prompt preparation | Display aliases and autocomplete presentation |
 | Effective config, persistence, agents, and model selection | Applying an accepted theme |
@@ -140,6 +140,13 @@ Both transports use bounded queues. Stdio has one writer that preserves message
 order and applies backpressure. In stdio mode, stdout is reserved for JSON-RPC;
 human logs use the configured log file or stderr.
 
+The client's hand-off from its reader task to `incoming()` is unbounded, and has
+to stay that way. That reader is the only thing that resolves request futures,
+while `incoming()` consumers issue requests mid-message — `_resync` on an event
+gap. Bounding the hand-off lets a notification burst park the reader on a full
+queue, so the response that would release the consumer is never dispatched and
+the connection deadlocks. Backpressure belongs at the transports.
+
 ### Initialization and attachment
 
 Every connection follows this order:
@@ -195,11 +202,23 @@ Session creation and user execution are separate:
 - `session/start` creates and attaches an empty session;
 - `session/resume` loads saved state and attaches it;
 - `session/continue` resolves and attaches the latest eligible session;
-- `session/read`, `session/list`, and `history/list` are passive reads;
+- `session/read`, `session/list`, and `session/history/list` are passive reads;
 - `session/fork` creates a session from an existing public boundary;
-- `session/close` flushes and closes the attached runtime;
+- `session/stop` flushes and shuts down the attached runtime;
 - `turn/start` begins structured user input and may mark harness instructions as
   injected so they remain hidden from public history;
+- `session/turn/enqueue` accepts canonical `entries` containing
+  context entries followed by at most one user entry as a separate future
+  turn;
+- `session/turn/queue/read` reads the accepted queued turns;
+- `session/turn/queue/remove` removes one accepted queued turn by its stable queue item
+  ID;
+- `session/turn/queue/replace` replaces one accepted queued turn
+  without changing its identity or FIFO position;
+- `session/turn/queue/steer` atomically moves one accepted queued turn into
+  the expected active turn when the selected backend supports it;
+- `session/turn/queue/resume` resumes automatic draining after an
+  interruption;
 - `turn/steer` adds input to the active turn; and
 - `turn/interrupt` interrupts the active turn.
 
@@ -207,14 +226,90 @@ A session has at most one active turn. Steering and interruption include the
 expected turn identity so stale control requests fail instead of affecting a
 new turn.
 
+Starting, steering, and queueing are different actions. `turn/start` begins
+work immediately and requires the session to be idle. `turn/steer` adds input
+to the expected active turn and never creates a future turn.
+`session/turn/enqueue`
+accepts one future user turn and never changes the active turn. If queueing
+finds an idle, unpaused session, the server promotes exactly one queued item
+after returning the enqueue response. This makes a busy-submit race safe
+without changing `turn/start` semantics.
+
+Queue editing uses the `session/turn/queue/replace` Session
+procedure. It accepts the same typed entries as enqueue plus the target queue
+item ID. A successful replacement preserves the item's ID, creation time, and
+FIFO position. The enqueue request does not accept Vibe-only `message`,
+`messageEntryId`, or `replaceQueueItemId` fields.
+
+The Unified Harness implements `session/turn/queue/steer` as one server-owned
+operation. The request contains the session ID, queue item ID, and expected
+active turn ID. It does not resend message content. Under the session lifecycle
+lock, the backend reads the already-prepared queued content, submits it to Core
+as steering, retires that exact queue record, and publishes the queue update.
+Once Core accepts the steering command, queue retirement and publication do not
+yield to another session mutation.
+
+The operation has two outcomes:
+
+- On success, Core accepts the queued user content exactly once and the server
+  retires the exact queue item.
+- On failure, Core does not accept the steering command and the queue item is
+  unchanged.
+
+The queue item ID is also the retry identity for this operation. Repeating a
+successful request for the same expected turn returns the stored receipt
+without steering again. Reusing it with another expected turn is a conflict.
+A stale turn, a missing queue item, or unsupported queued context fails without
+changing the queue. The initial Unified implementation accepts the user entry
+used by the Vibe CLI and rejects queue items that also contain context entries.
+Legacy backends do not implement this operation.
+
+The accepted turn queue has these rules:
+
+- Queue items are structured user turns. Shell commands, slash commands,
+  scheduled loops, and other harness work are not queue items.
+- Items have stable IDs and run in FIFO order as separate turns. The server
+  never combines adjacent queued prompts.
+- Replacement returns `not_found` after the target starts or is removed.
+- A completed or failed turn promotes at most one next item. An interrupted
+  turn preserves the remaining items and pauses automatic draining.
+- Removal and resume are idempotent. Enqueue and replacement retries use an
+  idempotency key. Accepted keys remain reserved for the lifetime of the live
+  session backend. Reusing a key with different input is a conflict.
+- The server enforces a fixed queue size limit and rejects enqueue requests
+  beyond it without changing the queue.
+- Unsolicited work such as scheduled loops does not overtake accepted user
+  turns.
+
+Promoting an item removes it from the queue before emitting `turn/started`.
+The resulting public turn keeps the queue item ID so clients can replace a
+pending message with the running turn. Queued input does not enter public
+history until its turn starts.
+
+Atomic queued steering uses the matching public user-history entry as its
+rendering boundary. The Unified adapter flushes events through the returned
+watermark before completing the request. Textual keeps the existing queued
+widgets pending until it receives a `history/entryAdded` event whose entry has
+`role = user`, `source = turn_steer`, and the queued message entry ID. It then
+marks those widgets sent in place instead of mounting or moving another user
+message. Sequential event handling therefore renders earlier output, the
+steered user message, and later output in that order.
+
+Terminal and promotion notifications have one order: `turn/completed`, then
+the queue update that records a pause or removes the promoted item, then the
+next `turn/started`. Responses are still written before notifications caused
+by the accepted request.
+
 Turn input is structured content. The server owns normalization into
 model-visible input and persistence. Delivery surfaces do not construct private
 messages or maintain a second prompt renderer.
 
-Compaction and plan-context clearing may replace the active session identity
-while preserving the turn. The server emits a typed handoff containing the old
-ID, replacement `PublicSessionState`, event watermark, and session-log summary.
-The client adopts all of those values atomically before processing later events.
+Compaction preserves the active session identity and appends a checkpoint to the
+same public history. Plan-context clearing may replace the active session while
+preserving the turn. For replacement operations, the server emits a typed
+handoff containing the old ID, replacement `PublicSessionState`, event
+watermark, and session-log summary. The client adopts all of those values
+atomically before processing later events.
 
 Root creation and replacement are serialized lifecycle transitions. A staged
 replacement is either adopted after the previous root closes or is itself
@@ -233,11 +328,21 @@ assignment from the first rendered prompt.
 - a format identifier and per-session event watermark;
 - public session metadata;
 - a page of public history;
-- currently open callback entries; and
-- the active or most recently terminal turn.
+- currently open callback entries;
+- the active or most recently terminal turn;
+- the accepted queued turns and whether automatic draining is paused; and
+- the current model-provider retry, including its turn, category, and technical
+  detail.
 
 It is not the private persistence format and is not sufficient to reconstruct
 the engine. Only the server reads session files.
+
+The optional `retrying` value is present only while the current live turn is
+waiting to retry a model request. The server sets it before announcing the
+retry and clears it before resumed model output, terminal turn state,
+interruption, shutdown, or session replacement. Other projection changes,
+including session metadata and statistics updates, preserve it. The public retry
+state currently includes only the turn ID, retry category, and technical detail.
 
 Within a session, public history is an append-only timeline of these closed
 variants:
@@ -250,10 +355,11 @@ variants:
 - notice.
 
 Entries have stable IDs and generation status. An in-progress entry may receive
-typed patches. A completed entry is immutable. Compaction, rewind, and clear may
-create a replacement session derived from an earlier boundary plus a checkpoint.
-The original stored session is not rewritten, and the client adopts the returned
-replacement snapshot rather than editing its existing projection.
+typed patches. A completed entry is immutable. Compaction appends a checkpoint
+without replacing the session. Rewind and clear may create a replacement session
+derived from an earlier boundary plus a checkpoint. The original stored session
+is not rewritten, and the client adopts the returned replacement snapshot rather
+than editing its existing projection.
 
 One effect entry owns the complete visible lifecycle of work: call, streaming
 output, approval blocking, result, duration, and terminal state. Tool names are
@@ -265,7 +371,10 @@ their async stream and projects only client-relevant semantics. It does not
 mirror every core event into a second private hierarchy.
 
 Projection-changing notifications carry a positive, monotonic event ID scoped
-to the session. The snapshot's `eventId` is its watermark. The client reducer:
+to one loaded session runtime. A restored runtime may begin a new sequence and
+its subscription snapshot replaces the earlier projection and watermark. A
+subscription never promises replay of events from an earlier connection or
+process. The snapshot's `eventId` is its watermark. The client reducer:
 
 1. ignores IDs at or below the watermark;
 2. accepts only the next ID;
@@ -274,8 +383,19 @@ to the session. The snapshot's `eventId` is its watermark. The client reducer:
 
 The core notification families are `session/snapshot`, session handoffs,
 `session/updated`, `history/entryAdded`, `history/entryUpdated`,
-`turn/started`, `turn/completed`, and `session/statsUpdated`. Warnings, errors,
-and resource notifications remain typed rather than using a generic envelope.
+`turn/queueUpdated`, `turn/started`, `turn/completed`, and
+`session/statsUpdated`. Warnings, errors, and resource notifications remain
+typed rather than using a generic envelope.
+
+Retry-state changes use numbered `session/snapshot` notifications and therefore
+share the session event watermark. A live same-session snapshot contains a
+bounded latest history and turn page. Reducers retain an already-loaded
+contiguous prefix when that page overlaps it, while explicit resyncs and session
+handoffs still replace state. The unnumbered `turn/retrying` notification remains
+temporarily because the ACP/VS Code path and previously released clients may
+still depend on it. New reducers derive retry presentation from
+`PublicSessionState.retrying` and do not keep a second local retry value from that
+compatibility notification.
 
 ## Callbacks and client participation
 
@@ -305,7 +425,11 @@ instead of silently switching ownership or implementation.
 
 ## Server-owned resources
 
-State outside the main timeline uses typed resource families. Current families
+State outside the main timeline uses typed resource families. Live-session
+configuration mutations such as agent switching, settings updates, config
+writes, and config reloads are applied through the selected session backend;
+the app server remains responsible for their typed Host API and public result.
+Current resource families
 include runtime/config, agents, skills, tools, MCP, connectors, diagnostics,
 statistics, session logs, scheduled loops, workspace trust and prompt
 preparation, account, feedback, narration, review, telemetry, shell, and Vibe
@@ -340,6 +464,18 @@ result handling.
 Textual, ACP, and programmatic mode share the same app-server session and
 resource APIs:
 
+- Textual renders and edits the server-owned prompt queue. It does not keep a
+  second accepted queue or schedule queued work itself.
+- On Unified Harness sessions, Textual steers a queued block through
+  `session/turn/queue/steer`; it does not remove, reconstruct, or re-enqueue the
+  item. While that request is unresolved, later queue submissions wait and
+  edits or removals cannot overtake it.
+- Textual `!` commands and non-side-channel slash commands require an idle
+  session. They are rejected while other work or accepted prompts are pending.
+- Other delivery surfaces use the same enqueue, read, remove, and resume
+  methods when they add queueing; they do not implement another accepted
+  queue.
+
 - Textual renders public models and owns terminal-local facilities.
 - ACP translates ACP requests, callbacks, content, client tools, and updates to
   and from the app-server API.
@@ -353,15 +489,30 @@ session loader, tool execution path, or extension lifecycle.
 
 The in-process harness can replace a failed memory connection. The client
 initializes the new connection, resumes the attached session, replaces its
-projection from the returned snapshot, and receives still-open callbacks. Stdio
-EOF closes its server process; process restart uses normal persisted-session
-resume semantics and does not imply restoration of in-flight execution.
+projection from the returned snapshot, receives still-open callbacks, and sees
+the current retry state when the live turn is waiting to retry. Stdio EOF closes
+its server process; process restart uses normal persisted-session resume
+semantics and does not restore an in-flight turn or its retry state.
 
-A successful `session/close` is the delivery surface's durability and cleanup
-boundary. The server records eligible last-session state, flushes session-owned
-data, closes child runtimes, interrupts or rejects pending work, and releases
-owned runtime resources such as MCP clients, model backends, experiments,
-managed terminals, Vibe Code operations, and telemetry before shutdown finishes.
+Accepted queued turns belong to the live session backend. Reconnecting to the
+same live backend recovers them through the subscription snapshot or
+`session/read`. Stopping the session or restarting the app-server process
+discards them. Persisting queued turns across process restarts requires a
+separate storage decision and is not part of the initial queue implementation.
+
+If a connection drops during queued steering, Textual does not re-enqueue the
+message. It reconciles the replacement snapshot instead. A matching steering
+history entry means the operation succeeded; the unchanged queue item means it
+failed; and a turn carrying the queue item ID means normal queue promotion won
+the race.
+
+Transport detachment only removes that connection's subscriptions and callback
+claims. A successful `session/stop` is the delivery surface's durability and
+runtime-cleanup boundary. The server records eligible last-session state,
+flushes session-owned data, closes child runtimes, interrupts or rejects pending
+work, and releases owned runtime resources such as MCP clients, model backends,
+experiments, managed terminals, Vibe Code operations, and telemetry before
+shutdown finishes.
 
 Security rules:
 
@@ -408,6 +559,8 @@ Security rules:
   validated response lifecycles.
 - Return or notify canonical resource state after mutations rather than
   maintaining client/server shadow state.
+- Derive retry presentation from `PublicSessionState.retrying`; do not maintain
+  a client-local retry lifecycle.
 - Keep blocking serialization, file I/O, subprocess work, and discovery off the
   shared UI event loop.
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from enum import StrEnum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, cast
 
@@ -14,6 +15,9 @@ from vibe.observability.logging import logger
 from vibe.utils.io import read_safe_async
 
 if TYPE_CHECKING:
+    from textual.widgets import Markdown
+    from textual.widgets._markdown import MarkdownStream
+
     from vibe.cli.textual_ui.app import ChatScroll
 
 
@@ -25,9 +29,7 @@ from textual.css.query import NoMatches
 from textual.geometry import Size
 from textual.reactive import reactive
 from textual.widget import Widget
-from textual.widgets import Link, Markdown, Static
-from textual.widgets._markdown import MarkdownStream
-from watchfiles import awatch
+from textual.widgets import Link, Static
 
 from vibe.cli.textual_ui.shortcut_hints import shortcut, shortcut_hint
 from vibe.cli.textual_ui.widgets.collapsible import (
@@ -40,7 +42,7 @@ from vibe.cli.textual_ui.widgets.no_markup_static import (
     NonSelectableStatic,
 )
 from vibe.cli.textual_ui.widgets.spinner import SpinnerMixin, SpinnerType
-from vibe.cli.textual_ui.widgets.tool_widgets import _clean_output
+from vibe.cli.textual_ui.widgets.tool_widgets import clean_output
 
 
 class ExpandingBorder(NonSelectableStatic):
@@ -103,7 +105,7 @@ def _format_display_path(path: Path) -> str:
         return str(path)
     if str(relative) == ".":
         return "~"
-    return f"~/{relative}"
+    return str(Path("~") / relative)
 
 
 class UserMessageAttachment(Horizontal):
@@ -131,6 +133,12 @@ class UserMessageAttachment(Horizontal):
                 )
 
 
+class UserMessageSeverity(StrEnum):
+    INFO = auto()
+    WARNING = auto()
+    ERROR = auto()
+
+
 class UserMessage(Static):
     PROMPT_CHAR: ClassVar[str] = ">"
     SHOW_SEPARATOR: ClassVar[bool] = True
@@ -141,16 +149,29 @@ class UserMessage(Static):
         pending: bool = False,
         history_entry_id: str | None = None,
         images: list[ImageAttachment] | None = None,
+        severity: UserMessageSeverity | None = None,
     ) -> None:
         super().__init__()
         self.add_class("user-message")
         self._content = content
         self._pending = pending
         self._images = images or []
+        self.severity = severity
         self.history_entry_id = history_entry_id
+        if severity is not None:
+            self.add_class("user-message-severity")
+            self.add_class(f"user-message-{severity.value}")
 
     def get_content(self) -> str:
         return self._content
+
+    def update_content(self, content: str) -> None:
+        self._content = content
+        try:
+            content_widget = self.query_one(".user-message-content", NoMarkupStatic)
+            content_widget.update(content)
+        except Exception:
+            pass
 
     @property
     def pending(self) -> bool:
@@ -159,15 +180,16 @@ class UserMessage(Static):
     def compose(self) -> ComposeResult:
         with Vertical(classes="user-message-wrapper"):
             with Horizontal(classes="user-message-container"):
-                yield NonSelectableStatic(
-                    f"{self.PROMPT_CHAR} ", classes="user-message-prompt"
-                )
+                if self.severity is None:
+                    yield NonSelectableStatic(
+                        f"{self.PROMPT_CHAR} ", classes="user-message-prompt"
+                    )
                 yield NoMarkupStatic(self._content, classes="user-message-content")
             if self._images:
                 with Vertical(classes="user-message-attachments"):
                     for image in self._images:
                         yield UserMessageAttachment(image)
-            if self.SHOW_SEPARATOR:
+            if self.SHOW_SEPARATOR and self.severity is None:
                 yield ExpandingSeparator(classes="user-message-separator")
             if self._pending:
                 self.add_class("pending")
@@ -232,8 +254,13 @@ class SlashCommandMessage(UserMessage):
     PROMPT_CHAR = "/"
     SHOW_SEPARATOR = False
 
-    def __init__(self, content: str) -> None:
-        super().__init__(content)
+    def __init__(self, content: str, pending: bool = False) -> None:
+        # content is the raw user input (e.g. "/clear"); the widget already
+        # renders PROMPT_CHAR, so drop a leading slash to avoid "//clear".
+        # Payload-path callers pass content without a slash (e.g. "model x").
+        super().__init__(
+            content[1:] if content.startswith("/") else content, pending=pending
+        )
         self.add_class("slash-command-message")
 
 
@@ -259,6 +286,8 @@ class StreamingMessageBase(Static):
 
     def _ensure_stream(self) -> MarkdownStream:
         if self._stream is None:
+            from textual.widgets import Markdown
+
             self._stream = Markdown.get_stream(self._get_markdown())
         return self._stream
 
@@ -324,6 +353,8 @@ class AssistantMessage(StreamingMessageBase):
         self.add_class("assistant-message")
 
     def compose(self) -> ComposeResult:
+        from textual.widgets import Markdown
+
         markdown = Markdown("")
         self._markdown = markdown
         yield markdown
@@ -359,6 +390,8 @@ class ReasoningMessage(ClickWithoutDragMixin, SpinnerMixin, StreamingMessageBase
                     classes="reasoning-collapsed-text",
                 )
                 yield self._status_text_widget
+            from textual.widgets import Markdown
+
             markdown = Markdown("", classes="reasoning-message-content")
             markdown.display = not self.collapsed
             self._markdown = markdown
@@ -417,6 +450,8 @@ class UserCommandMessage(Static):
         self._content = content
 
     def compose(self) -> ComposeResult:
+        from textual.widgets import Markdown
+
         with Horizontal(classes="user-command-container"):
             yield ExpandingBorder(classes="user-command-border")
             with Vertical(classes="user-command-content"):
@@ -439,6 +474,8 @@ class WhatsNewMessage(Static):
         self._content = content
 
     def compose(self) -> ComposeResult:
+        from textual.widgets import Markdown
+
         yield Markdown(self._content)
 
 
@@ -459,6 +496,25 @@ class VscodeExtensionPromoMessage(Static):
         self._content = content
 
     def compose(self) -> ComposeResult:
+        from textual.widgets import Markdown
+
+        yield Markdown(self._content)
+
+
+class CustomToolsDeprecationMessage(Static):
+    def __init__(self, tool_names: list[str]) -> None:
+        super().__init__()
+        self.add_class("custom-tools-deprecation-message")
+        names = ", ".join(f"`{name}`" for name in sorted(tool_names))
+        replacement = "a skill" if len(tool_names) == 1 else "skills"
+        self._content = (
+            "**Support for custom tools will be deprecated soon.** "
+            f"Ask Vibe to help replace yours ({names}) with {replacement}."
+        )
+
+    def compose(self) -> ComposeResult:
+        from textual.widgets import Markdown
+
         yield Markdown(self._content)
 
 
@@ -497,7 +553,6 @@ class BashOutputMessage(ClickWithoutDragMixin, SpinnerMixin, Static):
         self._output = output.rstrip("\n")
         self._exit_code = exit_code
         self._pending = pending
-        self._queued = False
         self._output_widget: NoMarkupStatic | None = None
         self._overflow_widget: NoMarkupStatic | None = None
         self._section: OverflowCollapsibleSection | None = None
@@ -505,12 +560,10 @@ class BashOutputMessage(ClickWithoutDragMixin, SpinnerMixin, Static):
         self._prompt_widget: NonSelectableStatic | None = None
         self._indicator_widget: Static | None = None
 
-    QUEUED_PROMPT = "! "
-
     def _clean_lines(self) -> list[str]:
         # Sanitize captured output (ANSI escapes, \r redraws, control bytes)
         # before splitting so it renders terminal-safe and line counts match.
-        return _clean_output(self._output).splitlines()
+        return clean_output(self._output).splitlines()
 
     def _preview_text(self) -> str:
         return "\n".join(self._clean_lines()[: self.PREVIEW_LINES])
@@ -532,31 +585,18 @@ class BashOutputMessage(ClickWithoutDragMixin, SpinnerMixin, Static):
             self._section.set_collapsed_label(lines_label(count, prefix="+"))
 
     def _update_spinner_frame(self) -> None:
-        if not self._is_spinning or not self._prompt_widget or self._queued:
+        if not self._is_spinning or not self._prompt_widget:
             return
         # Frames are all the same size, so skip the relayout.
         self._prompt_widget.update(f"{self._spinner.next_frame()} ", layout=False)
 
     def on_mount(self) -> None:
-        if self._pending and not self._queued:
+        if self._pending:
             self.start_spinner_timer()
 
-    def set_queued(self, queued: bool) -> None:
-        if queued == self._queued:
-            return
-        self._queued = queued
-        if queued:
-            self.add_class("queued")
-            self.stop_spinning()
-            if self._prompt_widget is not None:
-                self._prompt_widget.update(self.QUEUED_PROMPT)
-            return
-        self.remove_class("queued")
-        if self._pending:
-            if self._prompt_widget is not None:
-                self._prompt_widget.update(f"{self._spinner.current_frame()} ")
-            self._is_spinning = True
-            self.start_spinner_timer()
+    @property
+    def pending(self) -> bool:
+        return self._pending
 
     def compose(self) -> ComposeResult:
         if self._pending:
@@ -566,7 +606,10 @@ class BashOutputMessage(ClickWithoutDragMixin, SpinnerMixin, Static):
         else:
             status_class = "bash-success"
         self.add_class(status_class)
-        prompt_text = f"{self._spinner.current_frame()} " if self._pending else "$ "
+        if self._pending:
+            prompt_text = f"{self._spinner.current_frame()} "
+        else:
+            prompt_text = "$ "
         with Horizontal(classes="bash-command-line"):
             self._prompt_widget = NonSelectableStatic(
                 prompt_text, classes=f"bash-prompt {status_class}"
@@ -667,7 +710,7 @@ class ErrorMessage(Static):
             error = (
                 self._error
                 if isinstance(self._error, Content)
-                else Content(self._error)
+                else Content(clean_output(self._error))
             )
             text = Content("Error: ") + error if self._show_border else error
             self._content_widget = NoMarkupStatic(text, classes="error-content")
@@ -743,10 +786,14 @@ class PlanFileMessage(Widget):
         self._watch_task: asyncio.Task | None = None
 
     def compose(self) -> ComposeResult:
+        from textual.widgets import Markdown
+
         with Vertical(classes="plan-file-wrapper"):
             yield Markdown(self.content, classes="plan-file-content")
 
     def watch_content(self, new_content: str) -> None:
+        from textual.widgets import Markdown
+
         try:
             self.query_one(Markdown).update(new_content)
         except NoMatches:
@@ -757,6 +804,8 @@ class PlanFileMessage(Widget):
         self._watch_task = asyncio.create_task(self._watch_file())
 
     async def _watch_file(self) -> None:
+        from watchfiles import awatch
+
         try:
             async for _ in awatch(self._file_path):
                 self.content = (await read_safe_async(self._file_path)).text

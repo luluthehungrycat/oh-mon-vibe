@@ -175,9 +175,12 @@ async def test_experimental_bash_keeps_compatibility_stderr_empty():
         tool.run(ExperimentalBashArgs(command="printf err >&2"))
     )
 
-    assert result.stdout == "err"
-    assert result.output == "err"
-    assert result.stderr == ""
+    assert ExperimentalBash.project_result(result) == {
+        "stdout": "err",
+        "stderr": "",
+        "output": "err",
+        "truncated": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -807,7 +810,7 @@ def test_bash_log_file_display_describes_actions_and_truncation():
 
 @pytest.mark.skipif(is_windows(), reason="managed bash is POSIX-only")
 @pytest.mark.asyncio
-async def test_foreground_killed_session_is_reported_as_failure():
+async def test_killed_background_session_fails_when_success_is_required():
     terminal_runtime = TerminalRuntime()
     tool = ExperimentalBash(
         config_getter=lambda: ExperimentalBashToolConfig(),
@@ -817,17 +820,20 @@ async def test_foreground_killed_session_is_reported_as_failure():
     started = await collect_result(
         tool.run(ExperimentalBashArgs(command="sleep 30", background=True))
     )
+    assert started.status == "running"
     sessions = BashSessions(
         config_getter=lambda: BashSessionsConfig(),
         state=BaseToolState(),
         terminal_runtime=terminal_runtime,
     )
-    await collect_result(
+    killed = await collect_result(
         sessions.run(BashSessionsArgs(action="kill", session_id=started.session_id))
     )
+    assert killed.session is not None
+    assert killed.session.status == "killed"
 
     with pytest.raises(ToolError):
-        tool._result_from_session(
+        await tool._result_from_session(
             started.session_id, background=False, max_bytes=1000, enforce_success=True
         )
 
@@ -1193,6 +1199,60 @@ def test_advisory_allow_cannot_bypass_outside_directory(monkeypatch, tmp_path):
     )
 
 
+def test_enabled_internal_analyzer_is_invoked_and_can_require_approval(monkeypatch):
+    monkeypatch.setattr(bash_module, "uses_posix_shell", lambda: True)
+    seen: list[str] = []
+    config = BashToolConfig(
+        safety=BashSafetyConfig(policy="hybrid", enabled_plugins=["approval"])
+    )
+
+    def analyze(command: str) -> CommandDecision:
+        seen.append(command)
+        return CommandDecision(Decision.ASK, "needs approval", "approval")
+
+    monkeypatch.setattr(
+        bash_module,
+        "discover_plugins",
+        lambda enabled: type("Registry", (), {"analyzers": {"approval": analyze}})(),
+    )
+    tool = Bash(config_getter=lambda: config, state=BaseToolState())
+
+    permission = tool.resolve_permission(BashArgs(command="echo hello"))
+
+    assert seen == ["echo hello"]
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.ASK
+    assert any(
+        "advisory analyzer" in item.label for item in permission.required_permissions
+    )
+
+
+def test_core_deny_prevents_internal_analyzer_invocation(monkeypatch):
+    monkeypatch.setattr(bash_module, "uses_posix_shell", lambda: True)
+    invoked: list[str] = []
+    config = BashToolConfig(
+        denylist=["passwd"],
+        safety=BashSafetyConfig(policy="hybrid", enabled_plugins=["allow"]),
+    )
+
+    def analyze(command: str) -> CommandDecision:
+        invoked.append(command)
+        return CommandDecision(Decision.ALLOW, "safe", "allow")
+
+    monkeypatch.setattr(
+        bash_module,
+        "discover_plugins",
+        lambda enabled: type("Registry", (), {"analyzers": {"allow": analyze}})(),
+    )
+    tool = Bash(config_getter=lambda: config, state=BaseToolState())
+
+    permission = tool.resolve_permission(BashArgs(command="passwd root"))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.NEVER
+    assert invoked == []
+
+
 @pytest.mark.skipif(is_windows(), reason="managed bash is POSIX-only")
 @pytest.mark.asyncio
 async def test_managed_terminal_is_rejected_when_sandbox_policy_enabled(bash):
@@ -1543,7 +1603,7 @@ def test_new_read_only_commands_are_allowlisted():
         "grep pattern file.txt",
         "cut -d',' -f1 file.csv",
         "sort file.txt",
-        "tr 'a' 'b' < file.txt",
+        "tr 'a' 'b'",
         "uniq file.txt",
         "basename file.txt",
         "comm file1.txt file2.txt",
@@ -1578,6 +1638,16 @@ def test_new_read_only_commands_are_allowlisted():
         assert permission.permission is ToolPermission.ALWAYS, (
             f"Command '{cmd}' should be always allowed"
         )
+
+
+def test_read_only_command_with_input_redirection_requires_approval():
+    config = BashToolConfig()
+    bash_tool = Bash(config_getter=lambda: config, state=BaseToolState())
+
+    permission = bash_tool.resolve_permission(BashArgs(command="tr 'a' 'b' < file.txt"))
+
+    assert permission is not None
+    assert permission.permission is ToolPermission.ASK
 
 
 def _force_windows_bash(monkeypatch: pytest.MonkeyPatch) -> None:

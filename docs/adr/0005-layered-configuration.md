@@ -13,6 +13,11 @@ Textual, ACP, and programmatic clients use typed app-server resources. They do
 not read or edit `config.toml`, receive the orchestrator, or mutate a live config
 object.
 
+The selected `SessionBackend` is the application boundary for changes to that
+live runtime. Agent switches, session-limit updates, config writes, and reloads
+use distinct typed backend methods after Host-side validation and persistence;
+resource handlers do not reach into an implementation-specific runtime object.
+
 ## Current layer stack
 
 The effective order is:
@@ -23,9 +28,19 @@ The effective order is:
    enabled, followed by the project TOML layer (a discovered trusted
    `.vibe/config.toml`) when the `"project"` source is enabled;
 4. `VIBE_*` environment values;
-5. session/runtime overrides; and
-6. the active agent profile overlay, currently applied by `AgentManager` after
-   the orchestrator result.
+5. session/runtime overrides;
+6. the active agent profile layer (`AgentProfileLayer`); and
+7. the enforced admin layer (`AdminConfigLayer`), which shadows every layer
+   below it.
+
+`AgentProfileLayer` ships as a statically installed empty slot positioned just
+below the admin layer. `AgentManager` owns its contents: it fills the slot for
+the initial agent and, on a profile switch, replaces the layer in place with
+the new overrides, then rebuilds the orchestrator synchronously (`rebuild`, a
+`run_sync` bridge over `build`). Because the slot is replaced in place its
+priority is fixed by the stack definition, so the admin layer always outranks
+a profile. The effective config is the single merged result; there is no
+separate profile-free "base" config.
 
 The user and project TOML layers are installed together so a trusted project
 config inherits unspecified values from the user config; per-field merge
@@ -36,19 +51,56 @@ layer still contributes.
 
 The default write target is selected from the installed layers:
 
-- a discovered and trusted project layer is the default write target;
+- `~/.vibe/config.toml` is the default write target whenever the user source is
+  enabled, including when a trusted project config is discovered: project
+  discovery walks up parent directories, so in a monorepo the closest project
+  file is rarely the scope the writer meant;
 - project-only composition uses the project layer, creating
   `.vibe/config.toml` on first write when absent;
-- otherwise `~/.vibe/config.toml` is selected when the user source is enabled;
 - composition without a persistent source uses the runtime override layer.
+
+`active_model` uses the same write-target resolution as every other field.
+When a session already has a pinned model, the app server additionally mirrors
+an implicit `active_model` write into the runtime override layer; this does not
+change the target of the original write. An explicit persistent target,
+including one selected through `/config`, changes only that layer. A write
+explicitly targeting the session override changes that override directly.
+Session metadata is synchronized from the effective model only when the next
+user turn starts or is enqueued.
+
+The thinking level travels with the model pick and is session-scoped the same
+way, except that it lives under a model entry rather than beside it: the
+app server mirrors the session's level into the runtime override layer as a
+field of the active model, so a level picked in one session is not the level
+another session reopens on. Session metadata records it at the same turn
+boundary as the model, and records the effective level, so a model change moves
+the recorded level to the model now active.
+
+A model declared by a layer above the override — an agent profile, an admin
+policy — is exempt: that layer both outranks the override and may be replaced
+while the session runs, which would leave the override as the model's only and
+incomplete definition. The level of such a model stays the layer's to set, and
+the session neither scopes nor records it.
+
+An `active_model` alias absent from the merged model catalog is normalized to
+the empty, unpinned sentinel. Normal default resolution then applies, including
+the routed default and `allowed_models`; the invalid source value is left
+untouched and reported as a validation warning.
+
+Clients that let a user pick a scope (the `/config` screen) offer the default
+target, the trusted project layer, and the session override layer, in that
+order; each write op names its target layer explicitly.
 
 An untrusted project layer loads empty and is skipped by the merge builder.
 When the user source is enabled, implicit writes fall back to the user layer.
 A user or project TOML value overrides the corresponding GrowthBook assignment.
 
-The default layer is active; discovered and agent-profile layer classes exist
-but are not yet part of the default orchestrator stack. Code must follow the
-live stack rather than assume those layers are active.
+The default, GrowthBook, user, project, environment, override, agent-profile,
+and admin layers are all part of the default orchestrator stack. The
+agent-profile layer is statically installed but ships empty; `AgentManager`
+fills it in place when a profile is selected and rebuilds the orchestrator.
+Code must follow the live stack rather than assume a fixed layer set, since
+optional TOML layers may be absent.
 
 A/B test assignments that affect runtime behavior are configuration inputs.
 They must be mapped into config fields by `GrowthbookLayer`, then consumed from
@@ -71,21 +123,21 @@ values. Clients must not infer writable paths from its shape.
 
 The current resource methods are defined by `vibe.app_server.protocol`:
 
-- `config/read` returns effective and base redacted views;
+- `config/read` returns the effective redacted view (a single merged config;
+  no separate base view);
 - `config/reload` re-reads configured sources and optionally rebuilds runtime
   state;
-- `config/patch` validates and persists JSON-pointer edits, applying `set` and
+- `config/write` validates and persists JSON-pointer edits, applying `set` and
   `remove` ops that each optionally target a named layer;
-- `config/thinking/write` updates the active model's thinking level;
 - `config/proxy/read` and `config/proxy/write` manage the supported global
   proxy and certificate `.env` entries; and
 - `config/schema` exposes the live schema used by ACP settings clients.
 
 The proxy resource is deliberately separate from the TOML orchestrator.
 `config/schema` is configuration-form metadata; it is not a list of valid
-`config/patch` paths and is not the public app-server protocol schema.
+`config/write` paths and is not the public app-server protocol schema.
 
-For `config/patch`, the server:
+For `config/write`, the server:
 
 1. requires the session to be idle;
 2. converts all ops into one schema-aware patch;

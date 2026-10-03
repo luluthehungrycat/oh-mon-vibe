@@ -22,7 +22,9 @@ def ansi_tolerant_pattern(text: str) -> re.Pattern[str]:
     return re.compile(ansi.join(re.escape(char) for char in text))
 
 
-def write_e2e_config(vibe_home: Path, api_base: str) -> None:
+def write_e2e_config(
+    vibe_home: Path, api_base: str, *, provider_name: str = "mock-provider"
+) -> None:
     vibe_home.mkdir(parents=True, exist_ok=True)
     (vibe_home / "config.toml").write_text(
         "\n".join([
@@ -31,14 +33,14 @@ def write_e2e_config(vibe_home: Path, api_base: str) -> None:
             "disable_welcome_banner_animation = true",
             "",
             "[[providers]]",
-            'name = "mock-provider"',
+            f'name = "{provider_name}"',
             f'api_base = "{api_base}"',
             'api_key_env_var = "MISTRAL_API_KEY"',
             'backend = "generic"',
             "",
             "[[models]]",
             'name = "mock-model"',
-            'provider = "mock-provider"',
+            f'provider = "{provider_name}"',
             'alias = "mock-model"',
         ]),
         encoding="utf-8",
@@ -58,13 +60,31 @@ def poll_until(predicate: Callable[[], bool], timeout: float, message: str) -> N
     raise AssertionError(message)
 
 
-def wait_for_request_count(
-    request_count_getter: Callable[[], int], expected_count: int, timeout: float
+# Waiting on the backend must always drain the child, never just sleep on the
+# predicate. Textual's writer thread has a 30-slot queue and blocks on a full one, so
+# a pty nobody reads eventually stalls the app's event loop: it stops handling input,
+# never dispatches the turn, and the request the caller is waiting for never arrives.
+# The startup burst alone is ~26KB against a 64KB Linux pty buffer.
+def wait_for_request_count_while_draining_child_output(
+    child: pexpect.spawn,
+    captured: io.StringIO,
+    request_count_getter: Callable[[], int],
+    *,
+    expected_count: int,
+    timeout: float,
 ) -> None:
-    poll_until(
-        lambda: request_count_getter() >= expected_count,
-        timeout,
-        f"Timed out waiting for {expected_count} backend request(s).",
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        if request_count_getter() >= expected_count:
+            return
+        try:
+            child.expect(r"\S", timeout=0.05)
+        except pexpect.TIMEOUT:
+            pass
+    rendered_tail = strip_ansi(captured.getvalue())[-1200:]
+    raise AssertionError(
+        f"Timed out waiting for {expected_count} backend request(s).\n\n"
+        f"Rendered tail:\n{rendered_tail}"
     )
 
 

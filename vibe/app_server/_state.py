@@ -1,23 +1,24 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
 
 from vibe.app_server._projection import (
     project_agents,
     project_message_history,
     project_workdir,
 )
-from vibe.app_server._utils import now_ms
+from vibe.app_server._utils import now_ms, optional_time_ms, time_ms
 from vibe.app_server.models import (
     BlockedSessionStatus,
     IdleSessionStatus,
     PublicCallbackEntry,
     PublicHistoryEntry,
     PublicHistoryPage,
+    PublicRetryState,
     PublicSession,
     PublicSessionState,
     PublicTurn,
+    PublicTurnStatus,
     RunningSessionStatus,
     TokenUsage,
 )
@@ -31,14 +32,22 @@ def build_public_state(
     history: list[PublicHistoryEntry],
     current_history: list[PublicHistoryEntry],
     callbacks: list[PublicCallbackEntry],
-    active_turn: PublicTurn | None,
-    last_turn: PublicTurn | None,
+    turns: list[PublicTurn],
+    retrying: PublicRetryState | None,
     history_limit: int,
+    turns_limit: int | None = None,
+    include_history: bool = True,
+    include_turns: bool = True,
 ) -> PublicSessionState:
     all_history = [*history, *current_history]
     open_callbacks = [
         callback for callback in callbacks if callback.state.status == "open"
     ]
+    active_turn = (
+        turns[-1]
+        if turns and turns[-1].status is PublicTurnStatus.IN_PROGRESS
+        else None
+    )
     if active_turn is None:
         status = IdleSessionStatus()
     elif open_callbacks:
@@ -51,7 +60,8 @@ def build_public_state(
     else:
         status = RunningSessionStatus(active_turn_id=active_turn.id)
     metadata = agent_loop.session_logger.session_metadata
-    created_at = _parse_time_ms(metadata.start_time) if metadata else now_ms()
+    created_at = time_ms(metadata.start_time) if metadata else now_ms()
+    bumped_at = optional_time_ms(metadata.bumped_at) if metadata else None
     try:
         model = agent_loop.config.get_active_model().alias
     except ValueError:
@@ -67,6 +77,7 @@ def build_public_state(
         status=status,
         created_at=created_at,
         updated_at=now_ms(),
+        bumped_at=bumped_at,
         cwd=workdir,
         workspace_roots=[
             str(root) for root in agent_loop.harness_files.workspace_roots
@@ -78,9 +89,15 @@ def build_public_state(
     return PublicSessionState(
         event_id=0,
         session=session,
-        history=history_page(all_history, limit=history_limit),
+        history=all_history[-history_limit:] if include_history else None,
+        history_before_cursor=(
+            all_history[-history_limit].id
+            if include_history and len(all_history) > history_limit
+            else None
+        ),
+        turns=(turns[-(turns_limit or history_limit) :] if include_turns else None),
         active_callbacks=open_callbacks,
-        latest_turn=active_turn or last_turn,
+        retrying=retrying,
     )
 
 
@@ -90,6 +107,9 @@ def build_stored_public_state(
     metadata: SessionMetadata,
     *,
     history_limit: int,
+    turns_limit: int | None = None,
+    include_history: bool = True,
+    include_turns: bool = True,
 ) -> PublicSessionState:
     history = project_message_history(session_id, messages, metadata)
     cwd = metadata.environment.get("working_directory")
@@ -102,18 +122,46 @@ def build_stored_public_state(
             title=metadata.title,
             preview=message_preview(messages),
             status=IdleSessionStatus(),
-            created_at=_parse_time_ms(metadata.start_time),
+            created_at=time_ms(metadata.start_time),
             updated_at=(
-                _parse_time_ms(metadata.end_time)
+                time_ms(metadata.end_time)
                 if metadata.end_time is not None
                 else now_ms()
             ),
+            bumped_at=optional_time_ms(metadata.bumped_at),
             cwd=cwd,
         ),
-        history=history_page(history, limit=history_limit),
+        history=history[-history_limit:] if include_history else None,
+        history_before_cursor=(
+            history[-history_limit].id
+            if include_history and len(history) > history_limit
+            else None
+        ),
+        turns=(
+            _turns_from_history(history, session_id)[-(turns_limit or history_limit) :]
+            if include_turns
+            else None
+        ),
         active_callbacks=[],
-        latest_turn=None,
     )
+
+
+def _turns_from_history(
+    history: Sequence[PublicHistoryEntry], session_id: str
+) -> list[PublicTurn]:
+    turns: dict[str, PublicTurn] = {}
+    for entry in history:
+        if entry.turn_id is None:
+            continue
+        previous = turns.get(entry.turn_id)
+        turns[entry.turn_id] = PublicTurn(
+            id=entry.turn_id,
+            session_id=session_id,
+            status=PublicTurnStatus.COMPLETED,
+            started_at=entry.created_at if previous is None else previous.started_at,
+            completed_at=entry.updated_at,
+        )
+    return list(turns.values())
 
 
 def history_page(
@@ -172,14 +220,9 @@ def message_preview(messages: Sequence[LLMMessage]) -> str:
         (
             message.content[:160]
             for message in messages
-            if message.role is Role.user and message.content
+            # Skips injected context: a manual shell summary is a user-role
+            # message the user never typed.
+            if message.role is Role.user and message.content and not message.injected
         ),
         "",
     )
-
-
-def _parse_time_ms(value: str) -> int:
-    try:
-        return int(datetime.fromisoformat(value).timestamp() * 1000)
-    except ValueError:
-        return now_ms()

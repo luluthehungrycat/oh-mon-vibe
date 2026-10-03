@@ -1,6 +1,6 @@
 [project]
 name = "oh-my-vibe"
-version = "2.24.0"
+version = "2.25.7"
 description = "Oh My Vibe, a downstream CLI coding assistant"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -99,6 +99,7 @@ dependencies = [
     "pyyaml==6.0.3",
     "referencing==0.37.0",
     "requests==2.34.2",
+    "rfc8785==0.1.4",
     "rich==15.0.0",
     "rpds-py==0.30.0",
     "secretstorage==3.5.0 ; sys_platform == 'linux'",
@@ -133,17 +134,25 @@ Issues = "https://github.com/luluthehungrycat/oh-my-vibe/issues"
 Documentation = "https://github.com/luluthehungrycat/oh-my-vibe#readme"
 
 [build-system]
-requires = ["hatchling==1.31.0", "hatch-vcs==0.5.0", "editables==0.6"]
-build-backend = "hatchling.build"
+requires = ["maturin==1.14.1"]
+build-backend = "maturin_backend"
+backend-path = ["build_backend"]
 
-[tool.hatch.metadata]
-allow-direct-references = true
-
-[tool.hatch.build.targets.wheel]
-include = ["vibe/"]
+[tool.maturin]
+manifest-path = ".native-build/harness-core/Cargo.toml"
+module-name = "mistralai_vibe_local_harness._native"
+python-source = "."
+python-packages = ["vibe", "mistralai_vibe_local_harness"]
+include = [
+    { path = "vibe/_bin/*", format = "wheel" },
+    { path = "mistralai_vibe_local_harness/*", format = "wheel" },
+    { path = "mistralai_vibe_local_harness/**/*", format = "wheel" },
+]
+exclude = ["**/__pycache__/**", "**/*.pyc", "vibe/cli-rust/**"]
+features = ["extension-module"]
 
 [project.scripts]
-omv = "vibe.cli.entrypoint:main"
+omv = "vibe.cli.launcher:main"
 omv-acp = "vibe.acp.entrypoint:main"
 omv-app-server = "vibe.app_server.stdio:main"
 
@@ -162,6 +171,7 @@ url = "https://pypi.org/simple"
 dev = [
     "cryptography>=48.0.0",
     "debugpy>=1.8.21",
+    "miniaudio>=1.71",
     "pre-commit>=4.2.0",
     "pyinstrument>=5.1.2",
     "pyright>=1.1.403",
@@ -172,6 +182,7 @@ dev = [
     "pytest-xdist>=3.8.0",
     "respx>=0.22.0",
     "ruff>=0.15.18",
+    "setproctitle>=1.3.7",
     "tomlkit>=0.13.0",
     "twine>=5.0.0",
     "typos>=1.34.0",
@@ -200,7 +211,7 @@ venvPath = "."
 venv = ".venv"
 
 [tool.ruff]
-include = ["vibe/**/*.py", "tests/**/*.py"]
+include = ["build_backend/**/*.py", "vibe/**/*.py", "tests/**/*.py"]
 exclude = ["pyinstaller/"]
 line-length = 88
 target-version = "py312"

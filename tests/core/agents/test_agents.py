@@ -60,7 +60,7 @@ class TestAgentManager:
         names = [a.name for a in subagents]
 
         # These are AGENT type
-        assert "default" not in names
+        assert "ask" not in names
         assert "plan" not in names
         assert "auto-approve" not in names
 
@@ -76,12 +76,88 @@ class TestAgentManager:
         with pytest.raises(ValueError, match="not found"):
             manager.get_agent("nonexistent-agent")
 
-    def test_get_default_agent(self, manager: AgentManager) -> None:
-        """Test getting the default agent."""
-        agent = manager.get_agent("default")
+    def test_get_ask_agent(self, manager: AgentManager) -> None:
+        agent = manager.get_agent("ask")
 
-        assert agent.name == "default"
+        assert agent.name == "ask"
         assert agent.agent_type == AgentType.AGENT
+
+    def test_smart_approve_hidden_from_the_picker_by_default(
+        self,
+        build_config: ConfigBuilder,
+        load_orchestrator: OrchestratorLoader[VibeConfigSchema],
+    ) -> None:
+        """Smart approve ships dark: without the flag it is not in the picker/cycle."""
+        manager = AgentManager(load_orchestrator(build_config()))
+
+        assert "smart-approve" not in manager.available_agents
+        assert "smart-approve" not in manager.get_agent_order()
+
+    def test_smart_approve_available_flag_exposes_it_in_the_picker(
+        self,
+        build_config: ConfigBuilder,
+        load_orchestrator: OrchestratorLoader[VibeConfigSchema],
+    ) -> None:
+        """The availability flag adds smart approve to the picker/cycle."""
+        config = build_config(smart_approve_available=True)
+        manager = AgentManager(load_orchestrator(config))
+
+        assert "smart-approve" in manager.available_agents
+        assert "smart-approve" in manager.get_agent_order()
+
+    def test_smart_approve_default_flag_offers_and_defaults(
+        self,
+        build_config: ConfigBuilder,
+        load_orchestrator: OrchestratorLoader[VibeConfigSchema],
+    ) -> None:
+        """The default flag both exposes smart approve and makes it the resolved default."""
+        config = build_config(smart_approve_default=True)
+        manager = AgentManager(
+            load_orchestrator(config), initial_agent=config.resolve_default_agent()
+        )
+
+        assert "smart-approve" in manager.available_agents
+        assert manager.active_profile.name == "smart-approve"
+
+    def test_explicit_smart_approve_selection_bypasses_the_gate(
+        self,
+        build_config: ConfigBuilder,
+        load_orchestrator: OrchestratorLoader[VibeConfigSchema],
+    ) -> None:
+        """Explicitly selecting smart approve works even when the picker gate is off."""
+        manager = AgentManager(
+            load_orchestrator(build_config()), initial_agent="smart-approve"
+        )
+
+        assert manager.active_profile.name == "smart-approve"
+
+    def test_explicit_smart_approve_stays_in_the_cycle(
+        self,
+        build_config: ConfigBuilder,
+        load_orchestrator: OrchestratorLoader[VibeConfigSchema],
+    ) -> None:
+        """A --smart-approve start keeps the mode in the cycle after switching away.
+
+        Regression: the mode was active at startup but dropped out of the picker
+        once the user cycled off it, because it was hidden by the rollout gate.
+        """
+        manager = AgentManager(
+            load_orchestrator(build_config()), initial_agent="smart-approve"
+        )
+
+        assert "smart-approve" in manager.available_agents
+        assert "smart-approve" in manager.get_agent_order()
+
+        # Cycle a full loop; smart-approve must be reachable again, not skipped.
+        order = manager.get_agent_order()
+        current = manager.active_profile
+        seen = [current.name]
+        for _ in range(len(order)):
+            current = manager.next_agent(current)
+            seen.append(current.name)
+
+        assert seen.count("smart-approve") >= 2
+        assert current.name == "smart-approve"
 
     def test_initial_agent_rejects_subagent(
         self,
@@ -132,7 +208,7 @@ class TestAgentManager:
         build_config: ConfigBuilder,
         load_orchestrator: OrchestratorLoader[VibeConfigSchema],
     ) -> None:
-        config = build_config(enabled_agents=["default"])
+        config = build_config(enabled_agents=["ask"])
         with pytest.raises(ValueError, match="enabled_agents") as exc_info:
             AgentManager(load_orchestrator(config), initial_agent="plan")
         message = str(exc_info.value)
@@ -157,7 +233,7 @@ class TestAgentManager:
         with pytest.raises(ValueError, match="enabled_agents") as exc_info:
             AgentManager(load_orchestrator(config))
         message = str(exc_info.value)
-        assert "default" in message
+        assert "accept-edits" in message
         assert "default_agent" in message
 
     def test_default_agent_excluded_by_disabled_agents_raises_config_contradiction(
@@ -165,7 +241,7 @@ class TestAgentManager:
         build_config: ConfigBuilder,
         load_orchestrator: OrchestratorLoader[VibeConfigSchema],
     ) -> None:
-        config = build_config(disabled_agents=["default"])
+        config = build_config(disabled_agents=["accept-edits"])
         with pytest.raises(ValueError, match="disabled_agents") as exc_info:
             AgentManager(load_orchestrator(config))
         assert "default_agent" in str(exc_info.value)

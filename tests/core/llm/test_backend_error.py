@@ -4,6 +4,7 @@ import pytest
 
 from tests.constants import CHAT_COMPLETIONS_PATH
 from vibe.core.llm.exceptions import BackendError, PayloadSummary
+from vibe.utils.api_keys import ApiKeyOrigin, ApiKeySource
 
 
 def _make_payload_summary() -> PayloadSummary:
@@ -22,6 +23,7 @@ def _make_error(
     status: int | None,
     headers: dict[str, str] | None = None,
     body_text: str = "body",
+    api_key_origin: ApiKeyOrigin | None = None,
 ) -> BackendError:
     return BackendError(
         provider="test-provider",
@@ -33,6 +35,7 @@ def _make_error(
         parsed_error=None,
         model="test-model",
         payload_summary=_make_payload_summary(),
+        api_key_origin=api_key_origin,
     )
 
 
@@ -56,9 +59,25 @@ class TestBackendErrorFmt:
         msg = str(err)
         assert "status: N/A" in msg
 
-    def test_unauthorized_short_circuits(self) -> None:
-        err = _make_error(status=401)
-        assert str(err) == "Invalid API key. Please check your API key and try again."
+    @pytest.mark.parametrize(
+        ("origin", "expected"),
+        [
+            (None, "Invalid API key."),
+            (
+                ApiKeyOrigin(ApiKeySource.ENVIRONMENT, "MISTRAL_API_KEY"),
+                "Invalid API key (from env var MISTRAL_API_KEY).",
+            ),
+            (
+                ApiKeyOrigin(ApiKeySource.KEYRING, "MISTRAL_API_KEY"),
+                "Invalid API key (from the keyring).",
+            ),
+        ],
+    )
+    def test_unauthorized_names_where_the_key_came_from(
+        self, origin: ApiKeyOrigin | None, expected: str
+    ) -> None:
+        err = _make_error(status=401, api_key_origin=origin)
+        assert str(err) == f"{expected} Please check your API key and try again."
 
     def test_rate_limit_short_circuits(self) -> None:
         err = _make_error(status=429)
@@ -122,3 +141,46 @@ class TestBackendErrorIsResponseTooLong:
     def test_false_when_substring_missing(self) -> None:
         err = _make_error(status=422, body_text="some unrelated error")
         assert not err.is_response_too_long
+
+
+class TestBackendErrorIsInvalidModel:
+    def test_true_on_400_with_invalid_model_body(self) -> None:
+        err = _make_error(
+            status=400,
+            body_text='{"error":{"type":"invalid_model","message":"Invalid model: mistral-large-turbo"}}',
+        )
+        assert err.is_invalid_model
+
+    def test_false_when_status_not_400(self) -> None:
+        err = _make_error(status=422, body_text='{"error":{"type":"invalid_model"}}')
+        assert not err.is_invalid_model
+
+    def test_false_when_substring_missing(self) -> None:
+        err = _make_error(status=400, body_text="some unrelated error")
+        assert not err.is_invalid_model
+
+    def test_fmt_mentions_model_provider_and_recovery_paths(self) -> None:
+        err = _make_error(
+            status=400,
+            body_text='{"error":{"type":"invalid_model","message":"Invalid model: mistral-large-turbo"}}',
+        )
+        msg = str(err)
+        assert "test-model" in msg
+        assert "test-provider" in msg
+        assert "/model" in msg
+        assert "/config" in msg
+
+    def test_fmt_includes_parsed_error_when_available(self) -> None:
+        err = BackendError(
+            provider="test-provider",
+            endpoint="/v1/chat/completions",
+            status=400,
+            reason="Bad Request",
+            headers={},
+            body_text='{"error":{"type":"invalid_model"}}',
+            parsed_error="Invalid model: mistral-large-turbo",
+            model="test-model",
+            payload_summary=_make_payload_summary(),
+        )
+        msg = str(err)
+        assert "Invalid model: mistral-large-turbo" in msg

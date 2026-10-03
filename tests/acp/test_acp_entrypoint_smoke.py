@@ -116,7 +116,15 @@ async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
     if proc.returncode is None:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
-            await proc.wait()
+        # Bound the reap. Each test runs on its own function-scoped event loop
+        # under xdist, and asyncio's child watcher can miss the SIGCHLD for a
+        # process it spawned, leaving ``proc.wait()`` blocked forever even though
+        # the process is already dead. An unbounded wait here would then run out
+        # to the per-test timeout and surface as an opaque hang instead of the
+        # test's real result. The process is killed; stop waiting after a grace
+        # period and let the OS reap it.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(proc.wait(), timeout=5)
 
 
 def _build_env(vibe_home_dir: Path, *, include_api_key: bool) -> dict[str, str]:
@@ -188,6 +196,7 @@ async def _connect_and_initialize(
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_vibe_acp_initialize_and_new_session(vibe_home_dir: Path) -> None:
     proc, initialize_response, conn = await _connect_and_initialize(
         vibe_home_dir=vibe_home_dir, include_api_key=True
@@ -214,6 +223,7 @@ async def test_vibe_acp_initialize_and_new_session(vibe_home_dir: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_vibe_acp_bootstraps_default_files(vibe_home_dir: Path) -> None:
     proc, _initialize_response, conn = await _connect_and_initialize(
         vibe_home_dir=vibe_home_dir, include_api_key=True
@@ -230,6 +240,7 @@ async def test_vibe_acp_bootstraps_default_files(vibe_home_dir: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_vibe_acp_initialize_exposes_browser_auth(vibe_home_dir: Path) -> None:
     proc, initialize_response, _conn = await _connect_and_initialize(
         vibe_home_dir=vibe_home_dir, include_api_key=True
@@ -247,6 +258,7 @@ async def test_vibe_acp_initialize_exposes_browser_auth(vibe_home_dir: Path) -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_vibe_acp_initialize_exposes_delegated_browser_auth_when_supported(
     vibe_home_dir: Path,
 ) -> None:
@@ -272,6 +284,7 @@ async def test_vibe_acp_initialize_exposes_delegated_browser_auth_when_supported
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_vibe_acp_initialize_exposes_terminal_auth_when_supported(
     vibe_home_dir: Path,
 ) -> None:
@@ -305,6 +318,7 @@ async def test_vibe_acp_initialize_exposes_terminal_auth_when_supported(
 def test_vibe_acp_setup_shows_onboarding_and_exits_on_cancel(
     vibe_home_dir: Path,
 ) -> None:
+    pytest.importorskip("pty")
     env = cast("os._Environ[str]", _build_env(vibe_home_dir, include_api_key=False))
     env["TERM"] = "xterm-256color"
 
@@ -380,6 +394,7 @@ def test_acp_agent_import_does_not_load_gitpython() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_vibe_acp_new_session_fails_without_api_key(vibe_home_dir: Path) -> None:
     proc, _initialize_response, conn = await _connect_and_initialize(
         vibe_home_dir=vibe_home_dir, include_api_key=False

@@ -72,6 +72,18 @@ This section is for developers who want to set up the repository for local devel
 
    Pre-commit hooks will automatically run checks before each commit.
 
+### Building distributions
+
+`uv build --wheel` produces one platform-specific wheel containing the Python
+CLI, the Rust terminal, and the Unified Harness runtime. The build requires a
+working Rust toolchain and fails if either native component cannot be built.
+On Linux, set `CARGO_BUILD_FLAGS=--no-default-features` to build without ALSA.
+
+`VIBE_SKIP_RUST_TUI=1` may be used by development-only checks that do not need
+the terminal binary. Public releases always build both native components. Vibe
+does not publish a source distribution because installing it would require end
+users to compile both Rust components locally.
+
 ### Logging Configuration
 
 Logs are written to `~/.vibe/logs/vibe.log` by default. Control logging via environment variables:
@@ -80,7 +92,7 @@ Logs are written to `~/.vibe/logs/vibe.log` by default. Control logging via envi
 |----------|-------------|---------|
 | `LOG_LEVEL` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) | `WARNING` |
 | `LOG_MAX_BYTES` | Max log file size in bytes before rotation | `10485760` (10 MB) |
-| `DEBUG_MODE` | When `true`, forces `DEBUG` logging (and attaches `debugpy` on `localhost:5678` under `vibe-acp`) | - |
+| `DEBUG_MODE` | When `true`, forces `DEBUG` logging | - |
 
 Example:
 
@@ -88,7 +100,38 @@ Example:
 LOG_LEVEL=DEBUG uv run vibe
 ```
 
-You can also view logs in real-time within the application by pressing `Ctrl+\` to open the debug console.
+#### Runtime log level
+
+You can change the log level at runtime without restarting:
+
+```text
+/log-level                       # show current levels (session, env, config, effective)
+/log-level set DEBUG             # override for this process
+/log-level set-global INFO       # also persist to config.toml
+/log-level unset                 # clear the session override
+```
+
+You can also set `log_level` in `config.toml` (optional, defaults to `WARNING` when absent):
+
+```toml
+log_level = "DEBUG"
+```
+
+Precedence: session override > `LOG_LEVEL` env var > `log_level` in config.toml > default.
+
+The debug console (`Ctrl+\`) streams the file log in real time — change the level with `/log-level` and new entries appear immediately.
+
+#### Logging conventions for contributors
+
+- Import the logger from `vibe.observability.logging`:
+  ```python
+  from vibe.observability.logging import logger
+  ```
+- Pass variables as `%s` positional args, not f-string interpolation — this defers formatting to the logging framework (skipped entirely when the level gates the message out):
+  ```python
+  logger.info("Model call completed model=%s duration_ms=%d", alias, duration_ms)
+  ```
+- Use `DEBUG` for "about to do X" diagnostics and `INFO` for "here's what happened" outcomes with metadata (duration, token counts, error type). Never log raw model messages, tool arguments, or tool output — only metadata.
 
 ### Running Tests
 
@@ -96,6 +139,17 @@ Run all tests:
 
 ```bash
 uv run pytest
+```
+
+By default, local runs use `max(1, ceil(available CPUs / 2) - 1)` workers to
+leave resources available for the rest of the machine. CI runners (detected via
+`BUILDKITE` or `GITHUB_ACTIONS`) use every available CPU so the full suite stays
+fast; the generic `CI` variable is deliberately ignored because it is often set
+in developer shells. Set `PYTEST_XDIST_AUTO_NUM_WORKERS` to a positive integer
+to override either default:
+
+```bash
+PYTEST_XDIST_AUTO_NUM_WORKERS=4 uv run pytest
 ```
 
 Run tests with verbose output:

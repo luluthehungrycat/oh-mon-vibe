@@ -4,6 +4,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar, NamedTuple
 
+from vibe.cli.autocompletion.base import CompletionEntry
 from vibe.cli.autocompletion.file_indexer import FileIndexer, IndexEntry
 from vibe.cli.autocompletion.file_indexer.store import (
     ASCII_CODEPOINT_LIMIT,
@@ -11,7 +12,6 @@ from vibe.cli.autocompletion.file_indexer.store import (
 )
 from vibe.cli.autocompletion.fuzzy import fuzzy_match
 
-DEFAULT_MAX_ENTRIES_TO_PROCESS = 32000
 DEFAULT_TARGET_MATCHES = 100
 
 
@@ -19,9 +19,10 @@ class Completer:
     def get_completions(self, text: str, cursor_pos: int) -> list[str]:
         return []
 
-    def get_completion_items(self, text: str, cursor_pos: int) -> list[tuple[str, str]]:
+    def get_completion_items(self, text: str, cursor_pos: int) -> list[CompletionEntry]:
         return [
-            (completion, "") for completion in self.get_completions(text, cursor_pos)
+            CompletionEntry(completion, "")
+            for completion in self.get_completions(text, cursor_pos)
         ]
 
     def get_replacement_range(
@@ -31,14 +32,18 @@ class Completer:
 
 
 class CommandCompleter(Completer):
-    def __init__(self, entries: Callable[[], list[tuple[str, str]]]) -> None:
+    def __init__(self, entries: Callable[[], list[CompletionEntry]]) -> None:
         self._get_entries = entries
 
-    def _build_lookup(self) -> tuple[list[str], dict[str, str]]:
+    def _build_lookup(
+        self,
+    ) -> tuple[list[str], dict[str, str], dict[str, CompletionEntry]]:
         descriptions: dict[str, str] = {}
-        for alias, description in self._get_entries():
-            descriptions[alias] = description
-        return list(descriptions.keys()), descriptions
+        entry_by_alias: dict[str, CompletionEntry] = {}
+        for entry in self._get_entries():
+            descriptions[entry.label] = entry.description
+            entry_by_alias[entry.label] = entry
+        return list(descriptions.keys()), descriptions, entry_by_alias
 
     def _head_word(self, text: str, cursor_pos: int) -> str:
         head = text.split(" ", 1)[0]
@@ -66,19 +71,21 @@ class CommandCompleter(Completer):
         if not text.startswith("/"):
             return []
 
-        aliases, _ = self._build_lookup()
+        aliases, _, _ = self._build_lookup()
         search_str = "/" + self._head_word(text, cursor_pos)
         return self._fuzzy_filter(aliases, search_str)
 
-    def get_completion_items(self, text: str, cursor_pos: int) -> list[tuple[str, str]]:
+    def get_completion_items(self, text: str, cursor_pos: int) -> list[CompletionEntry]:
         if not text.startswith("/"):
             return []
 
-        aliases, descriptions = self._build_lookup()
+        _, descriptions, entry_by_alias = self._build_lookup()
         search_str = "/" + self._head_word(text, cursor_pos)
         return [
-            (alias, descriptions.get(alias, ""))
-            for alias in self._fuzzy_filter(aliases, search_str)
+            entry_by_alias.get(
+                alias, CompletionEntry(alias, descriptions.get(alias, ""))
+            )
+            for alias in self._fuzzy_filter(list(entry_by_alias.keys()), search_str)
         ]
 
     def get_replacement_range(
@@ -86,8 +93,11 @@ class CommandCompleter(Completer):
     ) -> tuple[int, int] | None:
         if not text.startswith("/"):
             return None
-        first_space = text.find(" ")
-        end = cursor_pos if first_space == -1 else min(cursor_pos, first_space)
+        # Replace the whole command word — from the start up to the first
+        # whitespace (space or newline) — regardless of caret position. Ending at
+        # the caret would corrupt the command when accepting mid-token; ending at
+        # len(text) would wipe any following lines (chat input allows newlines).
+        end = next((i for i, char in enumerate(text) if char.isspace()), len(text))
         return (0, end)
 
 
@@ -106,7 +116,7 @@ class PathCompleter(Completer):
 
     def __init__(
         self,
-        max_entries_to_process: int = DEFAULT_MAX_ENTRIES_TO_PROCESS,
+        max_entries_to_process: int | None = None,
         target_matches: int = DEFAULT_TARGET_MATCHES,
         watcher_enabled_getter: Callable[[], bool] | None = None,
     ) -> None:
@@ -131,7 +141,7 @@ class PathCompleter(Completer):
         if " " in fragment:
             return None
 
-        return fragment
+        return fragment.replace("\\", "/")
 
     def _build_search_context(self, partial_path: str) -> _SearchContext:
         suffix = partial_path.split("/")[-1]
@@ -270,13 +280,47 @@ class PathCompleter(Completer):
             shallow_path=-entry.rel.count("/"),
         )
 
-    def _score_matches(
+    def _prioritize_exact_directory_prefix(
         self, entries: list[IndexEntry], context: _SearchContext
+    ) -> list[IndexEntry]:
+        # Fuzzy scoring is capped to keep per-keystroke completion responsive.
+        # Raw index order follows filesystem traversal, so move descendants of
+        # the longest explicitly typed directory ahead of unrelated entries.
+        directory_segments = context.search_pattern.split("/")[:-1]
+        for segment_count in range(len(directory_segments), 0, -1):
+            directory = "/".join(directory_segments[:segment_count]).lower()
+            if not any(
+                entry.is_dir and entry.rel_lower == directory for entry in entries
+            ):
+                continue
+
+            prefix = f"{directory}/"
+            descendants = [
+                entry for entry in entries if entry.rel_lower.startswith(prefix)
+            ]
+            other_entries = [
+                entry for entry in entries if not entry.rel_lower.startswith(prefix)
+            ]
+            return descendants + other_entries
+
+        return entries
+
+    def _score_matches(
+        self,
+        entries: list[IndexEntry],
+        context: _SearchContext,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> list[tuple[str, PathCompleter.MatchRank]]:
         scored_matches: list[tuple[str, PathCompleter.MatchRank]] = []
+        entries = self._prioritize_exact_directory_prefix(entries, context)
 
         for i, entry in enumerate(entries):
-            if i >= self._max_entries_to_process:
+            if should_cancel and i % 128 == 0 and should_cancel():
+                return []
+            if (
+                self._max_entries_to_process is not None
+                and i >= self._max_entries_to_process
+            ):
                 break
 
             if not self._matches_prefix(entry, context):
@@ -310,29 +354,181 @@ class PathCompleter(Completer):
         scored_matches.sort(key=lambda x: x[1], reverse=True)
         return scored_matches[: self._target_matches]
 
-    def _collect_matches(self, text: str, cursor_pos: int) -> list[str]:
+    def _split_outside_root_dir(self, partial_path: str) -> tuple[str, str] | None:
+        if not partial_path:
+            return None
+
+        first_segment = partial_path.split("/", 1)[0]
+        if first_segment != "..":
+            return None
+
+        if partial_path.endswith("/"):
+            return partial_path.rstrip("/"), ""
+
+        idx = partial_path.rfind("/")
+        if idx == -1:
+            return partial_path, ""
+
+        dir_portion = partial_path[:idx]
+        suffix = partial_path[idx + 1 :]
+        if suffix == "..":
+            return f"{dir_portion}/{suffix}", ""
+        return dir_portion, suffix
+
+    def _list_outside_root_children(
+        self, target_dir: Path, dir_portion: str, suffix: str
+    ) -> list[str]:
+        suffix_lower = suffix.lower()
+        results: list[str] = []
+        matched: list[str] = []
+        try:
+            for child in target_dir.iterdir():
+                if (
+                    self._max_entries_to_process is not None
+                    and len(matched) >= self._max_entries_to_process
+                ):
+                    break
+                name = child.name
+                if name.startswith(".") and not suffix.startswith("."):
+                    continue
+                if suffix_lower and not name.lower().startswith(suffix_lower):
+                    continue
+                matched.append(name)
+        except (OSError, PermissionError):
+            return []
+        matched.sort(key=str.lower)
+        for name in matched[: self._target_matches]:
+            child = target_dir / name
+            results.append(f"@{dir_portion}/{name}{'/' if child.is_dir() else ''}")
+            if len(results) >= self._target_matches:
+                break
+        return results
+
+    def _collect_filesystem_matches(self, partial_path: str) -> list[str] | None:
+        split = self._split_outside_root_dir(partial_path)
+        if split is None or not split[0]:
+            return None
+        dir_portion, suffix = split
+
+        root = Path(".").resolve()
+        try:
+            target_dir = (Path(".") / dir_portion).resolve()
+        except (OSError, ValueError):
+            return None
+
+        try:
+            target_dir.relative_to(root)
+        except ValueError:
+            pass
+        else:
+            return None
+
+        if target_dir.is_dir():
+            return self._list_outside_root_children(target_dir, dir_portion, suffix)
+
+        parent = target_dir.parent
+        if parent == root or not parent.is_dir():
+            return []
+        return self._list_outside_root_children(
+            parent, Path(dir_portion).parent.as_posix(), target_dir.name
+        )
+
+    def _list_current_directory(
+        self, should_cancel: Callable[[], bool] | None = None
+    ) -> list[str]:
+        entries: list[Path] = []
+        try:
+            for entry in Path(".").iterdir():
+                if should_cancel and should_cancel():
+                    return []
+                if not entry.name.startswith("."):
+                    entries.append(entry)
+        except (OSError, PermissionError):
+            return []
+
+        entries.sort(key=lambda entry: entry.name.lower())
+        matches: list[str] = []
+        for entry in entries:
+            if should_cancel and should_cancel():
+                return []
+            try:
+                suffix = "/" if entry.is_dir() else ""
+            except OSError:
+                continue
+            matches.append(f"@{entry.name}{suffix}")
+            if len(matches) >= self._target_matches:
+                break
+        return matches
+
+    def _collect_matches(
+        self,
+        text: str,
+        cursor_pos: int,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[str]:
         before_cursor = text[:cursor_pos]
         partial_path = self._extract_partial(before_cursor)
         if partial_path is None:
             return []
 
+        if not partial_path:
+            return self._list_current_directory(should_cancel)
+
+        outside_matches = self._collect_filesystem_matches(partial_path)
+        if outside_matches is not None:
+            return outside_matches
+
         context = self._build_search_context(partial_path)
 
         try:
             # TODO (Vince): doing the assumption that "." is the root directory... Reliable?
-            file_index = self._indexer.get_index(Path("."))
+            file_index = self._indexer.get_index(Path("."), should_cancel)
         except (OSError, RuntimeError):
             return []
 
-        scored_matches = self._score_matches(file_index, context)
+        scored_matches = self._score_matches(file_index, context, should_cancel)
+
+        if not scored_matches and partial_path.endswith("/"):
+            # Keep the trailing slash as a literal fuzzy anchor rather than
+            # discarding it: the typed boundary stays meaningful. Build the
+            # fuzzy context directly because _build_search_context would route
+            # the trailing slash back into immediate-children mode. Skip
+            # slash-only partials ("/") so we don't flood the picker with every
+            # indexed path containing a separator.
+            #
+            # Do NOT fall back when the prefix is a real indexed directory —
+            # zero children means the dir is empty (or all entries are
+            # gitignored), not that the prefix was a fuzzy miss.
+            prefix = partial_path.rstrip("/")
+            prefix_is_real_dir = any(e.is_dir and e.rel == prefix for e in file_index)
+            if prefix and not prefix_is_real_dir:
+                scored_matches = self._score_matches(
+                    file_index,
+                    self._SearchContext(
+                        search_pattern=partial_path,
+                        path_prefix="",
+                        suffix=partial_path.split("/")[-1],
+                        immediate_only=False,
+                        search_pattern_ascii_mask=self._build_query_ascii_mask(
+                            partial_path
+                        ),
+                    ),
+                    should_cancel,
+                )
+
         return [path for path, _ in scored_matches]
 
     def get_completions(self, text: str, cursor_pos: int) -> list[str]:
         return self._collect_matches(text, cursor_pos)
 
-    def get_completion_items(self, text: str, cursor_pos: int) -> list[tuple[str, str]]:
-        matches = self._collect_matches(text, cursor_pos)
-        return [(completion, "") for completion in matches]
+    def get_completion_items(
+        self,
+        text: str,
+        cursor_pos: int,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[CompletionEntry]:
+        matches = self._collect_matches(text, cursor_pos, should_cancel)
+        return [CompletionEntry(completion, "") for completion in matches]
 
     def get_replacement_range(
         self, text: str, cursor_pos: int
