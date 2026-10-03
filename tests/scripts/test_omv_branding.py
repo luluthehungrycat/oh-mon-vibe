@@ -27,7 +27,7 @@ def test_checker_rejects_upstream_package_name(tmp_path: Path) -> None:
         '[project]\nname = "mistral-vibe"\n'
         'urls = { Repository = "https://github.com/luluthehungrycat/oh-my-vibe" }\n'
         "[project.scripts]\n"
-        'omv = "vibe.cli.entrypoint:main"\n'
+        'omv = "vibe.cli.launcher:main"\n'
         'omv-acp = "vibe.acp.entrypoint:main"\n'
         'omv-app-server = "vibe.app_server.stdio:main"\n',
         encoding="utf-8",
@@ -46,7 +46,7 @@ def test_checker_rejects_vibe_home_override(tmp_path: Path) -> None:
         '[project]\nname = "oh-my-vibe"\n'
         'urls = { Repository = "https://github.com/luluthehungrycat/oh-my-vibe" }\n'
         "[project.scripts]\n"
-        'omv = "vibe.cli.entrypoint:main"\n'
+        'omv = "vibe.cli.launcher:main"\n'
         'omv-acp = "vibe.acp.entrypoint:main"\n'
         'omv-app-server = "vibe.app_server.stdio:main"\n',
         encoding="utf-8",

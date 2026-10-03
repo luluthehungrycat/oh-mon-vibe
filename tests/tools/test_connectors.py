@@ -740,7 +740,7 @@ class TestBootstrapDiscovery:
     async def test_bootstrap_cache_without_protocol_uses_legacy_mcp(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
-        monkeypatch.setenv("VIBE_HOME", str(tmp_path))
+        monkeypatch.setenv("OMV_HOME", str(tmp_path))
         cached_payload = _make_bootstrap_response([
             _make_connector_payload(tools=[_make_tool_payload("cached")])
         ])

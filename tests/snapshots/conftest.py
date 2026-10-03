@@ -65,5 +65,5 @@ def _disable_managed_config_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
         return ManagedConfigResult()
 
     monkeypatch.setattr(
-        "vibe.app_server._resources.fetch_managed_config", no_managed_config
+        "vibe.app_server._admin_config.fetch_managed_config", no_managed_config
     )

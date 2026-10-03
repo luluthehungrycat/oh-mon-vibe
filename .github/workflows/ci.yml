@@ -63,6 +63,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      CARGO_BUILD_FLAGS: --no-default-features
 
     steps:
       - name: Checkout repository

@@ -495,9 +495,6 @@ class EventHandler:
             return group
 
     async def _mount_in_group(self, group: ToolGroup, widget: Widget) -> None:
-        if not group.is_attached:
-            await self.mount_callback(widget)
-            return
         children = list(group.content_container.children)
         if children:
             await self.mount_callback(widget, after=children[-1])

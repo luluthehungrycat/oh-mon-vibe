@@ -76,18 +76,25 @@
           });
 
         # The combined wheel builds the Rust CLI inside Nix's network-isolated
-        # builder, so provide the locked crates and toolchain explicitly.
+        # builder. Its backend builds two separate Cargo projects, each with its
+        # own lockfile, so configure both from one merged vendor directory.
         oh-my-vibe = prev.oh-my-vibe.overrideAttrs (old: {
-          cargoDeps = pkgs.rustPlatform.importCargoLock {
-            lockFile = ./vibe/cli-rust/Cargo.lock;
-          };
-          nativeBuildInputs = (old.nativeBuildInputs or []) ++ [
-            pkgs.rustPlatform.cargoSetupHook
-            pkgs.cargo
-            pkgs.rustc
-          ];
+          nativeBuildInputs = (old.nativeBuildInputs or []) ++ [pkgs.cargo pkgs.rustc];
+          postPatch = (old.postPatch or "") + ''
+            mkdir -p .cargo
+            cat > .cargo/config.toml <<'EOF'
+            [source.crates-io]
+            replace-with = "vendored-sources"
+
+            [source.vendored-sources]
+            directory = "${combinedCargoVendor}"
+            EOF
+          '';
           # Match Linux wheels, which disable the ALSA-backed voice feature.
-          env = (old.env or {}) // {CARGO_BUILD_FLAGS = "--no-default-features";};
+          env = (old.env or {}) // {
+            CARGO_BUILD_FLAGS = "--no-default-features";
+            CARGO_NET_OFFLINE = "true";
+          };
         });
 
         # The Rust terminal build fetches crates from the network, which is
@@ -101,6 +108,25 @@
       pkgs = import nixpkgs {
         inherit system;
       };
+
+      cliCargoVendor = pkgs.rustPlatform.importCargoLock {
+        lockFile = ./vibe/cli-rust/Cargo.lock;
+      };
+      harnessCargoVendor = pkgs.rustPlatform.importCargoLock {
+        lockFile = ./harness/core/Cargo.lock;
+      };
+      combinedCargoVendor = pkgs.runCommand "oh-my-vibe-cargo-vendor" {} ''
+        mkdir -p "$out"
+        for vendor in ${cliCargoVendor} ${harnessCargoVendor}; do
+          for crate in "$vendor"/*; do
+            [ -e "$crate" ] || continue
+            name=$(basename "$crate")
+            if [ ! -e "$out/$name" ]; then
+              ln -s "$crate" "$out/$name"
+            fi
+          done
+        done
+      '';
 
       python = pkgs.python312;
 

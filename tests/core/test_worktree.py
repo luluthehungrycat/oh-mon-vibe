@@ -139,12 +139,7 @@ def _commit_on_head(repo: Repo, message: str) -> None:
 
 def _init_repo(root: Path, *, separate_git_dir: Path | None = None) -> Repo:
     repo = _track_repo(
-        Repo.init(
-            root,
-            initial_branch="main",
-            separate_git_dir=separate_git_dir,
-            allow_unsafe_options=True,
-        )
+        Repo.init(root, initial_branch="main", separate_git_dir=separate_git_dir)
     )
     repo.config_writer().set_value("user", "name", "Tester").release()
     repo.config_writer().set_value("user", "email", "t@example.com").release()
